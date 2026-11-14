@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ambient occlusion comparison</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#121821;color:#f1f5f8;font:16px system-ui,sans-serif}main{max-width:1120px;margin:auto;padding:24px}h1{margin:0 0 8px;font-size:clamp(22px,4vw,36px)}p{color:#c4d0db;margin:0 0 14px}nav{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}button{font:inherit;padding:8px 14px;color:inherit;background:#252f3d;border:1px solid #718095;border-radius:6px}button[aria-pressed=true]{background:#d4e9fb;color:#162433}canvas{display:block;width:100%;height:auto}output{display:block;margin-top:12px;font-variant-numeric:tabular-nums}
+</style>
+<main><h1 id="scene-title">Ambient occlusion comparison</h1><p>Apple M1 benchmark · 1,280 × 720 · 1.12 m radius</p><nav aria-label="AO samples">
+<button data-taps="0" aria-pressed="true">AO off</button>
+<button data-taps="4" aria-pressed="false">Original</button>
+<button data-taps="14" aria-pressed="false">Wall correction</button>
+<button data-taps="34" aria-pressed="false">Reweighted</button>
+<button data-taps="32">SSAO</button><button data-taps="36">GTAO</button><label><input id="mask" type="checkbox"> AO mask</label></nav>
+<div id="view"></div><output id="status">Loading distance field…</output></main>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
+<script type="module">
+import * as T from 'three';
+import {SSAOPass} from 'three/addons/postprocessing/SSAOPass.js';
+import {GTAOPass} from 'three/addons/postprocessing/GTAOPass.js';
+
+const status = document.querySelector('#status');
+const W=1280,H=720;
+const name='archive';
+document.querySelector('#scene-title').textContent='Archive · ambient occlusion';
+const vertexShader=`
+out vec3 p;
+out vec3 n;
+in float wall;
+flat out float wallFace;
+void main(){
+  vec4 world=modelMatrix*instanceMatrix*vec4(position,1.);
+  p=world.xyz;
+  n=normalize(mat3(modelMatrix)*mat3(instanceMatrix)*normal);
+  wallFace=wall;
+  gl_Position=projectionMatrix*viewMatrix*world;
+}`;
+const fragmentShader=`
+precision highp float;
+precision highp sampler3D;
+uniform sampler3D field;
+uniform sampler2D aoMap;
+in vec3 p;
+in vec3 n;
+flat in float wallFace;
+out vec4 pixel;
+uniform bool showMask;
+const vec3 scale=1./vec3(26.,18.,8.);
+float tap(vec3 origin,vec3 direction,float r){
+  vec3 uv=origin+direction*r;
+  bool inside=all(greaterThanEqual(uv,vec3(0.)))&&all(lessThanEqual(uv,vec3(1.)));
+  float d=texture(field,uv).r;
+  return inside?clamp(1.-(d+.045)/r,0.,1.):0.;
+}
+float distanceAt(vec3 pos){
+  vec3 uv=(pos+1.)/vec3(26.,18.,8.);
+  if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.)))) return 2.;
+  float d=texture(field,uv).r;
+  #ifdef PACKED
+    d=d*2.7-1.2;
+  #endif
+  return d;
+}
+void main(){
+  vec3 normal=normalize(n);
+  float ao=1.;
+  #if defined(FAST)
+    vec3 origin=(p+1.)*scale;
+    vec3 direction=normal*scale;
+    vec4 taps=vec4(tap(origin,direction,.16),tap(origin,direction,.48),
+                   tap(origin,direction,.80),tap(origin,direction,1.12));
+    #ifdef CONTACT
+      // Emphasize near contacts while retaining longer-range contributions.
+      ao=1.-dot(taps,vec4(.46,.24,.21,.16));
+    #else
+      // Suppress weak, far-only hits while retaining broad occlusion
+      // when the nearer probes also see the blocker.
+      float vertical=wallFace*(1.-abs(normal.z));
+      float farSupport=.40+.60*max(taps.x,taps.y);
+      vec4 original=.92*vec4(1.,.8166666667,.6333333333,.45)/2.9;
+      vec4 corrected=vec4(.46,.24,.21*farSupport,.16*farSupport);
+      ao=1.-dot(taps,mix(original,corrected,vertical));
+    #endif
+  #elif TAPS > 0
+    float sum=0.,weights=0.;
+    for(int i=0;i<TAPS;i++){
+      float r=mix(.16,1.12,float(i)/float(TAPS-1));
+      float w=1.-.55*float(i)/float(TAPS-1);
+      sum+=w*clamp((r-distanceAt(p+normal*r)-.045)/r,0.,1.);
+      weights+=w;
+    }
+    ao=1.-.92*sum/weights;
+  #elif defined(SCREEN_AO)
+    ao=texelFetch(aoMap,ivec2(gl_FragCoord.xy),0).r;
+  #endif
+  if(showMask){pixel=vec4(vec3(ao),1.);return;}
+  float sun=max(0.,dot(normal,normalize(vec3(-.4,-.55,1.))));
+  vec3 albedo=mix(vec3(.28,.34,.43),vec3(.64,.69,.75),clamp(p.z/4.+.14,0.,1.));
+  if(p.z<.005)albedo=vec3(.37,.41,.44);
+  vec3 color=albedo*(.26*sun+.74*ao);
+  pixel=vec4(pow(color,vec3(1./2.2)),1.);
+}`;
+const quantile=(a,q)=>[...a].sort((a,b)=>a-b)[Math.ceil(q*a.length)-1];
+try {
+  const [volume,boxes]=await Promise.all([
+    fetch('./'+name+'.f32').then(r=>{if(!r.ok)throw Error('Missing field');return r.arrayBuffer();}),
+    fetch('./'+name+'.json').then(r=>{if(!r.ok)throw Error('Missing geometry');return r.json();})
+  ]);
+  const source=new Float32Array(volume);
+  if(source.length!==128**3)throw Error('Unexpected volume size');
+  const half=Uint16Array.from(source,value=>T.DataUtils.toHalfFloat(value));
+  const field=new T.Data3DTexture(half,128,128,128);
+  field.format=T.RedFormat;field.type=T.HalfFloatType;
+  field.minFilter=field.magFilter=T.LinearFilter;field.needsUpdate=true;
+  const renderer=new T.WebGLRenderer({antialias:false,preserveDrawingBuffer:true});
+  renderer.setSize(W,H,false);
+  document.querySelector('#view').append(renderer.domElement);
+  const scene=new T.Scene();
+  scene.background=new T.Color('#17212e');
+  const camera=new T.PerspectiveCamera(37,W/H,.1,100);
+  camera.up.set(0,0,1);
+  camera.position.set(18,-4,7.3);
+  camera.lookAt(10.8,8.8,1.4);
+  const variants=[0,4,14,34,32,36];
+  const mask={value:false};
+  const materials=Object.fromEntries(variants.map(mode=>[mode,new T.ShaderMaterial({
+    glslVersion:T.GLSL3,vertexShader,fragmentShader,
+    defines:mode===34?{FAST:1,CONTACT:1}:mode===14?{FAST:1}:{TAPS:mode},
+    uniforms:{field:{value:field},showMask:mask}
+  })]));
+  if(!boxes.length||boxes.some(b=>b.length!==6||b.some(v=>!Number.isFinite(v))))throw Error('Invalid geometry');
+  const mesh=new T.InstancedMesh(new T.BoxGeometry(1,1,1),materials[0],boxes.length);
+  const walls=new Float32Array(boxes.length);
+  walls[1]=walls[2]=1;
+  mesh.geometry.setAttribute('wall',new T.InstancedBufferAttribute(walls,1));
+  const matrix=new T.Matrix4();
+  boxes.forEach(([x,y,z,hx,hy,hz],i)=>mesh.setMatrixAt(i,matrix.makeScale(2*hx,2*hy,2*hz).setPosition(x,y,z)));
+  scene.add(mesh);
+  const radius=1.12;
+  // Seed Three.js's SSAO kernel and noise texture for reproducible captures.
+  const originalRandom=Math.random;
+  let seed=2804;
+  let ssao;
+  try {
+    Math.random=()=>{seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed/4294967296;};
+    ssao=new SSAOPass(scene,camera,W,H,32);
+  } finally {Math.random=originalRandom;}
+  ssao.kernelRadius=radius;
+  ssao.minDistance=.045/(camera.far-camera.near);
+  ssao.maxDistance=radius/(camera.far-camera.near);
+
+  const gtao=new GTAOPass(scene,camera,W,H);
+  gtao.updateGtaoMaterial({radius,screenSpaceRadius:false,thickness:radius});
+  // Run the built-in passes through denoising, then use the same ambient lighting
+  // equation in the final geometry draw for all methods.
+  ssao.output=SSAOPass.OUTPUT.Blur;
+  const renderSsaoPass=ssao.renderPass.bind(ssao);
+  ssao.renderPass=(r,material,...args)=>{
+    if(material!==ssao.copyMaterial)renderSsaoPass(r,material,...args);
+  };
+  gtao.output=GTAOPass.OUTPUT.Off;
+  const scratch=new T.WebGLRenderTarget(W,H,{depthBuffer:false});
+  const screenMaterial=new T.ShaderMaterial({
+    glslVersion:T.GLSL3,vertexShader,fragmentShader,
+    defines:{TAPS:0,SCREEN_AO:1},uniforms:{aoMap:{value:null},showMask:mask}
+  });
+  const gl=renderer.getContext();
+  const timer=gl.getExtension('EXT_disjoint_timer_query_webgl2');
+  const debug=gl.getExtension('WEBGL_debug_renderer_info');
+  function render(taps){
+    if(taps===32||taps===36){
+      const pass=taps===32?ssao:gtao;
+      pass.render(renderer,scratch,scratch);
+      screenMaterial.uniforms.aoMap.value=taps===32?ssao.blurRenderTarget.texture:gtao.pdRenderTarget.texture;
+      mesh.material=screenMaterial;
+    } else mesh.material=materials[taps];
+    renderer.setRenderTarget(null);
+    renderer.render(scene,camera);
+  }
+  function select(taps){
+    render(taps);
+    document.querySelectorAll('button').forEach(b=>b.setAttribute('aria-pressed',Number(b.dataset.taps)===taps));
+    status.value={0:'Ambient occlusion disabled',4:'Original four taps',14:'Four taps with weak distant hits reduced on structural walls',32:'Three.js SSAO',36:'Three.js GTAO',34:'Four taps with extra weight on near contacts'}[taps];
+  }
+  let selected=0;
+  document.querySelectorAll('button').forEach(b=>b.onclick=()=>{selected=Number(b.dataset.taps);select(selected);});
+  document.querySelector('#mask').onchange=e=>{mask.value=e.target.checked;render(selected);};
+  select(0);
+  async function gpuTime(taps){
+    if(!timer){
+      const start=performance.now();
+      for(let i=0;i<12;i++)render(taps);
+      gl.finish();
+      return (performance.now()-start)/12;
+    }
+    const q=gl.createQuery();
+    gl.beginQuery(timer.TIME_ELAPSED_EXT,q);
+    for(let i=0;i<12;i++)render(taps);
+    gl.endQuery(timer.TIME_ELAPSED_EXT);
+    gl.flush();
+    try {
+      for(let i=0;i<1000;i++){
+        if(gl.getQueryParameter(q,gl.QUERY_RESULT_AVAILABLE)){
+          if(gl.getParameter(timer.GPU_DISJOINT_EXT))throw Error('GPU timing disjoint');
+          return gl.getQueryParameter(q,gl.QUERY_RESULT)/12e6;
+        }
+        await new Promise(resolve=>setTimeout(resolve,5));
+      }
+      throw Error('GPU timer timed out');
+    } finally {gl.deleteQuery(q);}
+  }
+  window.aoDemo={select,mask(enabled){mask.value=enabled;},async benchmark(){
+    mask.value=false;
+
+    const times=Object.fromEntries(variants.map(v=>[v,[]]));
+    for(const taps of variants)for(let j=0;j<12;j++)render(taps);
+    gl.finish();
+    for(let i=0;i<20;i++){
+      for(let j=0;j<variants.length;j++){
+        const taps=variants[(i+j)%variants.length];
+        times[taps].push(await gpuTime(taps));
+      }
+    }
+    select(0);
+    return {method:timer?'GPU elapsed timer':'CPU wall time with WebGL finish per batch',
+      renderer:debug?gl.getParameter(debug.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER),
+      width:W,height:H,drawsPerBatch:12,times,
+      summary:Object.fromEntries(Object.entries(times).map(([k,v])=>[k,{p50:quantile(v,.50),p95:quantile(v,.95)}]))};
+  }};
+} catch(error) {
+  status.value=error.message;
+  throw error;
+}
+</script>
+</html>
