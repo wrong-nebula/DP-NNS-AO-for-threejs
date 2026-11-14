@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Archive AO viewer</title>
+<title>Archive AO viewer · moving geometry</title>
 <style>
 *{box-sizing:border-box}body{margin:0;background:#121821;color:#f1f5f8;font:16px system-ui,sans-serif}main{max-width:1120px;margin:auto;padding:24px}h1{margin:0 0 8px;font-size:clamp(22px,4vw,36px)}p{color:#c4d0db;margin:0 0 14px}nav{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}button{font:inherit;padding:8px 14px;color:inherit;background:#252f3d;border:1px solid #718095;border-radius:6px}button[aria-pressed=true]{background:#d4e9fb;color:#162433}canvas{display:block;width:100%;height:auto}output{display:block;margin-top:12px;font-variant-numeric:tabular-nums}
 #view{position:relative;background:#17212e}
@@ -10,12 +10,12 @@
 nav label{display:flex;align-items:center;gap:5px;padding:6px}
 #status{color:#c4d0db}
 </style>
-<main><h1>Archive AO viewer</h1><p>Drag to orbit · Scroll to zoom · Right-drag to pan</p><nav aria-label="Ambient occlusion method">
+<main><h1>Archive AO viewer · moving geometry</h1><p>Drag to orbit · Scroll to zoom · Right-drag to pan</p><nav aria-label="Ambient occlusion method">
 <button data-taps="0" aria-pressed="true">AO off</button>
 <button data-taps="4" aria-pressed="false">Original SDF</button>
 <button data-taps="14" aria-pressed="false">SDF wall correction</button>
 <button data-taps="34" aria-pressed="false">Reweighted SDF</button>
-<button data-taps="32" aria-pressed="false">SSAO</button><button data-taps="36" aria-pressed="false">GTAO</button><label><input id="mask" type="checkbox"> AO mask</label></nav>
+<button data-taps="32" aria-pressed="false">SSAO</button><button data-taps="36" aria-pressed="false">GTAO</button><label><input id="mask" type="checkbox"> AO mask</label><label><input id="animate" type="checkbox" checked> Animate movers</label><label><input id="dynao" type="checkbox" checked> Movers in SDF AO</label><label><input id="forcemesh" type="checkbox"> Baked SDF for all movers</label></nav>
 <div id="view"><output id="fps" aria-label="Live rendering frame rate"><strong id="fps-value">— FPS</strong><small id="frame-ms">Frame interval</small></output></div><output id="status">Loading distance field…</output></main>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
 <script type="module">
@@ -23,16 +23,39 @@ import * as T from 'three';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
 import {SSAOPass} from 'three/addons/postprocessing/SSAOPass.js';
 import {GTAOPass} from 'three/addons/postprocessing/GTAOPass.js';
+import {FullScreenQuad} from 'three/addons/postprocessing/Pass.js';
+import {RoundedBoxGeometry} from 'three/addons/geometries/RoundedBoxGeometry.js';
+import {TeapotGeometry} from 'three/addons/geometries/TeapotGeometry.js';
 
 const status = document.querySelector('#status');
 const W=1280,H=720;
+const MAX_DYN=16;     // moving objects evaluated in the AO shader
+const MESH_RES=64;    // voxels per side of each baked mesh SDF
+const MESH_PAD=1.2;   // >= farthest distance a tap can use (1.12-.045), so outside the bake = no occlusion
 const vertexShader=`
 out vec3 p;
 out vec3 n;
 in float wall;
+in vec3 boundsHalf; // half extents of the (centered) geometry, in instance space
+in float selfSkip; // mover index if this instance is a convex mover, else -1
 flat out float wallFace;
+#define MAX_DYN ${MAX_DYN}
+uniform vec4 dynSphere[MAX_DYN];
+uniform int dynCount;
+// Movers that can reach any point of this instance's world AABB. Pixels on the
+// instance lie inside the AABB, so this is a superset of the per-pixel mask.
+flat out int instMask;
 void main(){
-  vec4 world=modelMatrix*instanceMatrix*vec4(position,1.);
+  mat4 im=modelMatrix*instanceMatrix;
+  vec3 c=im[3].xyz;
+  vec3 h=abs(im[0].xyz)*boundsHalf.x+abs(im[1].xyz)*boundsHalf.y+abs(im[2].xyz)*boundsHalf.z;
+  instMask=0;
+  for(int i=0;i<MAX_DYN;i++){
+    if(i>=dynCount)break;
+    if(length(max(abs(dynSphere[i].xyz-c)-h,0.))-dynSphere[i].w<2.25)instMask|=1<<i;
+  }
+  if(selfSkip>=0.)instMask&=~(1<<int(selfSkip));
+  vec4 world=im*vec4(position,1.);
   p=world.xyz;
   n=normalize(mat3(modelMatrix)*mat3(instanceMatrix)*normal);
   wallFace=wall;
@@ -42,36 +65,122 @@ const fragmentShader=`
 precision highp float;
 precision highp sampler3D;
 uniform sampler3D field;
+uniform sampler3D meshAtlas;
+uniform float meshSlabs;
 uniform sampler2D aoMap;
 in vec3 p;
 in vec3 n;
 flat in float wallFace;
+flat in int instMask;
 out vec4 pixel;
 uniform bool showMask;
 const vec3 scale=1./vec3(26.,18.,8.);
-float tap(vec3 origin,vec3 direction,float r){
-  vec3 uv=origin+direction*r;
-  bool inside=all(greaterThanEqual(uv,vec3(0.)))&&all(lessThanEqual(uv,vec3(1.)));
-  float d=texture(field,uv).r;
-  return inside?clamp(1.-(d+.045)/r,0.,1.):0.;
-}
-float distanceAt(vec3 pos){
-  vec3 uv=(pos+1.)/vec3(26.,18.,8.);
-  if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.)))) return 2.;
+// Moving objects: rigid world->local transforms, a shape type and its parameters.
+// They are not in the baked scene field; their distance is evaluated here and
+// min()'d in. Types: 0 box, 1 sphere, 2 capsule, 3 cylinder, 4 rounded box,
+// 5 torus, 6 baked mesh SDF (any rigid mesh).
+#define MAX_DYN ${MAX_DYN}
+#define MESH_RES ${MESH_RES}.
+uniform mat4 dynInv[MAX_DYN];
+uniform vec4 dynParam[MAX_DYN];
+uniform int dynType[MAX_DYN];
+uniform int dynCount;
+uniform vec4 dynSphere[MAX_DYN]; // world center, bounding radius
+// Bit i set when mover i can affect this pixel (a tap at distance r only occludes
+// if the object is within r-.045 of the tap point). See the test in main().
+int dynMask=0;
+float staticDistance(vec3 pos){
+  vec3 uv=(pos+1.)*scale;
+  if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return 1e4;
   float d=texture(field,uv).r;
   #ifdef PACKED
     d=d*2.7-1.2;
   #endif
   return d;
 }
+float sdBox(vec3 q,vec3 h){
+  vec3 d=abs(q)-h;
+  return length(max(d,0.))+min(max(d.x,max(d.y,d.z)),0.);
+}
+// Baked mesh: k.x = slab in the atlas, k.y = half size of the baked cube.
+// Outside the cube the mesh is at least MESH_PAD away, which no tap can use.
+float sdMesh(vec3 q,vec4 k){
+  vec3 uv=q/(2.*k.y)+.5;
+  if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return 1e4;
+  uv.z=(k.x+clamp(uv.z,.5/MESH_RES,1.-.5/MESH_RES))/meshSlabs;
+  return textureLod(meshAtlas,uv,0.).r;
+}
+// Local axes follow the matching three.js geometries (capsule and cylinder along Y,
+// torus around Z).
+float sdShape(int type,vec3 q,vec4 k){
+  if(type==1)return length(q)-k.x;
+  if(type==2){q.y-=clamp(q.y,-k.y,k.y);return length(q)-k.x;}
+  if(type==3){vec2 d=abs(vec2(length(q.xz),q.y))-k.xy;return min(max(d.x,d.y),0.)+length(max(d,0.));}
+  if(type==4)return sdBox(q,k.xyz-k.w)-k.w;
+  if(type==5)return length(vec2(length(q.xy)-k.x,q.z))-k.y;
+  if(type==6)return sdMesh(q,k);
+  return sdBox(q,k.xyz);
+}
+float dynamicDistance(vec3 pos){
+  float d=1e4;
+  for(int i=0;i<MAX_DYN;i++){
+    if(i>=dynCount)break;
+    if(((dynMask>>i)&1)==0)continue;
+    d=min(d,sdShape(dynType[i],(dynInv[i]*vec4(pos,1.)).xyz,dynParam[i]));
+  }
+  return d;
+}
+const vec4 R=vec4(.16,.48,.80,1.12);
+// Scene distance at the four tap points p+normal*R. The static samples are fetched
+// together up front; each nearby mover is transformed to local space once and all
+// four taps are tested against it.
+vec4 tapDistances(vec3 p,vec3 normal){
+  vec4 d=vec4(staticDistance(p+normal*R.x),staticDistance(p+normal*R.y),
+              staticDistance(p+normal*R.z),staticDistance(p+normal*R.w));
+  if(dynMask==0)return d;
+  for(int i=0;i<MAX_DYN;i++){
+    if(i>=dynCount)break;
+    if(((dynMask>>i)&1)==0)continue;
+    vec3 lp=(dynInv[i]*vec4(p,1.)).xyz;
+    vec3 ln=mat3(dynInv[i])*normal;
+    int type=dynType[i];
+    vec4 k=dynParam[i];
+    if(type==0){
+      // Boxes: all four taps as vec4 lanes.
+      vec4 qx=abs(lp.x+ln.x*R)-k.x;
+      vec4 qy=abs(lp.y+ln.y*R)-k.y;
+      vec4 qz=abs(lp.z+ln.z*R)-k.z;
+      vec4 ox=max(qx,0.),oy=max(qy,0.),oz=max(qz,0.);
+      d=min(d,sqrt(ox*ox+oy*oy+oz*oz)+min(max(qx,max(qy,qz)),0.));
+    }else if(type==6){
+      d=min(d,vec4(sdMesh(lp+ln*R.x,k),sdMesh(lp+ln*R.y,k),sdMesh(lp+ln*R.z,k),sdMesh(lp+ln*R.w,k)));
+    }else{
+      vec3 q0=lp+ln*R.x,q1=lp+ln*R.y,q2=lp+ln*R.z,q3=lp+ln*R.w;
+      vec4 s;
+      if(type==1)s=vec4(length(q0),length(q1),length(q2),length(q3))-k.x;
+      else if(type==5)s=vec4(length(vec2(length(q0.xy)-k.x,q0.z)),length(vec2(length(q1.xy)-k.x,q1.z)),
+                             length(vec2(length(q2.xy)-k.x,q2.z)),length(vec2(length(q3.xy)-k.x,q3.z)))-k.y;
+      else s=vec4(sdShape(type,q0,k),sdShape(type,q1,k),sdShape(type,q2,k),sdShape(type,q3,k));
+      d=min(d,s);
+    }
+  }
+  return d;
+}
+float distanceAt(vec3 pos){
+  return min(staticDistance(pos),dynMask==0?1e4:dynamicDistance(pos));
+}
 void main(){
   vec3 normal=normalize(n);
   float ao=1.;
+  if(instMask!=0)for(int i=0;i<MAX_DYN;i++){
+    if(i>=dynCount)break;
+    // Tap k only sees the object if |p+n*r_k-c|-rb < r_k-.045. |p+n*t-c|-t never
+    // increases with t, so the farthest tap (1.12) is the easiest to satisfy: if it
+    // fails, every tap does.
+    if(((instMask>>i)&1)!=0&&distance(p+normal*R.w,dynSphere[i].xyz)-dynSphere[i].w<R.w-.044)dynMask|=1<<i;
+  }
   #if defined(FAST)
-    vec3 origin=(p+1.)*scale;
-    vec3 direction=normal*scale;
-    vec4 taps=vec4(tap(origin,direction,.16),tap(origin,direction,.48),
-                   tap(origin,direction,.80),tap(origin,direction,1.12));
+    vec4 taps=clamp(1.-(tapDistances(p,normal)+.045)/R,0.,1.);
     #ifdef CONTACT
       // Emphasize near contacts while retaining longer-range contributions.
       ao=1.-dot(taps,vec4(.46,.24,.21,.16));
@@ -84,6 +193,11 @@ void main(){
       vec4 corrected=vec4(.46,.24,.21*farSupport,.16*farSupport);
       ao=1.-dot(taps,mix(original,corrected,vertical));
     #endif
+  #elif TAPS == 4
+    // Same radii and weights as the generic loop below, evaluated four-wide.
+    vec4 w=1.-.55*vec4(0.,1.,2.,3.)/3.;
+    vec4 occ=clamp((R-tapDistances(p,normal)-.045)/R,0.,1.);
+    ao=1.-.92*dot(w,occ)/dot(w,vec4(1.));
   #elif TAPS > 0
     float sum=0.,weights=0.;
     for(int i=0;i<TAPS;i++){
@@ -102,6 +216,41 @@ void main(){
   if(p.z<.005)albedo=vec3(.37,.41,.44);
   vec3 color=albedo*(.26*sun+.74*ao);
   pixel=vec4(pow(color,vec3(1./2.2)),1.);
+}`;
+// GPU bake of a signed distance field for an arbitrary triangle mesh, one z-layer
+// per draw. Distance: exact point-triangle distance (min over all triangles).
+// Sign: generalized winding number (sum of triangle solid angles), which stays
+// robust on meshes that aren't perfectly closed, like the teapot.
+const bakeVertexShader=`void main(){gl_Position=vec4(position.xy,0.,1.);}`;
+const bakeFragmentShader=`
+precision highp float;
+uniform highp sampler2D tris;
+uniform int triCount;
+uniform int texW;
+uniform float halfSize;
+uniform float layer;
+out vec4 o;
+vec3 vert(int i){return texelFetch(tris,ivec2(i%texW,i/texW),0).xyz;}
+float dot2(vec3 v){return dot(v,v);}
+void main(){
+  vec3 p=(vec3(gl_FragCoord.xy,layer+.5)/${MESH_RES}.*2.-1.)*halfSize;
+  float d2=1e20,w=0.;
+  for(int t=0;t<triCount;t++){
+    vec3 a=vert(3*t),b=vert(3*t+1),c=vert(3*t+2);
+    vec3 ba=b-a,pa=p-a,cb=c-b,pb=p-b,ac=a-c,pc=p-c,nor=cross(ba,ac);
+    if(dot2(nor)<1e-14)continue; // degenerate (e.g. sphere poles): covered by neighbours
+    d2=min(d2,(sign(dot(cross(ba,nor),pa))+sign(dot(cross(cb,nor),pb))+sign(dot(cross(ac,nor),pc))<2.)
+      ?min(min(dot2(ba*clamp(dot(ba,pa)/dot2(ba),0.,1.)-pa),
+               dot2(cb*clamp(dot(cb,pb)/dot2(cb),0.,1.)-pb)),
+               dot2(ac*clamp(dot(ac,pc)/dot2(ac),0.,1.)-pc))
+      :dot(nor,pa)*dot(nor,pa)/dot2(nor));
+    vec3 A=-pa,B=-pb,C=-pc;
+    float la=length(A),lb=length(B),lc=length(C);
+    w+=atan(dot(A,cross(B,C)),la*lb*lc+dot(A,B)*lc+dot(B,C)*la+dot(C,A)*lb);
+  }
+  // Solid angle = 2*atan(...); winding number = total solid angle / 4pi.
+  float winding=w/6.283185307;
+  o=vec4(abs(winding)>.5?-sqrt(d2):sqrt(d2));
 }`;
 try {
   const boxes = [[12,8,-0.2,12.0,8.0,0.2],[12,15.75,3,12.0,0.25,3.0],[0.25,8,3,0.25,8.0,3.0],[12,11.8,2.33,11.5,1.3,0.13],[12,13.15,3,11.5,0.06,0.54],[6.2,5.6,0.1,1.75,0.215,0.1],[6.2,6.029999999999999,0.2,1.75,0.215,0.2],[6.2,6.46,0.30000000000000004,1.75,0.215,0.30000000000000004],[6.2,6.89,0.4,1.75,0.215,0.4],[6.2,7.319999999999999,0.5,1.75,0.215,0.5],[6.2,7.75,0.6000000000000001,1.75,0.215,0.6000000000000001],[6.2,8.18,0.7000000000000001,1.75,0.215,0.7000000000000001],[6.2,8.61,0.8,1.75,0.215,0.8],[6.2,9.04,0.9,1.75,0.215,0.9],[6.2,9.469999999999999,1.0,1.75,0.215,1.0],[6.2,9.899999999999999,1.1,1.75,0.215,1.1],[6.2,10.329999999999998,1.2000000000000002,1.75,0.215,1.2000000000000002],[6.2,11.7,2.3,1.75,1.4,0.1],[2.1,12.9,1.25,0.25,0.325,1.25],[10.2,12.9,1.25,0.25,0.325,1.25],[14.6,12.9,1.25,0.25,0.325,1.25],[19.3,12.9,1.25,0.25,0.325,1.25],[22,12.9,1.25,0.25,0.325,1.25],[1.55,13.260000000000002,1.66,0.07,0.07,1.66],[1.55,14.34,1.66,0.07,0.07,1.66],[4.45,13.260000000000002,1.66,0.07,0.07,1.66],[4.45,14.34,1.66,0.07,0.07,1.66],[3,13.8,0.24,1.52,0.64,0.07],[2.06,13.8,0.5032492051794106,0.28066171081498437,0.39757933671619566,0.19324920517941058],[3,13.8,0.4774431094763607,0.2249345075869993,0.528513328708839,0.1674431094763607],[3.94,13.8,0.5078351220282529,0.32137812410524624,0.4310273719176847,0.19783512202825293],[3,13.8,1.23,1.52,0.64,0.07],[2.06,13.8,1.4900552511771834,0.3022660987988635,0.24714876277976627,0.1900552511771833],[3,13.8,1.5540848071860047,0.3905543664743827,0.2518797694034512,0.25408480718600457],[3.94,13.8,1.7258191095875917,0.3723496686190805,0.4392575643884293,0.42581910958759156],[3,13.8,2.22,1.52,0.64,0.07],[2.06,13.8,2.494397538261738,0.2653941008458629,0.3389892307030933,0.20439753826173782],[3,13.8,2.5197059810017257,0.31400129900266527,0.4330888156170311,0.22970598100172576],[3.94,13.8,2.5799225534376675,0.3647755440446167,0.3180665437318258,0.2899225534376676],[3,13.8,3.19,1.52,0.64,0.07],[2.06,13.8,3.582651734944098,0.2484788189444799,0.5127643720161833,0.3226517349440982],[3,13.8,3.6487592116063996,0.21916025561507443,0.5138539625599163,0.3887592116064],[3.94,13.8,3.4351105907075015,0.21892562437755106,0.24774846138196943,0.1751105907075019],[8.05,13.559999999999999,1.66,0.07,0.07,1.66],[8.05,14.64,1.66,0.07,0.07,1.66],[10.95,13.559999999999999,1.66,0.07,0.07,1.66],[10.95,14.64,1.66,0.07,0.07,1.66],[9.5,14.1,0.24,1.52,0.64,0.07],[8.56,14.1,0.622969966537263,0.29739408373299636,0.48990412150401025,0.312969966537263],[9.5,14.1,0.4907687277778179,0.3848687244606862,0.37038609517385196,0.18076872777781788],[10.44,14.1,0.6532765396483444,0.3875384081962853,0.5384015461191327,0.3432765396483445],[9.5,14.1,1.23,1.52,0.64,0.07],[8.56,14.1,1.674029072593709,0.398710073775227,0.2603253015287262,0.37402907259370904],[9.5,14.1,1.6114692207161148,0.346669087313596,0.538271123193417,0.3114692207161148],[10.44,14.1,1.6689509996968102,0.40525033052806964,0.4472006970159704,0.36895099969681017],[9.5,14.1,2.22,1.52,0.64,0.07],[8.56,14.1,2.717665029194455,0.3479219378102417,0.5315512766458478,0.42766502919445487],[9.5,14.1,2.6835232505521702,0.32918592925962986,0.41509214828489854,0.39352325055217],[10.44,14.1,2.543488961921115,0.30685314400747915,0.5199988348595836,0.25348896192111536],[9.5,14.1,3.19,1.52,0.64,0.07],[8.56,14.1,3.612079029176679,0.2534724127527448,0.260282564100111,0.35207902917667927],[9.5,14.1,3.6324337628233425,0.24724592753675995,0.3399480163646796,0.3724337628233426],[10.44,14.1,3.567043506629625,0.3017001402798273,0.40557633507695295,0.3070435066296252],[11.55,7.56,1.66,0.07,0.07,1.66],[11.55,8.64,1.66,0.07,0.07,1.66],[14.45,7.56,1.66,0.07,0.07,1.66],[14.45,8.64,1.66,0.07,0.07,1.66],[13,8.1,0.24,1.52,0.64,0.07],[12.06,8.1,0.508510380288639,0.2540779483454284,0.37263724444463214,0.19851038028863902],[13,8.1,0.7031787385284284,0.3820245581466089,0.23626732234013648,0.3931787385284284],[13.94,8.1,0.7398378565205301,0.2467341562166057,0.33063227598042716,0.4298378565205302],[13,8.1,1.23,1.52,0.64,0.07],[12.06,8.1,1.7034356009643559,0.33537852281647207,0.23655080041757245,0.40343560096435577],[13,8.1,1.4721345655418139,0.2467924053009855,0.37960603408061,0.17213456554181378],[13.94,8.1,1.595747014214342,0.3683481150073706,0.2469091757402705,0.2957470142143418],[13,8.1,2.22,1.52,0.64,0.07],[12.06,8.1,2.5004436052322205,0.3081826609221626,0.5078673391616894,0.21044360523222042],[13,8.1,2.5425382123043954,0.4458474669664179,0.34159333023257255,0.2525382123043955],[13.94,8.1,2.6780641006448196,0.23020515978496253,0.2939727144660569,0.3880641006448194],[13,8.1,3.19,1.52,0.64,0.07],[12.06,8.1,3.695257285877492,0.3082048766851558,0.23882611847437346,0.4352572858774925],[13,8.1,3.621149066158552,0.3253907393795678,0.445352269557245,0.36114906615855213],[13.94,8.1,3.456758105185494,0.4230120294102629,0.3922240175201412,0.1967581051854939],[15.75,7.56,1.66,0.07,0.07,1.66],[15.75,8.64,1.66,0.07,0.07,1.66],[18.65,7.56,1.66,0.07,0.07,1.66],[18.65,8.64,1.66,0.07,0.07,1.66],[17.2,8.1,0.24,1.52,0.64,0.07],[16.259999999999998,8.1,0.7047407543083533,0.3756971165842191,0.4013372784332464,0.3947407543083533],[17.2,8.1,0.6418212005432609,0.23438209897436096,0.3245427851387654,0.3318212005432608],[18.14,8.1,0.48998317079380915,0.3142573093911099,0.5355479361728303,0.17998317079380916],[17.2,8.1,1.23,1.52,0.64,0.07],[16.259999999999998,8.1,1.5321595594293984,0.3018874932021716,0.5378063914695786,0.23215955942939845],[17.2,8.1,1.7330215916786815,0.42774705806270474,0.38602754024358193,0.4330215916786815],[18.14,8.1,1.6319400268848199,0.3046722013991318,0.2712432824845357,0.33194002688481994],[17.2,8.1,2.22,1.52,0.64,0.07],[16.259999999999998,8.1,2.504501697992835,0.25516226324942415,0.2453519976331458,0.21450169799283494],[17.2,8.1,2.7040454188432177,0.26921524520039497,0.48531577533224957,0.4140454188432175],[18.14,8.1,2.4384138716611665,0.4091333954487498,0.5270486040685631,0.14841387166116657],[17.2,8.1,3.19,1.52,0.64,0.07],[16.259999999999998,8.1,3.5140161822567686,0.4479454470333144,0.399415666809569,0.25401618225676903],[17.2,8.1,3.5008056945494044,0.21696550946288182,0.4984288323325247,0.24080569454940448],[18.14,8.1,3.6242921450638064,0.37043892605655077,0.43401066127980353,0.36429214506380664],[19.85,9.46,1.66,0.07,0.07,1.66],[19.85,10.54,1.66,0.07,0.07,1.66],[22.75,9.46,1.66,0.07,0.07,1.66],[22.75,10.54,1.66,0.07,0.07,1.66],[21.3,10,0.24,1.52,0.64,0.07],[20.36,10,0.6830337844019819,0.4126715042556819,0.2305363776627693,0.3730337844019819],[21.3,10,0.4678959226675601,0.3519883382753914,0.3909667361340362,0.1578959226675601],[22.240000000000002,10,0.4864766171456331,0.3485815411458779,0.32527836473536315,0.17647661714563312],[21.3,10,1.23,1.52,0.64,0.07],[20.36,10,1.670884493931585,0.3352201505724265,0.3312774571578044,0.37088449393158485],[21.3,10,1.7363028634633557,0.39837597525783247,0.39230664577502816,0.43630286346335573],[22.240000000000002,10,1.5938164887560164,0.2257919982213746,0.47237328148553526,0.2938164887560163],[21.3,10,2.22,1.52,0.64,0.07],[20.36,10,2.6147532775679907,0.1976487577303952,0.4323668028442841,0.3247532775679905],[21.3,10,2.4915056362376204,0.4148369174889728,0.44912396520983444,0.2015056362376203],[22.240000000000002,10,2.643412839552326,0.3607593937466914,0.2556712817724833,0.3534128395523257],[21.3,10,3.19,1.52,0.64,0.07],[20.36,10,3.5801053548150423,0.3744211692592525,0.29238900064252865,0.3201053548150425],[21.3,10,3.553773695466045,0.3306877178574422,0.3328242387962659,0.2937736954660452],[22.240000000000002,10,3.63113979847716,0.40509288997228105,0.23683523988211289,0.37113979847716033],[17.35,13.66,1.66,0.07,0.07,1.66],[17.35,14.739999999999998,1.66,0.07,0.07,1.66],[20.25,13.66,1.66,0.07,0.07,1.66],[20.25,14.739999999999998,1.66,0.07,0.07,1.66],[18.8,14.2,0.24,1.52,0.64,0.07],[17.86,14.2,0.5990589551915722,0.37172404400822473,0.5021017236867147,0.2890589551915721],[18.8,14.2,0.7217730674690948,0.3630166078237343,0.4899700185880074,0.4117730674690948],[19.740000000000002,14.2,0.6939084855681341,0.3128177612674816,0.3868578878905638,0.38390848556813406],[18.8,14.2,1.23,1.52,0.64,0.07],[17.86,14.2,1.450318331847214,0.22924597462855736,0.32566412631993424,0.15031833184721383],[18.8,14.2,1.475940502152294,0.399209169629957,0.5359654983572876,0.17594050215229387],[19.740000000000002,14.2,1.4545468373811303,0.30442766660998166,0.5231641575207513,0.15454683738113031],[18.8,14.2,2.22,1.52,0.64,0.07],[17.86,14.2,2.6542769014616194,0.430143818620663,0.4280648819409801,0.36427690146161945],[18.8,14.2,2.5155554997017266,0.24927583254428812,0.3507808325024557,0.22555549970172678],[19.740000000000002,14.2,2.579026565896096,0.19281276630078178,0.5023630934894251,0.2890265658960962],[18.8,14.2,3.19,1.52,0.64,0.07],[17.86,14.2,3.5265747868372195,0.20882699525624657,0.48528017546671554,0.26657478683721947],[18.8,14.2,3.6600909736267435,0.4257051792059768,0.3697599247116011,0.4000909736267439],[19.740000000000002,14.2,3.6358071497069617,0.3865393189603005,0.38215947229844105,0.3758071497069621],[10.3,4.6,0.1,0.95,0.72,0.1],[10.520000000000001,4.6,0.61,0.515,0.55,0.41],[9.760000000000002,4.6,0.43,0.28,0.515,0.23],[10.48,4.6,1.32,0.41,0.37,0.3],[14.6,3.2,0.1,0.95,0.72,0.1],[14.82,3.2,0.61,0.515,0.55,0.41],[14.059999999999999,3.2,0.43,0.28,0.515,0.23],[14.78,3.2,1.32,0.41,0.37,0.3],[19.1,4.9,0.1,0.95,0.72,0.1],[19.32,4.9,0.61,0.515,0.55,0.41],[18.560000000000002,4.9,0.43,0.28,0.515,0.23],[19.28,4.9,1.32,0.41,0.37,0.3],[3.1,4.4,0.1,0.95,0.72,0.1],[3.3200000000000003,4.4,0.61,0.515,0.55,0.41],[2.56,4.4,0.43,0.28,0.515,0.23],[3.2800000000000002,4.4,1.32,0.41,0.37,0.3]];
@@ -123,21 +272,138 @@ try {
   camera.up.set(0,0,1);
   camera.position.set(18,-4,7.3);
   camera.lookAt(10.8,8.8,1.4);
+
+  // ---- Moving objects -------------------------------------------------------
+  // type/param drive the analytic SDF; every geometry is also baked into the mesh
+  // atlas, so "Baked SDF for all movers" can switch any of them to the mesh path.
+  // Paths stay in open space; pose(t) -> position plus rotations (applied X, Y, then Z).
+  const teapot=new TeapotGeometry(1,8).rotateX(Math.PI/2);
+  teapot.computeBoundingBox();
+  teapot.scale(...Array(3).fill(.55/(teapot.boundingBox.max.z-teapot.boundingBox.min.z)));
+  const S=Math.sin,C=Math.cos;
+  const movers=[
+    {name:'crate',type:0,param:[.45,.45,.45,0],geometry:new T.BoxGeometry(.9,.9,.9),
+     pose:t=>({x:15+6*S(t*.35),y:1.4,z:.45,rz:t*.6})},
+    {name:'pillar',type:0,param:[.3,.3,1,0],geometry:new T.BoxGeometry(.6,.6,2),
+     pose:t=>({x:9.8+1.05*C(t*.5),y:8.6+1.05*S(t*.5),z:1,rz:-t*.5})},
+    {name:'floating box',type:0,param:[.5,.5,.25,0],geometry:new T.BoxGeometry(1,1,.5),
+     pose:t=>({x:17,y:6.5,z:1.3+.7*S(t*.8),rz:t*.4})},
+    {name:'plank',type:0,param:[1,.3,.08,0],geometry:new T.BoxGeometry(2,.6,.16),
+     pose:t=>({x:21.8,y:6.6,z:1,rz:t*.7})},
+    {name:'sphere',type:1,param:[.4,0,0,0],geometry:new T.SphereGeometry(.4,48,24),
+     pose:t=>{const x=4.5+2.5*S(t*.4);return {x,y:2,z:.4,ry:(x-4.5)/.4};}},
+    {name:'rounded box',type:4,param:[.35,.25,.3,.1],geometry:new RoundedBoxGeometry(.7,.5,.6,4,.1),
+     pose:t=>({x:6.5,y:3.6,z:.75,rx:t*.7,ry:t*.5})},
+    {name:'capsule',type:2,param:[.22,.35,0,0],geometry:new T.CapsuleGeometry(.22,.7,8,24),
+     pose:t=>({x:22.6,y:3.3,z:.9,rx:t*.8,rz:t*.3})},
+    {name:'cylinder',type:3,param:[.32,.45,0,0],geometry:new T.CylinderGeometry(.32,.32,.9,40),
+     pose:t=>({x:16.9,y:4+1.1*S(t*.45),z:.45,rx:Math.PI/2})},
+    {name:'torus',type:5,param:[.42,.14,0,0],geometry:new T.TorusGeometry(.42,.14,24,64),
+     pose:t=>({x:12.45,y:4.6,z:.85,rx:Math.PI/2,rz:t*.6})},
+    {name:'teapot',type:6,geometry:teapot,
+     pose:t=>({x:13+2.2*S(t*.3),y:11.7,z:2.46+.275,rz:t*.5})},
+    {name:'torus knot',type:6,geometry:new T.TorusKnotGeometry(.3,.09,160,20),
+     pose:t=>({x:15,y:6,z:1.4+.2*S(t*.9),rx:t*.4,rz:t*.6})},
+  ];
+  if(movers.length>MAX_DYN)throw Error('Too many movers');
+  for(const m of movers){
+    m.geometry.center();
+    m.geometry.computeBoundingBox();
+    m.geometry.computeBoundingSphere();
+    m.radius=m.geometry.boundingSphere.radius+1e-3;
+    const b=m.geometry.boundingBox;
+    m.half=[Math.max(-b.min.x,b.max.x),Math.max(-b.min.y,b.max.y),Math.max(-b.min.z,b.max.z)];
+  }
+
+  // ---- Bake every mover's local-space SDF into one 3D atlas (one slab each) ----
+  const atlasTarget=new T.WebGL3DRenderTarget(MESH_RES,MESH_RES,MESH_RES*movers.length,{depthBuffer:false});
+  const atlas=atlasTarget.texture;
+  atlas.format=T.RedFormat;atlas.type=T.HalfFloatType;
+  atlas.minFilter=atlas.magFilter=T.LinearFilter;atlas.generateMipmaps=false;
+  const bakeMaterial=new T.ShaderMaterial({
+    glslVersion:T.GLSL3,vertexShader:bakeVertexShader,fragmentShader:bakeFragmentShader,
+    uniforms:{tris:{value:null},triCount:{value:0},texW:{value:1024},halfSize:{value:1},layer:{value:0}}
+  });
+  const quad=new FullScreenQuad(bakeMaterial);
+  const bakeStart=performance.now();
+  let totalTris=0;
+  movers.forEach((m,slab)=>{
+    const pos=(m.geometry.index?m.geometry.toNonIndexed():m.geometry).attributes.position;
+    const triCount=pos.count/3, texW=1024, texH=Math.ceil(pos.count/texW);
+    const data=new Float32Array(texW*texH*4);
+    for(let i=0;i<pos.count;i++)data.set([pos.getX(i),pos.getY(i),pos.getZ(i),0],i*4);
+    const tris=new T.DataTexture(data,texW,texH,T.RGBAFormat,T.FloatType);
+    tris.needsUpdate=true;
+    const halfSize=Math.max(...m.half)+MESH_PAD;
+    const u=bakeMaterial.uniforms;
+    u.tris.value=tris;u.triCount.value=triCount;u.texW.value=texW;u.halfSize.value=halfSize;
+    for(let z=0;z<MESH_RES;z++){
+      bakeMaterial.uniforms.layer.value=z;
+      renderer.setRenderTarget(atlasTarget,slab*MESH_RES+z);
+      quad.render(renderer);
+    }
+    m.meshParam=new T.Vector4(slab,halfSize,0,0);
+    m.analyticParam=m.type===6?m.meshParam:new T.Vector4(...m.param);
+    totalTris+=triCount;
+    tris.dispose();
+  });
+  renderer.setRenderTarget(null);
+  renderer.getContext().finish();
+  const bakeMs=performance.now()-bakeStart;
+  quad.dispose();bakeMaterial.dispose();
+
   const variants=[0,4,14,34,32,36];
   const mask={value:false};
+  const dyn={
+    dynInv:{value:Array.from({length:MAX_DYN},()=>new T.Matrix4())},
+    dynParam:{value:Array.from({length:MAX_DYN},()=>new T.Vector4())},
+    dynType:{value:new Array(MAX_DYN).fill(0)},
+    dynSphere:{value:Array.from({length:MAX_DYN},()=>new T.Vector4())},
+    dynCount:{value:0},
+    meshAtlas:{value:atlas},
+    meshSlabs:{value:movers.length}
+  };
   const materials=Object.fromEntries(variants.map(mode=>[mode,new T.ShaderMaterial({
     glslVersion:T.GLSL3,vertexShader,fragmentShader,
     defines:mode===34?{FAST:1,CONTACT:1}:mode===14?{FAST:1}:{TAPS:mode},
-    uniforms:{field:{value:field},showMask:mask}
+    uniforms:{field:{value:field},showMask:mask,...dyn}
   })]));
   if(!boxes.length||boxes.some(b=>b.length!==6||b.some(v=>!Number.isFinite(v))))throw Error('Invalid geometry');
   const mesh=new T.InstancedMesh(new T.BoxGeometry(1,1,1),materials[0],boxes.length);
   const walls=new Float32Array(boxes.length);
   walls[1]=walls[2]=1;
   mesh.geometry.setAttribute('wall',new T.InstancedBufferAttribute(walls,1));
+  mesh.geometry.setAttribute('selfSkip',new T.InstancedBufferAttribute(new Float32Array(boxes.length).fill(-1),1));
+  mesh.geometry.setAttribute('boundsHalf',new T.InstancedBufferAttribute(new Float32Array(boxes.length*3).fill(.5),3));
   const matrix=new T.Matrix4();
   boxes.forEach(([x,y,z,hx,hy,hz],i)=>mesh.setMatrixAt(i,matrix.makeScale(2*hx,2*hy,2*hz).setPosition(x,y,z)));
   scene.add(mesh);
+  // Each mover is drawn as a one-instance InstancedMesh so it shares the scene shader.
+  for(const m of movers){
+    m.geometry.setAttribute('wall',new T.InstancedBufferAttribute(new Float32Array([0]),1));
+    m.geometry.setAttribute('selfSkip',new T.InstancedBufferAttribute(new Float32Array([m.type<=4?movers.indexOf(m):-1]),1));
+    m.geometry.setAttribute('boundsHalf',new T.InstancedBufferAttribute(new Float32Array(m.half),3));
+    m.object=new T.InstancedMesh(m.geometry,materials[0],1);
+    m.object.instanceMatrix.setUsage(T.DynamicDrawUsage);
+    m.object.frustumCulled=false;
+    scene.add(m.object);
+  }
+  const rigid=new T.Matrix4(),euler=new T.Euler();
+  let dynamicAO=true,animate=true,forceMesh=false,simTime=0,lastNow=0;
+  function updateMovers(t){
+    movers.forEach((m,i)=>{
+      const {x,y,z,rx=0,ry=0,rz=0}=m.pose(t);
+      rigid.makeRotationFromEuler(euler.set(rx,ry,rz,'ZYX')).setPosition(x,y,z);
+      dyn.dynInv.value[i].copy(rigid).invert();
+      dyn.dynType.value[i]=forceMesh?6:m.type;
+      dyn.dynParam.value[i].copy(forceMesh?m.meshParam:m.analyticParam);
+      dyn.dynSphere.value[i].set(x,y,z,m.radius);
+      m.object.setMatrixAt(0,rigid);
+      m.object.instanceMatrix.needsUpdate=true;
+    });
+    dyn.dynCount.value=dynamicAO?movers.length:0;
+  }
+  updateMovers(0);
   const radius=1.12;
   // Seed Three.js's SSAO kernel and noise texture for reproducible captures.
   const originalRandom=Math.random;
@@ -164,27 +430,32 @@ try {
   const scratch=new T.WebGLRenderTarget(W,H,{depthBuffer:false});
   const screenMaterial=new T.ShaderMaterial({
     glslVersion:T.GLSL3,vertexShader,fragmentShader,
-    defines:{TAPS:0,SCREEN_AO:1},uniforms:{aoMap:{value:null},showMask:mask}
+    defines:{TAPS:0,SCREEN_AO:1},uniforms:{aoMap:{value:null},showMask:mask,...dyn}
   });
   const controls=new OrbitControls(camera,renderer.domElement);
   controls.target.set(10.8,8.8,1.4);
   controls.minDistance=1.5;
   controls.maxDistance=45;
   controls.update();
-  renderer.domElement.setAttribute('aria-label','3D Archive test scene with stairs, shelves and walls');
+  renderer.domElement.setAttribute('aria-label','3D Archive test scene with stairs, shelves, walls and moving objects');
+  function setMaterial(material){
+    mesh.material=material;
+    for(const m of movers)m.object.material=material;
+  }
   function render(taps){
     if(taps===32||taps===36){
       const pass=taps===32?ssao:gtao;
       pass.render(renderer,scratch,scratch);
       screenMaterial.uniforms.aoMap.value=taps===32?ssao.blurRenderTarget.texture:gtao.pdRenderTarget.texture;
-      mesh.material=screenMaterial;
-    } else mesh.material=materials[taps];
+      setMaterial(screenMaterial);
+    } else setMaterial(materials[taps]);
     renderer.setRenderTarget(null);
     renderer.render(scene,camera);
   }
   const buttons=[...document.querySelectorAll('button[data-taps]')];
   const fpsValue=document.querySelector('#fps-value');
   const frameMs=document.querySelector('#frame-ms');
+  const bakeNote=` · baked ${movers.length} mover SDFs (${MESH_RES}³, ${totalTris.toLocaleString()} triangles) in ${bakeMs.toFixed(0)} ms`;
   let selected=14;
   let started=0;
   let frames=0;
@@ -198,14 +469,24 @@ try {
     selected=mode;
     buttons.forEach(button=>button.setAttribute('aria-pressed',Number(button.dataset.taps)===mode));
     const label=buttons.find(button=>Number(button.dataset.taps)===mode).textContent;
-    status.value=label+' · 1280 × 720 · 1.12 m AO radius';
+    status.value=label+' · 1280 × 720 · 1.12 m AO radius'+bakeNote;
     resetFps();
   }
   buttons.forEach(button=>button.onclick=()=>select(Number(button.dataset.taps)));
   document.querySelector('#mask').onchange=event=>{mask.value=event.target.checked;resetFps();};
+  document.querySelector('#animate').onchange=event=>{animate=event.target.checked;};
+  document.querySelector('#dynao').onchange=event=>{dynamicAO=event.target.checked;updateMovers(simTime);resetFps();};
+  document.querySelector('#forcemesh').onchange=event=>{forceMesh=event.target.checked;updateMovers(simTime);resetFps();};
+  // Debug hook for timing from the console.
+  window.aoDemo={renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,totalTris,select:mode=>select(mode),
+    setDynamicAO:on=>{dynamicAO=on;updateMovers(simTime);},
+    setForceMesh:on=>{forceMesh=on;updateMovers(simTime);}};
   document.addEventListener('visibilitychange',resetFps);
   select(selected);
   renderer.setAnimationLoop(now=>{
+    if(animate&&lastNow)simTime+=Math.min(now-lastNow,100)/1000;
+    lastNow=now;
+    if(animate)updateMovers(simTime);
     render(selected);
     if(!started){started=now;return;}
     frames++;
