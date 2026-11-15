@@ -11,7 +11,7 @@ sample  sample(offset) -> (N,) signed distance to the static scene at each pixel
 Rules (enforced by the judge before the formula runs): plain arithmetic, comparisons, `if`
 expressions and these np functions only: clip minimum maximum where abs sqrt exp log power square
 tanh sign floor fmin fmax. No imports, loops, comprehensions, attributes other than np.<name>,
-names starting with "_", pixel-mixing indexing (only n[:, k]), or more than 48 numeric constants.
+names starting with "_", pixel-mixing indexing (only n[:, k]), or more than 96 numeric constants (8 KB of source).
 The result must stay portable to a few lines of GLSL.
 
 This seed is the viewer's "SDF wall correction" (index.html, FAST path): taps along the normal at
