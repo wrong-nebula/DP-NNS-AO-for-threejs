@@ -136,6 +136,22 @@ float dynamicDistance(vec3 pos){
   return d;
 }
 const vec4 R=vec4(.16,.48,.80,1.12);
+// "SDF wall correction" AO from the four tap distances. Off the structural walls each tap has its
+// own bias and response curve (near tap squared, middle taps square-rooted, far tap to the 8th
+// power), found by the AO accuracy campaign against ray-traced AO; on walls (by the vertical factor)
+// it stays the shipped wall-corrected weighting. accuracy/ao_formula.py is the reference version.
+float aoWallCorrection(vec4 d,vec3 normal){
+  vec4 t=clamp(1.-(d+.045)/R,0.,1.);
+  float vertical=wallFace*(1.-abs(normal.z));
+  float farSupport=.40+.60*max(t.x,t.y);
+  vec4 original=.92*vec4(1.,.8166666667,.6333333333,.45)/2.9;
+  vec4 corrected=vec4(.46,.24,.21*farSupport,.16*farSupport);
+  float wallAO=1.-dot(t,mix(original,corrected,vertical));
+  vec4 s=clamp(1.-(d+vec4(.024,.078,0.,.02))/R,0.,1.);
+  float far=s.w*s.w;far*=far;far*=far;
+  float openAO=1.-(.92/2.9)*(s.x*s.x+.8166666667*sqrt(s.y)+.6333333333*sqrt(s.z)+.45*far);
+  return mix(openAO,wallAO,vertical);
+}
 // Scene distance at the four tap points p+normal*R. The static samples are fetched
 // together up front; each nearby mover is transformed to local space once and all
 // four taps are tested against it.
@@ -210,20 +226,17 @@ void main(){
     if(((cand>>i)&1)!=0&&distance(p+normal*R.w,dynSphere[i].xyz)-dynSphere[i].w<R.w-.044)dynMask|=1<<i;
   }
   #if defined(FAST)
-    vec4 tapsAll=clamp(1.-(tapDistances(p,normal)+.045)/R,0.,1.);
-    vec4 tapsStatic=clamp(1.-(dStatic+.045)/R,0.,1.);
-    vec4 taps=tapsStatic+(tapsAll-tapsStatic)*moverScale;
+    vec4 dAll=tapDistances(p,normal);
     #ifdef CONTACT
+      vec4 tapsAll=clamp(1.-(dAll+.045)/R,0.,1.);
+      vec4 tapsStatic=clamp(1.-(dStatic+.045)/R,0.,1.);
+      vec4 taps=tapsStatic+(tapsAll-tapsStatic)*moverScale;
       // Emphasize near contacts while retaining longer-range contributions.
       ao=1.-dot(taps,vec4(.46,.24,.21,.16));
     #else
-      // Suppress weak, far-only hits while retaining broad occlusion
-      // when the nearer probes also see the blocker.
-      float vertical=wallFace*(1.-abs(normal.z));
-      float farSupport=.40+.60*max(taps.x,taps.y);
-      vec4 original=.92*vec4(1.,.8166666667,.6333333333,.45)/2.9;
-      vec4 corrected=vec4(.46,.24,.21*farSupport,.16*farSupport);
-      ao=1.-dot(taps,mix(original,corrected,vertical));
+      // Movers add occlusion through the same formula, weighted by moverScale.
+      float aoStatic=aoWallCorrection(dStatic,normal);
+      ao=aoStatic+(aoWallCorrection(dAll,normal)-aoStatic)*moverScale.x;
     #endif
   #elif TAPS == 4
     // Same radii and weights as the generic loop below, evaluated four-wide.
