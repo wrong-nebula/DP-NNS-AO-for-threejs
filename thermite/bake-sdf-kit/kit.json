@@ -3,30 +3,75 @@
   "name": "bake-sdf-cpu",
   "target": "cpu",
   "build": {
-    "command": ["sh", "-c", "c++ -O3 -std=c++17 -pthread tools/bake_sdf.cpp -o bake_sdf"],
-    "outputs": ["bake_sdf"],
+    "command": [
+      "sh",
+      "-c",
+      "clang++ -O3 -std=c++17 -pthread -stdlib=libc++ tools/bake_sdf.cpp -o bake_sdf"
+    ],
+    "outputs": [
+      "bake_sdf"
+    ],
     "timeout_s": 300
   },
   "cells": {
-    "archive": { "cell": "archive", "subdiv": 1 },
-    "dense": { "cell": "dense", "subdiv": 16 },
-    "dense8": { "cell": "dense8", "subdiv": 8 }
+    "archive": {
+      "cell": "archive",
+      "subdiv": 1
+    },
+    "dense": {
+      "cell": "dense",
+      "subdiv": 16
+    },
+    "dense8": {
+      "cell": "dense8",
+      "subdiv": 8
+    }
   },
   "run": {
-    "copy": ["run.sh", "inputs/archive.json"],
-    "command": ["sh", "{kit:run.sh}", "{build}", "{params}", "{out}", "{kit:inputs/archive.json}"],
+    "copy": [
+      "run.sh",
+      "inputs/archive.json"
+    ],
+    "command": [
+      "sh",
+      "{kit:run.sh}",
+      "{build}",
+      "{params}",
+      "{out}",
+      "{kit:inputs/archive.json}"
+    ],
     "timeout_s": 120,
     "rss_mib": 2048,
     "disk_mib": 256
   },
   "metrics": {
-    "bake_s": { "unit": "s", "from": "time" },
-    "visible_mismatch": { "unit": "voxels", "from": "check", "field": "visible_mismatch", "may_be_zero": true },
-    "mae14": { "from": "check", "field": "mae14" },
-    "mae4": { "from": "check", "field": "mae4" }
+    "bake_s": {
+      "unit": "s",
+      "from": "time"
+    },
+    "visible_mismatch": {
+      "unit": "voxels",
+      "from": "check",
+      "field": "visible_mismatch",
+      "may_be_zero": true
+    },
+    "mae14": {
+      "from": "check",
+      "field": "mae14"
+    },
+    "mae4": {
+      "from": "check",
+      "field": "mae4"
+    }
   },
   "check": {
-    "command": ["python3", "{kit}/check.py", "{kit}", "{out}", "{params_json}"],
+    "command": [
+      "python3",
+      "{kit}/check.py",
+      "{kit}",
+      "{out}",
+      "{params_json}"
+    ],
     "timeout_s": 120
   }
 }

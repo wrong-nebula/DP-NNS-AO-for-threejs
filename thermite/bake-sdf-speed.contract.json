@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
   "campaign": "bake-sdf-speed",
-  "version": 4,
+  "version": 5,
   "title": "Faster static SDF bake (tools/bake_sdf.cpp) with output identical where the AO reads it",
   "mode": "hill_climb",
   "project": {
     "repo": "dpnns-ao",
-    "commit": "d81792ba4f2963c5ecaa38714ea3e5d700419553",
+    "commit": "07382aecdb56cdce30b4f2933b1dbc13bad41f40",
     "kit": {
       "repo": "bake-sdf-kit",
-      "commit": "5126ae937f9262065b8748b80265e112a7c4be5f"
+      "commit": "b10c26da2b7c430f27372ff28ffaf42e4e31b3bb"
     }
   },
   "target": {
@@ -75,7 +75,7 @@
     "runs_per_cell": 3,
     "confirm_blocks": 5
   },
-  "additional_information": "`tools/bake_sdf.cpp` bakes a 128^3 clipped signed distance field (float32) from triangles. The AO shader only reads distances below 1.075 m, so trilinear samples read stored values below 1.33 m (reach plus one voxel diagonal). The judge requires every voxel whose value is below 1.33 m to be bit-identical to the original baker's output, and allows values above that only to be raised. Values below the band must never change.\n\nMeasured so far (Apple M1, 8 threads): the distance pass dominates the Archive (1,908 triangles, ~1.5M BVH queries, ~0.5 us each). On the dense 488k-triangle mesh, the BVH build was a third of the time before it was parallelised. Already in the seed: parallel BVH build with identical node layout, skipping the unused grid build, per-voxel Lipschitz culling from the block centre's exact distance, `--reach`, and one triangle per BVH leaf (Archive -21%, output identical).\n\nTried and rejected: seeding each query with the block centre's triangle (no gain); BVH leaves of 8 (slower); tie-breaking slack at the seed distance (12% more triangle tests, because box scenes have many equidistant triangles).\n\nThe rig shares its host with other work, so timings are noisy; each cell runs 3 times per block.",
+  "additional_information": "`tools/bake_sdf.cpp` bakes a 128^3 clipped signed distance field (float32) from triangles. The AO shader only reads distances below 1.075 m, so trilinear samples read stored values below 1.33 m (reach plus one voxel diagonal). The judge requires every voxel whose value is below 1.33 m to be bit-identical to the original baker's output, and allows values above that only to be raised. Values below the band must never change.\n\nMeasured so far (Apple M1, 8 threads): the distance pass dominates the Archive (1,908 triangles, ~1.5M BVH queries, ~0.5 us each). On the dense 488k-triangle mesh, the BVH build was a third of the time before it was parallelised. Already in the seed: parallel BVH build with identical node layout, skipping the unused grid build, per-voxel Lipschitz culling from the block centre's exact distance, `--reach`, and one triangle per BVH leaf (Archive -21%, output identical), a binned-SAH build and a cache-line node layout (Thermite run 4's champions 2 and 3).\n\nTried and rejected: seeding each query with the block centre's triangle (no gain); BVH leaves of 8 (slower); tie-breaking slack at the seed distance (12% more triangle tests, because box scenes have many equidistant triangles).\n\nThe rig shares its host with other work, so timings are noisy; each cell runs 3 times per block.\n\nThe judge builds with clang++ 16 and libc++, like the target Mac (Apple clang 16). Run 4's g++ judge promoted a 4-wide BVH that is 7-24% slower under clang; code that only wins under one compiler's codegen is not a win here.",
   "ideas": [
     "float32 BVH bounds and a 4-wide BVH with structure-of-arrays boxes; keep triangle distances in double, or prove float gives identical stored values",
     "SAH or binned-SAH build instead of median split (fewer node visits per query)",

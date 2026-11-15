@@ -24,12 +24,11 @@ The reference fields, `eval_ao.py` and the ray-traced reference live in `refs/`.
 
 Single runs on a shared host; the campaign uses 3 runs per cell per block, and 5 confirmation blocks. Negative tests: one voxel changed by 1 mm inside the band fails, and far values raised to the clip pass.
 
-## Status: running on its own rig, `local-4`
+## Status: run 5, clang judge, on `local-4`
 
-- **Run `bake-sdf-speed-4`** was assigned 2026-11-15 13:54 JST, from contract v4 (kit `5126ae9`: one third of the CPU quota as bake threads). It is seeded from `d81792b`, with a budget of $20 and 4 h.
-- **Rig `local-4`:** added for this campaign only, so it never displaces another campaign. It is defined in `~/thermite/compose.override.yaml` (profile `rig-four`, derived from the `-3` services), with the harness at 3 CPUs / 2.5 GB and the supervisor at 1 CPU. The images are the stock 0.2.4 harness and supervisor, each with only Claude Code 2.1.325 added. Workers run `opus-5.5` from the `default` provider (your Claude subscription) under Claude Code. With a 3-CPU quota, the bake gets 1 thread.
-- **Baseline** (13:55, 3 blocks): archive `bake_s` 0.726 s ±16%, dense 1.219 s ±4.5%. MAE 0.04012 / 0.04211 and `visible_mismatch` 0 on both cells. Calibration (A/A) and the planner's epoch 1 started right after.
-- **Earlier runs, kept for the record:** 1, no kit named in the contract; 2 and 3, baseline blocks CPU-throttled (8, then 4 threads on `local-1`'s 6-CPU quota, on a shared machine at load 11–15); 3 was also displaced on `local-1` by another session's run.
-- **Results:** follow the run on the dashboard (http://127.0.0.1:8800/ui) or at `GET /v1/runs/bake-sdf-speed-4`.
+- **Run `bake-sdf-speed-5`** was assigned 2026-11-15 18:15 JST, from contract v5. Kit `b10c26d` builds with **clang++ 16 + libc++** (Debian), the closest match to the target Mac's Apple clang 16 + libc++. It is seeded from champion #3 (`07382ae`).
+- **Why the switch:** run 4's judge built with g++ 12. It promoted a 4-wide BVH (its champion #4) that is 7–24% slower than champion #3 under Apple clang at 1 and 8 threads, with identical output. The clang judge, on cores 6–7, ranks the two the way the Mac does: archive +28.5% and dense +9% slower for #4.
+- **Rig `local-4`:** harness image `local/thermite-harness:0.2.4-claude-clang`, pinned to cores 6–7 while `local-2` is stopped, with no CPU quota. Workers run `opus-5.5` (Claude subscription) under Claude Code.
+- **Run 4 (g++ judge), paused:** champions #2 binned-SAH (`e6483a1` here) and #3 cache-line nodes (`07382ae` here) were verified on the Mac and committed; #4 was not adopted. Trials: 10, with 3 promoted, 3 not confirmed and 4 inconclusive.
 
 GPU work (runtime AO, the mover bake) can't run on this rig: it is a CPU target in a Linux container with no browser GPU. Those stay with `benchmark/mover-bench.js` on the Mac.
