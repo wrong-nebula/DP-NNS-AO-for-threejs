@@ -144,51 +144,100 @@ struct Searcher {
 };
 
 // ------------------------------------------------------------------ triangle BVH
-// Binary BVH, median split on the longest centroid axis, leaves of up to BVH_LEAF triangles.
+// Binary BVH, binned-SAH split on centroids, leaves of up to BVH_LEAF triangles.
 // Closest-triangle queries visit the nearer child first and skip boxes beyond the best distance,
 // so a good starting bound (e.g. the previous voxel's triangle) prunes most of the tree.
+#ifndef BVH_BINS
+#define BVH_BINS 16
+#endif
+#ifndef BVH_SAH_MIN
+#define BVH_SAH_MIN 0   // ranges of at most this many triangles use the median split (SAH all the way down is fastest to query)
+#endif
 #ifndef BVH_LEAF
 #define BVH_LEAF 1   // one triangle per leaf: Archive -21% vs 4, dense mesh unchanged, output identical
 #endif
 struct BVH {
     struct Node { V3 lo,hi; int left=-1,right=-1,start=0,count=0; };
-    std::vector<Node> nodes; std::vector<uint32_t> order; const std::vector<Tri>& t;
+    // Build primitive: triangle bounds, centroid and index, partitioned in place (contiguous, cache friendly).
+    // float32 halves the build's memory traffic. Bounds are rounded outward, so node boxes are
+    // conservative (at most one float ulp larger) and queries stay exact.
+    using F3 = std::array<float,3>;
+    struct Prim { F3 lo,hi,c; uint32_t id; };
+    static float down(double x){float f=float(x);return double(f)>x?std::nextafter(f,-INFINITY):f;}
+    static float up(double x){float f=float(x);return double(f)<x?std::nextafter(f,INFINITY):f;}
+    std::vector<Node> nodes; std::vector<uint32_t> order; const std::vector<Tri>& t; std::vector<Prim> prim;
     // threads > 1 builds the top subtrees in parallel. The node array is identical to the serial
-    // build (same splits, same pre-order layout), so queries and output do not change.
+    // build (same splits, same pre-order layout). Query results are exact for any tree shape.
     explicit BVH(const std::vector<Tri>& tris,int threads=1):t(tris){
-        order.resize(t.size()); std::iota(order.begin(),order.end(),0);
-        std::vector<V3> cen(t.size()); for(size_t i=0;i<t.size();++i)cen[i]=(t[i].a+t[i].b+t[i].c)*(1./3);
-        int depth=0; while((2<<depth)<=threads&&depth<6)++depth;   // 2^depth subtrees
-        nodes=buildTree(0,int(t.size()),cen,depth);
+        prim.resize(t.size());
+        for(size_t i=0;i<t.size();++i){Prim& q=prim[i];const V3 c=(t[i].a+t[i].b+t[i].c)*(1./3);q.id=uint32_t(i);
+            for(int k=0;k<3;++k){q.c[k]=float(c[k]);q.lo[k]=down(std::min({t[i].a[k],t[i].b[k],t[i].c[k]}));q.hi[k]=up(std::max({t[i].a[k],t[i].b[k],t[i].c[k]}));}}
+        int depth=0; while((1<<depth)<2*threads&&depth<7)++depth;   // up to 2x as many subtrees as threads (SAH splits are uneven)
+        if(threads<=1)depth=0;
+        nodes=buildTree(0,int(t.size()),depth);
+        order.resize(t.size()); for(size_t i=0;i<t.size();++i)order[i]=prim[i].id;
+        std::vector<Prim>().swap(prim);
     }
-    std::vector<Node> buildTree(int s,int e,const std::vector<V3>& cen,int depth){
+    std::vector<Node> buildTree(int s,int e,int depth){
         std::vector<Node> out;
-        if(depth<=0||e-s<=8192){out.reserve(2*(e-s)/4+2);build(s,e,cen,out);return out;}
-        int ax; Node n=split(s,e,cen,ax); const int m=(s+e)/2;
+        if(depth<=0||e-s<=8192){out.reserve(2*(e-s)/BVH_LEAF+2);build(s,e,out);return out;}
+        int m; Node n=split(s,e,m);
         std::vector<Node> L,R;
-        std::thread th([&]{L=buildTree(s,m,cen,depth-1);}); R=buildTree(m,e,cen,depth-1); th.join();
+        std::thread th([&]{L=buildTree(s,m,depth-1);}); R=buildTree(m,e,depth-1); th.join();
         out.reserve(1+L.size()+R.size()); out.push_back(n);
         auto append=[&](const std::vector<Node>& v){const int off=int(out.size());for(Node x:v){if(x.left>=0){x.left+=off;x.right+=off;}out.push_back(x);}return off;};
         out[0].left=append(L); out[0].right=append(R);
         return out;
     }
-    // Bounds of [s,e); for internal nodes also partitions `order` at the median of the longest centroid axis.
-    Node split(int s,int e,const std::vector<V3>& cen,int& ax){
-        Node n; n.lo={INFINITY,INFINITY,INFINITY}; n.hi={-INFINITY,-INFINITY,-INFINITY}; V3 clo=n.lo,chi=n.hi;
-        for(int i=s;i<e;++i){const Tri& x=t[order[i]];for(const V3* p:{&x.a,&x.b,&x.c})for(int k=0;k<3;++k){n.lo[k]=std::min(n.lo[k],(*p)[k]);n.hi[k]=std::max(n.hi[k],(*p)[k]);}
-            for(int k=0;k<3;++k){clo[k]=std::min(clo[k],cen[order[i]][k]);chi[k]=std::max(chi[k],cen[order[i]][k]);}}
-        ax=0; if(e-s<=BVH_LEAF)return n;
-        for(int k=1;k<3;++k)if(chi[k]-clo[k]>chi[ax]-clo[ax])ax=k;
-        const int m=(s+e)/2;
-        std::nth_element(order.begin()+s,order.begin()+m,order.begin()+e,[&](uint32_t a,uint32_t b){return cen[a][ax]<cen[b][ax];});
+    // Bounds of [s,e); for internal nodes also partitions `prim` and sets the split index m.
+    // Ranges above BVH_SAH_MIN use a binned SAH split (BVH_BINS centroid bins on each axis,
+    // cost = area(L)*n(L) + area(R)*n(R)); smaller ones, or when no bin boundary separates the
+    // centroids, split at the median of the longest centroid axis.
+    Node split(int s,int e,int& m){
+        Node n; F3 lo{INFINITY,INFINITY,INFINITY},hi{-INFINITY,-INFINITY,-INFINITY},clo=lo,chi=hi;
+        for(int i=s;i<e;++i){const Prim& q=prim[i];for(int k=0;k<3;++k){lo[k]=std::min(lo[k],q.lo[k]);hi[k]=std::max(hi[k],q.hi[k]);
+            clo[k]=std::min(clo[k],q.c[k]);chi[k]=std::max(chi[k],q.c[k]);}}
+        for(int k=0;k<3;++k){n.lo[k]=lo[k];n.hi[k]=hi[k];}
+        m=s; if(e-s<=BVH_LEAF)return n;
+        if(e-s>BVH_SAH_MIN){
+            // Small ranges use fewer bins (at most one per triangle): the per-node bin setup and sweep
+            // would otherwise dominate the build at the bottom of the tree.
+            const int NB=std::min(BVH_BINS,e-s);
+            struct Bin { F3 lo{INFINITY,INFINITY,INFINITY},hi{-INFINITY,-INFINITY,-INFINITY}; int n=0; };
+            Bin bins[3][BVH_BINS]; float sc[3];
+            for(int ax=0;ax<3;++ax){const float ext=chi[ax]-clo[ax];sc[ax]=ext>0?float(NB)/ext:0;}
+            auto binOf=[&](const Prim& q,int ax){return std::min(NB-1,int((q.c[ax]-clo[ax])*sc[ax]));};
+            for(int i=s;i<e;++i){const Prim& q=prim[i];
+                for(int ax=0;ax<3;++ax){if(!(sc[ax]>0))continue;Bin& bn=bins[ax][binOf(q,ax)];++bn.n;
+                    for(int k=0;k<3;++k){bn.lo[k]=std::min(bn.lo[k],q.lo[k]);bn.hi[k]=std::max(bn.hi[k],q.hi[k]);}}}
+            auto area=[](const F3& a,const F3& b){float x=b[0]-a[0],y=b[1]-a[1],z=b[2]-a[2];return x*y+y*z+z*x;};
+            double bestCost=INFINITY; int bestAx=-1,bestB=0;
+            for(int ax=0;ax<3;++ax){
+                if(!(sc[ax]>0))continue;
+                float rArea[BVH_BINS]; int rCnt[BVH_BINS]; F3 lo={INFINITY,INFINITY,INFINITY},hi={-INFINITY,-INFINITY,-INFINITY}; int c=0;
+                for(int b=NB-1;b>0;--b){const Bin& bn=bins[ax][b];c+=bn.n;for(int k=0;k<3;++k){lo[k]=std::min(lo[k],bn.lo[k]);hi[k]=std::max(hi[k],bn.hi[k]);}rCnt[b]=c;rArea[b]=c?area(lo,hi):0;}
+                lo={INFINITY,INFINITY,INFINITY};hi={-INFINITY,-INFINITY,-INFINITY}; c=0;
+                for(int b=0;b<NB-1;++b){const Bin& bn=bins[ax][b];c+=bn.n;for(int k=0;k<3;++k){lo[k]=std::min(lo[k],bn.lo[k]);hi[k]=std::max(hi[k],bn.hi[k]);}
+                    if(!c||!rCnt[b+1])continue;
+                    const double cost=double(area(lo,hi))*c+double(rArea[b+1])*rCnt[b+1];
+                    if(cost<bestCost){bestCost=cost;bestAx=ax;bestB=b+1;}}
+            }
+            if(bestAx>=0){
+                const int ax=bestAx;
+                m=int(std::partition(prim.begin()+s,prim.begin()+e,[&](const Prim& q){return binOf(q,ax)<bestB;})-prim.begin());
+                if(m>s&&m<e)return n;
+            }
+        }
+        int ax=0; for(int k=1;k<3;++k)if(chi[k]-clo[k]>chi[ax]-clo[ax])ax=k;
+        m=(s+e)/2;
+        std::nth_element(prim.begin()+s,prim.begin()+m,prim.begin()+e,[&](const Prim& a,const Prim& b){return a.c[ax]<b.c[ax];});
         return n;
     }
-    int build(int s,int e,const std::vector<V3>& cen,std::vector<Node>& out){
-        int ax; Node n=split(s,e,cen,ax);
+    int build(int s,int e,std::vector<Node>& out){
+        int m; Node n=split(s,e,m);
         const int id=int(out.size()); out.push_back(n);
         if(e-s<=BVH_LEAF){out[id].start=s;out[id].count=e-s;return id;}
-        const int m=(s+e)/2;
-        const int l=build(s,m,cen,out),r=build(m,e,cen,out); out[id].left=l; out[id].right=r; return id;
+        const int l=build(s,m,out),r=build(m,e,out); out[id].left=l; out[id].right=r; return id;
     }
     static double boxDist2(const V3& p,const Node& n){double d=0;for(int k=0;k<3;++k){double v=std::max({n.lo[k]-p[k],0.,p[k]-n.hi[k]});d+=v*v;}return d;}
     // Returns the squared distance and sets `tri`; keeps `best2`/`tri` if nothing is closer.
