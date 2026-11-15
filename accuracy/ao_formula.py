@@ -26,7 +26,9 @@ def ao(n, wall, sample):
     up = (0.0, 0.0, 1.0)
     d0 = sample(n * r0)
     d1 = sample(n * r1)
-    d2 = sample(n * r2)
+    # Third tap on vertical faces: 0.7 m out, 0.4 m down, to see the floor and other
+    # supports below (wall-floor and crate-floor corners); 0.8 m along n on horizontal faces.
+    d2 = sample(n * (0.7 + 0.1 * (up * n * n)) - 0.4 * (up * (1 - n * n)))
     # Fourth tap: 1.12 m along the normal on floors, tops and undersides; on vertical
     # faces 0.8 m tilted 45 degrees up (0.5657 out, 0.5657 up), to see overhangs.
     # n * n is (0, 0, 1) on horizontal faces, so up * n * n and up * (1 - n * n) pick
@@ -37,12 +39,13 @@ def ao(n, wall, sample):
     # Structural walls: refit with GPU-robust terms only (square, linear clamps; no sqrt).
     # The biases put each clamp's kink away from where an open wall's taps sit
     # (d ~ r), so 8-bit trilinear / half-float rounding is not amplified. The
-    # constant 0.1383 lifts open walls to 1 (output clip).
-    v0 = np.clip(1 - (d0 + 0.1526) / r0, 0, 1)
-    v1 = np.clip(1 - (d1 - 0.0907) / r1, 0, 1)
-    v2 = np.clip(1 - (d2 - 0.5168) / r2, 0, 1)
-    v3 = np.clip(1 - (d3 + 0.1875) / 0.8, 0, 1)
-    walls = np.clip(1.1383 - (0.0598 * np.square(v0) + 0.5477 * v1 + 0.038 * v2 + 0.0891 * v3), 0, 1)
+    # constant 0.1356 lifts open walls to 1 (output clip). The large v0 weight only acts on
+    # contact pixels (d0 < 0.008 m), where the output is clipped to 0 anyway.
+    v0 = np.clip(1 - (d0 + 0.1523) / r0, 0, 1)
+    v1 = np.clip(1 - (d1 - 0.0624) / r1, 0, 1)
+    v2 = np.clip(1 - (d2 + 0.4135) / r2, 0, 1)
+    v3 = np.clip(1 - (d3 - 0.2624) / 0.8, 0, 1)
+    walls = np.clip(1.1356 - (7.212 * np.square(v0) + 0.4812 * v1 + 0.1365 * v2 + 0.1172 * v3), 0, 1)
     # Floors and tops (n.z > 0.7): champion per-tap bias + power on the 4 normal taps.
     s0 = np.clip(1 - (d0 + 0.024) / r0, 0, 1)
     s1 = np.clip(1 - (d1 + 0.078) / r1, 0, 1)
@@ -50,11 +53,11 @@ def ao(n, wall, sample):
     s3 = np.clip(1 - (d3 + 0.02) / r3, 0, 1)
     s3 = np.square(np.square(np.square(s3)))
     flat = 1 - k * (np.square(s0) + 0.8166666667 * np.sqrt(s1) + 0.6333333333 * np.sqrt(s2) + 0.45 * s3)
-    # Other faces: own bias/weights, linear response on the tilted tap.
-    u0 = np.clip(1 - (d0 - 0.0061) / r0, 0, 1)
-    u1 = np.clip(1 - (d1 + 0.1163) / r1, 0, 1)
-    u2 = np.clip(1 - (d2 + 0.0024) / r2, 0, 1)
-    u3 = np.clip(1 - (d3 + 0.2143) / 0.8, 0, 1)
-    side = 1 - (0.1337 * np.square(u0) + 0.1146 * np.sqrt(u1) + 0.3459 * np.sqrt(u2) + 0.202 * u3)
+    # Other faces: own bias/weights, linear response on the up-tilted tap, sqrt on the down-tilted one.
+    u0 = np.clip(1 - (d0 - 0.0644) / r0, 0, 1)
+    u1 = np.clip(1 - (d1 + 0.0633) / r1, 0, 1)
+    u2 = np.clip(1 - (d2 + 0.1349) / 0.8, 0, 1)
+    u3 = np.clip(1 - (d3 + 0.1475) / 0.8, 0, 1)
+    side = np.clip(1.106 - (0.1429 * np.square(u0) + 0.1795 * np.sqrt(u1) + 0.2928 * np.sqrt(u2) + 0.2654 * u3), 0, 1)
     tuned = np.where(n[:, 2] > 0.7, flat, side)
     return walls * vertical + tuned * (1 - vertical)

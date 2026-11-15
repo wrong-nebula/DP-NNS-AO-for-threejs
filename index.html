@@ -141,6 +141,13 @@ const vec4 R=vec4(.16,.48,.80,1.12);
 // 0.8 m out at 45 degrees up, to see overhangs (shelves, stair undersides); on floors and tops it
 // stays 1.12 m along the normal. Floors/tops, other faces and structural walls each get their own
 // per-tap biases and response curves.
+// Tap 2: 0.8 m along the normal on horizontal faces; on vertical faces 0.7 m out and 0.4 m down,
+// to see the floor and supports below. Tap 3: 1.12 m along the normal on horizontal faces; on
+// vertical faces 0.8 m out at 45 degrees up, to see overhangs.
+vec3 wallCorrectionTap2(vec3 n){
+  float h=n.z*n.z;
+  return n*vec3(.7,.7,.7+.1*h)-vec3(0.,0.,.4*(1.-h));
+}
 vec3 wallCorrectionTap3(vec3 n){
   float h=n.z*n.z;
   return n*vec3(.5657,.5657,.5657+.5543*h)+vec3(0.,0.,.5657*(1.-h));
@@ -150,13 +157,13 @@ float aoWallCorrection(vec4 d,vec3 normal){
   float k=.92/2.9;
   // Structural walls: GPU-robust refit (linear clamps and one square, no sqrt), with each clamp's
   // kink away from where an open wall's taps sit, so filtering rounding is not amplified.
-  vec4 v=clamp(1.-(d+vec4(.1526,-.0907,-.5168,.1875))/vec4(R.xyz,.8),0.,1.);
-  float wallAO=clamp(1.1383-(.0598*v.x*v.x+.5477*v.y+.038*v.z+.0891*v.w),0.,1.);
+  vec4 v=clamp(1.-(d+vec4(.1523,-.0624,.4135,-.2624))/vec4(R.xyz,.8),0.,1.);
+  float wallAO=clamp(1.1356-(7.212*v.x*v.x+.4812*v.y+.1365*v.z+.1172*v.w),0.,1.);
   vec4 s=clamp(1.-(d+vec4(.024,.078,0.,.02))/R,0.,1.);
   float far=s.w*s.w;far*=far;far*=far;
   float flatAO=1.-k*(s.x*s.x+.8166666667*sqrt(s.y)+.6333333333*sqrt(s.z)+.45*far);
-  vec4 u=clamp(1.-(d+vec4(-.0061,.1163,.0024,.2143))/vec4(R.xyz,.8),0.,1.);
-  float sideAO=1.-(.1337*u.x*u.x+.1146*sqrt(u.y)+.3459*sqrt(u.z)+.202*u.w);
+  vec4 u=clamp(1.-(d+vec4(-.0644,.0633,.1349,.1475))/vec4(R.xy,.8,.8),0.,1.);
+  float sideAO=clamp(1.106-(.1429*u.x*u.x+.1795*sqrt(u.y)+.2928*sqrt(u.z)+.2654*u.w),0.,1.);
   return mix(normal.z>.7?flatAO:sideAO,wallAO,vertical);
 }
 // Scene distance at the four tap points p+normal*R. The static samples are fetched
@@ -168,10 +175,11 @@ vec4 dStatic=vec4(1e4);
 // Weight of the extra occlusion moving objects add, per tap. A small object blocks less of the
 // hemisphere than a wall at the same distance, which the distance-only taps cannot tell apart.
 uniform vec4 moverScale;
-// Taps 0-2 sit along the normal at R.xyz; tap 3 at offset o3 (normal*R.w, or tilted).
-vec4 tapDistances(vec3 p,vec3 normal,vec3 o3){
+// Taps 0-1 sit along the normal at R.xy; taps 2 and 3 at offsets o2 and o3 (normal*R.z and
+// normal*R.w, or tilted).
+vec4 tapDistances(vec3 p,vec3 normal,vec3 o2,vec3 o3){
   vec4 d=vec4(staticDistance(p+normal*R.x),staticDistance(p+normal*R.y),
-              staticDistance(p+normal*R.z),staticDistance(p+o3));
+              staticDistance(p+o2),staticDistance(p+o3));
   dStatic=d;
   #ifdef NO_DYN
     return d;
@@ -182,9 +190,9 @@ vec4 tapDistances(vec3 p,vec3 normal,vec3 o3){
     if(((dynMask>>i)&1)==0)continue;
     vec3 lp=(dynInv[i]*vec4(p,1.)).xyz;
     vec3 ln=mat3(dynInv[i])*normal;
-    vec3 lo3=mat3(dynInv[i])*o3;
+    vec3 lo2=mat3(dynInv[i])*o2,lo3=mat3(dynInv[i])*o3;
     // Local tap offsets as vec4 lanes per axis.
-    vec4 ox=vec4(ln.x*R.xyz,lo3.x),oy=vec4(ln.y*R.xyz,lo3.y),oz=vec4(ln.z*R.xyz,lo3.z);
+    vec4 ox=vec4(ln.x*R.xy,lo2.x,lo3.x),oy=vec4(ln.y*R.xy,lo2.y,lo3.y),oz=vec4(ln.z*R.xy,lo2.z,lo3.z);
     int type=dynType[i];
     vec4 k=dynParam[i];
     if(type==0){
@@ -199,13 +207,12 @@ vec4 tapDistances(vec3 p,vec3 normal,vec3 o3){
       // and R_k-.045 (where occlusion clamps to 0). The bounding sphere gives a lower bound
       // per tap, so only taps that pass it fetch the atlas.
       vec3 o=p-dynSphere[i].xyz;
-      vec3 o3w=o+o3;
-      vec4 lb=vec4(sqrt(max(dot(o,o)+R.xyz*(2.*dot(o,normal)+R.xyz),0.)),length(o3w))-dynSphere[i].w;
+      vec4 lb=vec4(sqrt(max(dot(o,o)+R.xy*(2.*dot(o,normal)+R.xy),0.)),length(o+o2),length(o+o3))-dynSphere[i].w;
       bvec4 need=lessThan(lb,min(d,R-.045));
       d=min(d,vec4(need.x?sdMesh(lp+ln*R.x,k):1e4,need.y?sdMesh(lp+ln*R.y,k):1e4,
-                   need.z?sdMesh(lp+ln*R.z,k):1e4,need.w?sdMesh(lp+lo3,k):1e4));
+                   need.z?sdMesh(lp+lo2,k):1e4,need.w?sdMesh(lp+lo3,k):1e4));
     }else{
-      vec3 q0=lp+ln*R.x,q1=lp+ln*R.y,q2=lp+ln*R.z,q3=lp+lo3;
+      vec3 q0=lp+ln*R.x,q1=lp+ln*R.y,q2=lp+lo2,q3=lp+lo3;
       vec4 s;
       if(type==1)s=vec4(length(q0),length(q1),length(q2),length(q3))-k.x;
       else if(type==5)s=vec4(length(vec2(length(q0.xy)-k.x,q0.z)),length(vec2(length(q1.xy)-k.x,q1.z)),
@@ -239,14 +246,14 @@ void main(){
   }
   #if defined(FAST)
     #ifdef CONTACT
-      vec4 dAll=tapDistances(p,normal,normal*R.w);
+      vec4 dAll=tapDistances(p,normal,normal*R.z,normal*R.w);
       vec4 tapsAll=clamp(1.-(dAll+.045)/R,0.,1.);
       vec4 tapsStatic=clamp(1.-(dStatic+.045)/R,0.,1.);
       vec4 taps=tapsStatic+(tapsAll-tapsStatic)*moverScale;
       // Emphasize near contacts while retaining longer-range contributions.
       ao=1.-dot(taps,vec4(.46,.24,.21,.16));
     #else
-      vec4 dAll=tapDistances(p,normal,wallCorrectionTap3(normal));
+      vec4 dAll=tapDistances(p,normal,wallCorrectionTap2(normal),wallCorrectionTap3(normal));
       // Movers add occlusion through the same formula, weighted by moverScale.
       float aoStatic=aoWallCorrection(dStatic,normal);
       ao=aoStatic+(aoWallCorrection(dAll,normal)-aoStatic)*moverScale.x;
@@ -254,7 +261,7 @@ void main(){
   #elif TAPS == 4
     // Same radii and weights as the generic loop below, evaluated four-wide.
     vec4 w=1.-.55*vec4(0.,1.,2.,3.)/3.;
-    vec4 occAll=clamp((R-tapDistances(p,normal,normal*R.w)-.045)/R,0.,1.);
+    vec4 occAll=clamp((R-tapDistances(p,normal,normal*R.z,normal*R.w)-.045)/R,0.,1.);
     vec4 occStatic=clamp((R-dStatic-.045)/R,0.,1.);
     vec4 occ=occStatic+(occAll-occStatic)*moverScale;
     ao=1.-.92*dot(w,occ)/dot(w,vec4(1.));

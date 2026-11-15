@@ -66,7 +66,7 @@ Measured on an Apple M1.
 | Moving-object bake at page load | 60 ms | **12 ms** (5× faster) |
 | Runtime AO, 11 moving objects | 0.79 ms | **0.62 ms** (−21%) |
 | Runtime AO, 16 moving objects | 1.10 ms | **0.79 ms** (−28%) |
-| Static AO error, SDF wall correction (vs ray-traced, GPU output) | 0.0408 | **0.0292** (−28%) |
+| Static AO error, SDF wall correction (vs ray-traced, GPU output) | 0.0408 | **0.0275** (−33%) |
 | AO error near moving objects (vs ray-traced, held-out poses) | 0.097 | **0.041** (−58%) |
 
 ### Static bake (`tools/bake_sdf.cpp`)
@@ -109,16 +109,16 @@ Per-tap weights gained only 0.001 more, with an irregular pattern, so the single
 
 The wall-correction formula was refit against ray-traced AO, with the same four texture reads per pixel. The formula is one function, [accuracy/ao_formula.py](accuracy/ao_formula.py), ported line for line to `aoWallCorrection()` in the shader. It was scored on six camera views of the Archive; three of them were held out, and a change that made any of those worse was refused.
 - **Per-tap response curves.** Away from the structural walls, each tap has its own bias and a cheap curve: the near tap squared, the middle two square-rooted, and the far tap to the 8th power (three squarings), so only deep occlusion counts.
-- **A tilted fourth tap.** On faces that are not horizontal, the fourth tap sits 0.8 m out at 45° up instead of 1.12 m along the normal. It sees overhangs such as shelf boards and the stair underside. Floors and tops keep it along the normal, and moving objects are tested at the tilted position too.
+- **Tilted taps on vertical faces.** On faces that are not horizontal, the fourth tap sits 0.8 m out at 45° up instead of 1.12 m along the normal, to see overhangs such as shelf boards and the stair underside. The third tap sits 0.7 m out and 0.4 m down, to see the floor and supports below (wall–floor and crate–floor corners). Floors and tops keep both along the normal, and moving objects are tested at the same positions.
 - **Separate fits per surface class.** Floors and tops, other faces, and the two structural walls each have their own weights. The walls use only linear clamps and one square, with each clamp's kink away from where a wall's taps sit.
 - **Scored as the GPU renders.** The CPU evaluator models the GPU's 8-bit trilinear weights and half-precision filtering. Without that, a wall refit using `sqrt` of a value that is about 0 on every wall scored 8% better in full precision, yet darkened walls by 0.013 on the GPU.
 
 | SDF wall correction, GPU output vs ray-traced | Before | After |
 |---|---:|---:|
-| All pixels | 0.0408 | **0.0292** |
-| Structural walls | 0.0212 | **0.0158** (still slightly lighter than the reference, so no extra darkening) |
+| All pixels | 0.0408 | **0.0275** |
+| Structural walls | 0.0212 | **0.0141** (still slightly lighter than the reference, so no extra darkening) |
 
-The "Original SDF" and "Reweighted SDF" modes are unchanged, pixel for pixel. With moving objects, all-pixel error is 0.032, from 0.050.
+The "Original SDF" and "Reweighted SDF" modes are unchanged, pixel for pixel. With moving objects, all-pixel error is 0.030, from 0.050.
 
 ### Runtime AO with moving objects
 
