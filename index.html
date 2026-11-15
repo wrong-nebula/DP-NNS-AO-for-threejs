@@ -50,11 +50,13 @@ void main(){
   vec3 c=im[3].xyz;
   vec3 h=abs(im[0].xyz)*boundsHalf.x+abs(im[1].xyz)*boundsHalf.y+abs(im[2].xyz)*boundsHalf.z;
   instMask=0;
+  #ifndef NO_DYN
   for(int i=0;i<MAX_DYN;i++){
     if(i>=dynCount)break;
     if(length(max(abs(dynSphere[i].xyz-c)-h,0.))-dynSphere[i].w<2.25)instMask|=1<<i;
   }
   if(selfSkip>=0.)instMask&=~(1<<int(selfSkip));
+  #endif
   vec4 world=im*vec4(position,1.);
   p=world.xyz;
   n=normalize(mat3(modelMatrix)*mat3(instanceMatrix)*normal);
@@ -68,6 +70,9 @@ uniform sampler3D field;
 uniform sampler3D meshAtlas;
 uniform float meshSlabs;
 uniform sampler2D aoMap;
+// Movers whose bit is set in the 1 m cell containing p, filled on the CPU each frame. A superset of
+// the per-pixel test below: it sets bit i wherever |p-c| < radius + 1.12 + (1.12-.044).
+uniform highp usampler3D moverCells;
 in vec3 p;
 in vec3 n;
 flat in float wallFace;
@@ -137,9 +142,12 @@ const vec4 R=vec4(.16,.48,.80,1.12);
 vec4 tapDistances(vec3 p,vec3 normal){
   vec4 d=vec4(staticDistance(p+normal*R.x),staticDistance(p+normal*R.y),
               staticDistance(p+normal*R.z),staticDistance(p+normal*R.w));
+  #ifdef NO_DYN
+    return d;
+  #endif
   if(dynMask==0)return d;
   for(int i=0;i<MAX_DYN;i++){
-    if(i>=dynCount)break;
+    if(i>=dynCount||(dynMask>>i)==0)break;
     if(((dynMask>>i)&1)==0)continue;
     vec3 lp=(dynInv[i]*vec4(p,1.)).xyz;
     vec3 ln=mat3(dynInv[i])*normal;
@@ -153,7 +161,14 @@ vec4 tapDistances(vec3 p,vec3 normal){
       vec4 ox=max(qx,0.),oy=max(qy,0.),oz=max(qz,0.);
       d=min(d,sqrt(ox*ox+oy*oy+oz*oz)+min(max(qx,max(qy,qz)),0.));
     }else if(type==6){
-      d=min(d,vec4(sdMesh(lp+ln*R.x,k),sdMesh(lp+ln*R.y,k),sdMesh(lp+ln*R.z,k),sdMesh(lp+ln*R.w,k)));
+      // A mesh only changes tap k if its distance there is below both the current distance
+      // and R_k-.045 (where occlusion clamps to 0). The bounding sphere gives a lower bound
+      // per tap, so only taps that pass it fetch the atlas.
+      vec3 o=p-dynSphere[i].xyz;
+      vec4 lb=sqrt(max(dot(o,o)+R*(2.*dot(o,normal)+R),0.))-dynSphere[i].w;
+      bvec4 need=lessThan(lb,min(d,R-.045));
+      d=min(d,vec4(need.x?sdMesh(lp+ln*R.x,k):1e4,need.y?sdMesh(lp+ln*R.y,k):1e4,
+                   need.z?sdMesh(lp+ln*R.z,k):1e4,need.w?sdMesh(lp+ln*R.w,k):1e4));
     }else{
       vec3 q0=lp+ln*R.x,q1=lp+ln*R.y,q2=lp+ln*R.z,q3=lp+ln*R.w;
       vec4 s;
@@ -172,12 +187,20 @@ float distanceAt(vec3 pos){
 void main(){
   vec3 normal=normalize(n);
   float ao=1.;
-  if(instMask!=0)for(int i=0;i<MAX_DYN;i++){
-    if(i>=dynCount)break;
+  int cand=instMask;
+  #ifdef NO_DYN
+    cand=0;
+  #endif
+  if(cand!=0){
+    ivec3 cell=ivec3(floor(p+1.));
+    if(all(greaterThanEqual(cell,ivec3(0)))&&all(lessThan(cell,ivec3(26,18,8))))cand&=int(texelFetch(moverCells,cell,0).r);
+  }
+  if(cand!=0)for(int i=0;i<MAX_DYN;i++){
+    if(i>=dynCount||(cand>>i)==0)break;
     // Tap k only sees the object if |p+n*r_k-c|-rb < r_k-.045. |p+n*t-c|-t never
     // increases with t, so the farthest tap (1.12) is the easiest to satisfy: if it
     // fails, every tap does.
-    if(((instMask>>i)&1)!=0&&distance(p+normal*R.w,dynSphere[i].xyz)-dynSphere[i].w<R.w-.044)dynMask|=1<<i;
+    if(((cand>>i)&1)!=0&&distance(p+normal*R.w,dynSphere[i].xyz)-dynSphere[i].w<R.w-.044)dynMask|=1<<i;
   }
   #if defined(FAST)
     vec4 taps=clamp(1.-(tapDistances(p,normal)+.045)/R,0.,1.);
@@ -229,12 +252,17 @@ uniform int triCount;
 uniform int texW;
 uniform float halfSize;
 uniform float layer;
+uniform vec3 meshHalf; // half extents of a centred box containing the mesh
 out vec4 o;
 vec3 vert(int i){return texelFetch(tris,ivec2(i%texW,i/texW),0).xyz;}
 float dot2(vec3 v){return dot(v,v);}
 void main(){
   vec3 p=(vec3(gl_FragCoord.xy,layer+.5)/${MESH_RES}.*2.-1.)*halfSize;
   float d2=1e20,w=0.;
+  // Outside a convex set that contains the mesh, every triangle lies in an open half-space of
+  // directions, so the total solid angle is below 2pi and |winding| < .5: the sign is outside.
+  // Only voxels inside the box need the winding term.
+  bool inBox=all(lessThanEqual(abs(p),meshHalf));
   for(int t=0;t<triCount;t++){
     vec3 a=vert(3*t),b=vert(3*t+1),c=vert(3*t+2);
     vec3 ba=b-a,pa=p-a,cb=c-b,pb=p-b,ac=a-c,pc=p-c,nor=cross(ba,ac);
@@ -244,9 +272,11 @@ void main(){
                dot2(cb*clamp(dot(cb,pb)/dot2(cb),0.,1.)-pb)),
                dot2(ac*clamp(dot(ac,pc)/dot2(ac),0.,1.)-pc))
       :dot(nor,pa)*dot(nor,pa)/dot2(nor));
-    vec3 A=-pa,B=-pb,C=-pc;
-    float la=length(A),lb=length(B),lc=length(C);
-    w+=atan(dot(A,cross(B,C)),la*lb*lc+dot(A,B)*lc+dot(B,C)*la+dot(C,A)*lb);
+    if(inBox){
+      vec3 A=-pa,B=-pb,C=-pc;
+      float la=length(A),lb=length(B),lc=length(C);
+      w+=atan(dot(A,cross(B,C)),la*lb*lc+dot(A,B)*lc+dot(B,C)*la+dot(C,A)*lb);
+    }
   }
   // Solid angle = 2*atan(...); winding number = total solid angle / 4pi.
   float winding=w/6.283185307;
@@ -305,6 +335,10 @@ try {
     {name:'torus knot',type:6,geometry:new T.TorusKnotGeometry(.3,.09,160,20),
      pose:t=>({x:15,y:6,z:1.4+.2*S(t*.9),rx:t*.4,rz:t*.6})},
   ];
+  // Benchmark option ?extra=N (N<=5): clone movers on offset paths to test scaling up to 16.
+  {const extra=Math.min(5,MAX_DYN-movers.length,+(new URLSearchParams(location.search).get('extra')||0));
+   [0,4,6,9,10].slice(0,extra).forEach((j,k)=>{const b=movers[j];movers.push({...b,name:b.name+' copy',geometry:b.geometry.clone(),
+     pose:t=>{const q=b.pose(t+2.5);return {...q,x:q.x+(k%2?-1.6:1.6),y:q.y+1.2};}});});}
   if(movers.length>MAX_DYN)throw Error('Too many movers');
   for(const m of movers){
     m.geometry.center();
@@ -315,19 +349,28 @@ try {
     m.half=[Math.max(-b.min.x,b.max.x),Math.max(-b.min.y,b.max.y),Math.max(-b.min.z,b.max.z)];
   }
 
-  // ---- Bake every mover's local-space SDF into one 3D atlas (one slab each) ----
-  const atlasTarget=new T.WebGL3DRenderTarget(MESH_RES,MESH_RES,MESH_RES*movers.length,{depthBuffer:false});
-  const atlas=atlasTarget.texture;
-  atlas.format=T.RedFormat;atlas.type=T.HalfFloatType;
-  atlas.minFilter=atlas.magFilter=T.LinearFilter;atlas.generateMipmaps=false;
+  // ---- Bake mover SDFs into a 3D atlas (one slab each) ----
+  // Only baked meshes (type 6) are needed to draw. The analytic shapes are baked the first
+  // time "Baked SDF for all movers" is switched on, into a new atlas holding every mover.
   const bakeMaterial=new T.ShaderMaterial({
     glslVersion:T.GLSL3,vertexShader:bakeVertexShader,fragmentShader:bakeFragmentShader,
-    uniforms:{tris:{value:null},triCount:{value:0},texW:{value:1024},halfSize:{value:1},layer:{value:0}}
+    uniforms:{tris:{value:null},triCount:{value:0},texW:{value:1024},halfSize:{value:1},layer:{value:0},meshHalf:{value:new T.Vector3()}}
   });
   const quad=new FullScreenQuad(bakeMaterial);
+  function bakeAtlas(list){
+    const target=new T.WebGL3DRenderTarget(MESH_RES,MESH_RES,MESH_RES*Math.max(1,list.length),{depthBuffer:false});
+    const tex=target.texture;
+    tex.format=T.RedFormat;tex.type=T.HalfFloatType;
+    tex.minFilter=tex.magFilter=T.LinearFilter;tex.generateMipmaps=false;
+    let tris=0;
+    list.forEach((m,slab)=>{tris+=bakeMover(m,slab,target);});
+    renderer.setRenderTarget(null);
+    return {target,tex,tris};
+  }
   const bakeStart=performance.now();
-  let totalTris=0;
-  movers.forEach((m,slab)=>{
+  const bgl=renderer.getContext(),btimer=bgl.getExtension('EXT_disjoint_timer_query_webgl2');
+  const bakeQuery=btimer?bgl.createQuery():null; if(bakeQuery)bgl.beginQuery(btimer.TIME_ELAPSED_EXT,bakeQuery);
+  function bakeMover(m,slab,atlasTarget){
     const pos=(m.geometry.index?m.geometry.toNonIndexed():m.geometry).attributes.position;
     const triCount=pos.count/3, texW=1024, texH=Math.ceil(pos.count/texW);
     const data=new Float32Array(texW*texH*4);
@@ -336,21 +379,28 @@ try {
     tris.needsUpdate=true;
     const halfSize=Math.max(...m.half)+MESH_PAD;
     const u=bakeMaterial.uniforms;
-    u.tris.value=tris;u.triCount.value=triCount;u.texW.value=texW;u.halfSize.value=halfSize;
+    u.tris.value=tris;u.triCount.value=triCount;u.texW.value=texW;u.halfSize.value=halfSize;u.meshHalf.value.set(...m.half);
     for(let z=0;z<MESH_RES;z++){
       bakeMaterial.uniforms.layer.value=z;
       renderer.setRenderTarget(atlasTarget,slab*MESH_RES+z);
       quad.render(renderer);
     }
     m.meshParam=new T.Vector4(slab,halfSize,0,0);
-    m.analyticParam=m.type===6?m.meshParam:new T.Vector4(...m.param);
-    totalTris+=triCount;
+    if(m.type===6)m.analyticParam=m.meshParam;
     tris.dispose();
-  });
-  renderer.setRenderTarget(null);
+    return triCount;
+  }
+  for(const m of movers)if(m.type!==6)m.analyticParam=new T.Vector4(...m.param);
+  const meshMovers=movers.filter(m=>m.type===6);
+  let baked=bakeAtlas(meshMovers),bakedAll=false,totalTris=baked.tris;
+  const atlasTarget=baked.target,atlas=baked.tex;
+  if(bakeQuery)bgl.endQuery(btimer.TIME_ELAPSED_EXT);
   renderer.getContext().finish();
   const bakeMs=performance.now()-bakeStart;
-  quad.dispose();bakeMaterial.dispose();
+  // Benchmark: GPU elapsed time of the bake, and wall time until a readback forces completion.
+  {const px=new Float32Array(4);renderer.readRenderTargetPixels(atlasTarget,0,0,1,1,px);}
+  const bakeSyncMs=performance.now()-bakeStart;
+  const bakeGpuMs=new Promise(ok=>{const poll=()=>{if(!bakeQuery)return ok(NaN);if(bgl.getQueryParameter(bakeQuery,bgl.QUERY_RESULT_AVAILABLE))return ok(bgl.getQueryParameter(bakeQuery,bgl.QUERY_RESULT)/1e6);setTimeout(poll,5);};poll();});
 
   const variants=[0,4,14,34,32,36];
   const mask={value:false};
@@ -361,13 +411,17 @@ try {
     dynSphere:{value:Array.from({length:MAX_DYN},()=>new T.Vector4())},
     dynCount:{value:0},
     meshAtlas:{value:atlas},
-    meshSlabs:{value:movers.length}
+    moverCells:{value:null},
+    meshSlabs:{value:Math.max(1,meshMovers.length)}
   };
-  const materials=Object.fromEntries(variants.map(mode=>[mode,new T.ShaderMaterial({
+  // Two compiled variants per mode: with mover code, and without it (NO_DYN) for when no mover
+  // is in the AO, so the static path carries none of the mover loops.
+  const makeMaterials=extra=>Object.fromEntries(variants.map(mode=>[mode,new T.ShaderMaterial({
     glslVersion:T.GLSL3,vertexShader,fragmentShader,
-    defines:mode===34?{FAST:1,CONTACT:1}:mode===14?{FAST:1}:{TAPS:mode},
+    defines:{...(mode===34?{FAST:1,CONTACT:1}:mode===14?{FAST:1}:{TAPS:mode}),...extra},
     uniforms:{field:{value:field},showMask:mask,...dyn}
   })]));
+  const materials=makeMaterials({}),staticMaterials=makeMaterials({NO_DYN:1});
   if(!boxes.length||boxes.some(b=>b.length!==6||b.some(v=>!Number.isFinite(v))))throw Error('Invalid geometry');
   const mesh=new T.InstancedMesh(new T.BoxGeometry(1,1,1),materials[0],boxes.length);
   const walls=new Float32Array(boxes.length);
@@ -388,6 +442,33 @@ try {
     m.object.frustumCulled=false;
     scene.add(m.object);
   }
+  // First use of "Baked SDF for all movers": bake every mover into a new atlas and swap it in.
+  function ensureAllBaked(){
+    if(bakedAll)return;
+    const old=baked.target;
+    baked=bakeAtlas(movers);bakedAll=true;
+    dyn.meshAtlas.value=baked.tex;dyn.meshSlabs.value=movers.length;
+    old.dispose();quad.dispose();bakeMaterial.dispose();
+  }
+  // 1 m world cells over the static field's box (lo -1, span 26 x 18 x 8), one bit per mover.
+  const CELLS=[26,18,8],cellBits=new Uint32Array(CELLS[0]*CELLS[1]*CELLS[2]);
+  const cellTex=new T.Data3DTexture(cellBits,...CELLS);
+  cellTex.format=T.RedIntegerFormat;cellTex.type=T.UnsignedIntType;cellTex.internalFormat='R32UI';
+  cellTex.minFilter=cellTex.magFilter=T.NearestFilter;cellTex.unpackAlignment=1;cellTex.needsUpdate=true;
+  dyn.moverCells.value=cellTex;
+  function fillCells(){
+    cellBits.fill(0);
+    movers.forEach((m,i)=>{
+      const s=dyn.dynSphere.value[i],reach=s.w+1.12+(1.12-.044)+1e-3;
+      const c=[s.x+1,s.y+1,s.z+1],lo=[],hi=[];
+      for(let k=0;k<3;k++){lo[k]=Math.max(0,Math.floor(c[k]-reach));hi[k]=Math.min(CELLS[k]-1,Math.floor(c[k]+reach));}
+      for(let z=lo[2];z<=hi[2];z++)for(let y=lo[1];y<=hi[1];y++)for(let x=lo[0];x<=hi[0];x++){
+        const dx=Math.max(x-c[0],0,c[0]-x-1),dy=Math.max(y-c[1],0,c[1]-y-1),dz=Math.max(z-c[2],0,c[2]-z-1);
+        if(dx*dx+dy*dy+dz*dz<reach*reach)cellBits[(z*CELLS[1]+y)*CELLS[0]+x]|=1<<i;
+      }
+    });
+    cellTex.needsUpdate=true;
+  }
   const rigid=new T.Matrix4(),euler=new T.Euler();
   let dynamicAO=true,animate=true,forceMesh=false,simTime=0,lastNow=0;
   function updateMovers(t){
@@ -402,6 +483,7 @@ try {
       m.object.instanceMatrix.needsUpdate=true;
     });
     dyn.dynCount.value=dynamicAO?movers.length:0;
+    fillCells();
   }
   updateMovers(0);
   const radius=1.12;
@@ -448,14 +530,14 @@ try {
       pass.render(renderer,scratch,scratch);
       screenMaterial.uniforms.aoMap.value=taps===32?ssao.blurRenderTarget.texture:gtao.pdRenderTarget.texture;
       setMaterial(screenMaterial);
-    } else setMaterial(materials[taps]);
+    } else setMaterial((dyn.dynCount.value>0?materials:staticMaterials)[taps]);
     renderer.setRenderTarget(null);
     renderer.render(scene,camera);
   }
   const buttons=[...document.querySelectorAll('button[data-taps]')];
   const fpsValue=document.querySelector('#fps-value');
   const frameMs=document.querySelector('#frame-ms');
-  const bakeNote=` · baked ${movers.length} mover SDFs (${MESH_RES}³, ${totalTris.toLocaleString()} triangles) in ${bakeMs.toFixed(0)} ms`;
+  const bakeNote=` · baked ${meshMovers.length} mesh SDFs (${MESH_RES}³, ${totalTris.toLocaleString()} triangles) in ${bakeSyncMs.toFixed(0)} ms`;
   let selected=14;
   let started=0;
   let frames=0;
@@ -476,11 +558,11 @@ try {
   document.querySelector('#mask').onchange=event=>{mask.value=event.target.checked;resetFps();};
   document.querySelector('#animate').onchange=event=>{animate=event.target.checked;};
   document.querySelector('#dynao').onchange=event=>{dynamicAO=event.target.checked;updateMovers(simTime);resetFps();};
-  document.querySelector('#forcemesh').onchange=event=>{forceMesh=event.target.checked;updateMovers(simTime);resetFps();};
+  document.querySelector('#forcemesh').onchange=event=>{forceMesh=event.target.checked;if(forceMesh)ensureAllBaked();updateMovers(simTime);resetFps();};
   // Debug hook for timing from the console.
-  window.aoDemo={renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,totalTris,select:mode=>select(mode),
+  window.aoDemo={renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,bakeSyncMs,bakeGpuMs,totalTris,get atlas(){return baked.tex;},meshRes:MESH_RES,setMask:on=>{mask.value=on;},select:mode=>select(mode),
     setDynamicAO:on=>{dynamicAO=on;updateMovers(simTime);},
-    setForceMesh:on=>{forceMesh=on;updateMovers(simTime);}};
+    setForceMesh:on=>{forceMesh=on;if(on)ensureAllBaked();updateMovers(simTime);}};
   document.addEventListener('visibilitychange',resetFps);
   select(selected);
   renderer.setAnimationLoop(now=>{

@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "campaign": "bake-sdf-speed",
+  "version": 1,
+  "title": "Faster static SDF bake (tools/bake_sdf.cpp) with output identical where the AO reads it",
+  "mode": "hill_climb",
+  "project": {
+    "repo": "https://github.com/wrong-nebula/DP-NNS-AO-for-threejs.git"
+  },
+  "target": {
+    "type": "cpu",
+    "class": "local"
+  },
+  "editable_paths": [
+    "tools/bake_sdf.cpp"
+  ],
+  "forbidden_patterns": [
+    "\\.f32\\.gz",
+    "refs/",
+    "check\\.py",
+    "THERMITE_"
+  ],
+  "objective": {
+    "policy": "single",
+    "primary": {
+      "metric": "bake_s",
+      "direction": "min",
+      "min_effect": 0.03
+    },
+    "secondary": []
+  },
+  "guards": [],
+  "hard_constraints": [
+    {
+      "kind": "max",
+      "metric": "visible_mismatch",
+      "value": 0
+    },
+    {
+      "kind": "max",
+      "metric": "mae14",
+      "value": 0.0402
+    },
+    {
+      "kind": "max",
+      "metric": "mae4",
+      "value": 0.0422
+    }
+  ],
+  "monitor_only": [
+    "mae14",
+    "mae4"
+  ],
+  "cells": [
+    "archive",
+    "dense"
+  ],
+  "held_out_cells": [
+    "dense8"
+  ],
+  "lanes": {
+    "count": 1,
+    "trials_per_epoch": 3
+  },
+  "budget": {
+    "wall_hours": 4,
+    "llm_usd": 20
+  },
+  "acceptance": {
+    "runs_per_cell": 3,
+    "confirm_blocks": 5
+  },
+  "additional_information": "`tools/bake_sdf.cpp` bakes a 128^3 clipped signed distance field (float32) from triangles. The AO shader only reads distances below 1.075 m, so trilinear samples read stored values below 1.33 m (reach plus one voxel diagonal). The judge requires every voxel whose value is below 1.33 m to be bit-identical to the original baker's output, and allows values above that only to be raised. Values below the band must never change.\n\nMeasured so far (Apple M1, 8 threads): the distance pass dominates the Archive (1,908 triangles, ~1.5M BVH queries, ~0.5 us each). On the dense 488k-triangle mesh, the BVH build was a third of the time before it was parallelised. Already in the seed: parallel BVH build with identical node layout, skipping the unused grid build, per-voxel Lipschitz culling from the block centre's exact distance, `--reach`, and one triangle per BVH leaf (Archive -21%, output identical).\n\nTried and rejected: seeding each query with the block centre's triangle (no gain); BVH leaves of 8 (slower); tie-breaking slack at the seed distance (12% more triangle tests, because box scenes have many equidistant triangles).\n\nThe rig shares its host with other work, so timings are noisy; each cell runs 3 times per block.",
+  "ideas": [
+    "float32 BVH bounds and a 4-wide BVH with structure-of-arrays boxes; keep triangle distances in double, or prove float gives identical stored values",
+    "SAH or binned-SAH build instead of median split (fewer node visits per query)",
+    "Process voxels in z-columns or Morton order within a block so the previous-voxel seed is tighter",
+    "Hierarchical culling: 8^3 block, then 4^3 and 2^3 sub-blocks, using the same 1-Lipschitz bound",
+    "Faster triangle distance: precompute per-triangle edge vectors and reciprocal lengths",
+    "Parallelise the winding-number sign pass and the OBJ/box loading"
+  ]
+}
