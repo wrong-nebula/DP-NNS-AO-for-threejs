@@ -25,16 +25,25 @@ SSAO's intensity and GTAO's scale were swept on this scene and set to their lowe
 
 GTAO's error is the average of its AO target over 32 temporally rotated frames, which TRAA converges to on a still camera. SSAO is read after its blur. The SDF is read from a float render of its AO term.
 
-## GPU time: no reliable split at this scale
+## GPU time (Apple M1, shared and loaded machine)
 
-Every mode measured roughly **0.2–0.3 ms per frame**, AO off included. That matches outside reports for r187 WebGPU on similar hardware: SDF 0.209 ms, SSAO 0.5× 0.237 ms, GTAO 0.5× + TRAA 0.458 ms.
+WebGPU timestamp queries over 12 frames per sample, every mode interleaved, 40 rounds. Background load only ever adds time, so **p10** estimates the uncontended GPU cost, and the median shows the contended one.
 
-The WebGPU timestamp queries could not separate the methods further on this setup:
-- Chromium rounds them (here in steps of about 65 µs).
-- They appear to miss some post-processing passes: SSAO 0.5× read *lower* than AO off.
-- The machine was under heavy load (load average ~15).
+| Mode | Frame p10 (p50) | AO cost over AO off (p10) | MAE |
+|---|---:|---:|---:|
+| AO off | 0.169 ms (0.273) | — | — |
+| **Four-tap SDF** | **0.191 ms (0.295)** | **+0.02 ms** | **0.0401** |
+| SSAO 0.5×, 16 samples | 0.257 ms (0.371) | +0.09 ms | 0.0652 |
+| GTAO 0.5× + TRAA, 16 samples | 1.32 ms (1.88) | +1.15 ms | 0.0535 |
+| SSAO 1×, 16 samples | 1.43 ms (2.10) | +1.26 ms | 0.0627 |
+| GTAO 1× + TRAA, 16 samples | 4.35 ms (6.35) | +4.18 ms | 0.0513 |
+| GTAO 1× + TRAA, **64 samples**, scale 1.25 | **6.74 ms (15.75)** | **+6.57 ms** | **0.0398** |
 
-For a precise split, run [r187.html](r187.html) in a browser with unrounded timestamps, for example Chrome with `--enable-dawn-features=allow_unsafe_apis --disable-dawn-features=timestamp_quantization`, on an idle machine: `await r187Bench.run()`.
+**Matching the SDF's accuracy.** SSAO cannot: its error stays at 0.063–0.065 from 16 to 64 samples, a floor set by what screen space can see. GTAO can, at full resolution with 64 samples and its scale retuned to 1.25: MAE 0.0398 against the SDF's 0.0401, reproduced to five decimals. At that setting a frame takes **6.74 ms against 0.19 ms, about 35× (p50: 53×)**. GTAO's AO work alone is about 6.6 ms against about 0.02 ms for the SDF's taps. At the r187 example's default (GTAO 0.5× + TRAA, 16 samples), GTAO is about 7× the SDF frame time, with 33% more error.
+
+**Caveats.** One GPU (M1), one scene and camera, and a machine under heavy load from other work: medians spread up to ±50% between runs, so treat the ratios as an order of magnitude. Chromium rounds WebGPU timestamps (about 65 µs here), which matters little at these sizes. A first timing pass read every mode at about 0.2–0.3 ms, with SSAO below AO off; it was a measurement fault, and this table replaces it. On faster GPUs the gap shrinks: an outside report on other hardware measured GTAO 0.5× + TRAA at 0.458 ms against 0.209 ms for the SDF.
+
+To repeat with unrounded timestamps, use Chrome with `--enable-dawn-features=allow_unsafe_apis --disable-dawn-features=timestamp_quantization` on an idle machine and run `await r187Bench.run()`.
 
 ## What this changes
 
@@ -44,7 +53,7 @@ The earlier headline ratios (SSAO 24× and GTAO 56× slower in the static benchm
 - each pass re-rendering the scene for its own normals and depth;
 - full-resolution blur and denoise.
 
-Against r187's current SSAO and GTAO, the costs are the same order of magnitude. SDF AO's remaining advantages:
+Against r187's current passes, the gap is smaller but still real on this M1. The SDF frame costs about the same as SSAO 0.5×, and about 7× less than GTAO 0.5× + TRAA. Matching its accuracy takes GTAO at full resolution with 64 samples, about 35× its frame time. SDF AO's advantages:
 - **About 20–35% lower AO error than tuned GTAO + TRAA, and about 40% lower than tuned SSAO**, on this scene.
 - **No pre-pass and no post-processing passes**, so nothing depends on screen resolution, TRAA history or ghosting.
 - **Occlusion from geometry that is off-screen or hidden**, which screen-space methods cannot see.

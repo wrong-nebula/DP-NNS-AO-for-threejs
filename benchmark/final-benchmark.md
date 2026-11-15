@@ -1,6 +1,6 @@
 # Final Archive AO benchmark
 
-The Apple M1 rendered the same 159-box Archive scene at 1280 × 720 with a 1.12 m nominal radius for every AO mode. GPU elapsed times are per draw within 20 rotating batches of 12 draws. Times include scene rendering and exclude SDF baking and texture upload. SSAO and GTAO use the Three.js 0.170.0 passes with full-resolution depth and normal rendering and filtering. An engine with reusable depth and normal buffers may have different ratios, and Three.js r187's WebGPU passes do: see [r187-results.md](r187-results.md), where SSAO and GTAO cost about the same as the SDF AO.
+The Apple M1 rendered the same 159-box Archive scene at 1280 × 720 with a 1.12 m nominal radius for every AO mode. GPU elapsed times are per draw within 20 rotating batches of 12 draws. Times include scene rendering and exclude SDF baking and texture upload. SSAO and GTAO use the Three.js 0.170.0 passes with full-resolution depth and normal rendering and filtering. An engine with reusable depth and normal buffers may have different ratios, and Three.js r187's WebGPU passes do: see [r187-results.md](r187-results.md): on an M1, SSAO 0.5× costs about the same as the SDF AO, and GTAO 0.5× + TRAA about 7× as much.
 
 AO error is mean absolute difference on the 0–1 visibility scale over 57,216 visible sample points, against a matched reference with 512 cosine-weighted rays per point. The wall-specific SDF weights were tuned on Archive. Figures describe these configurations on one camera and scene.
 
