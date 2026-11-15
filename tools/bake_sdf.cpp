@@ -25,6 +25,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <cstdio>
+#include <memory>
+#include <cstddef>
+#include <fcntl.h>
+#include <unistd.h>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -214,21 +220,39 @@ struct BVH {
         {
             // Small ranges use fewer bins (at most one per triangle).
             const int NB=std::min(BVH_BINS,e-s);
-            struct Bin { F3 lo{INFINITY,INFINITY,INFINITY},hi{-INFINITY,-INFINITY,-INFINITY}; int n=0; };
-            Bin bins[3][BVH_BINS]; float sc[3];
+            // Bin bounds live in separate lo[] and hi[] arrays (4 floats each, lane 3 unused): a per-prim
+            // read-modify-write of a {lo,hi} pair compiles to ldp/stp q-pairs that miss store-to-load
+            // forwarding. Only the NB bins in use are initialised.
+            alignas(16) float bLo[3][BVH_BINS][4],bHi[3][BVH_BINS][4]; int bN[3][BVH_BINS]; float sc[3];
             for(int ax=0;ax<3;++ax){const float ext=bb.chi[ax]-bb.clo[ax];sc[ax]=ext>0?float(NB)/ext:0;}
+            for(int ax=0;ax<3;++ax)for(int b=0;b<NB;++b){for(int k=0;k<4;++k){bLo[ax][b][k]=INFINITY;bHi[ax][b][k]=-INFINITY;}bN[ax][b]=0;}
             auto binOf=[&](const Prim& q,int ax){return std::min(NB-1,int((q.c[ax]-bb.clo[ax])*sc[ax]));};
+            const bool use0=sc[0]>0,use1=sc[1]>0,use2=sc[2]>0;
+#if defined(__aarch64__)
+            {static_assert(sizeof(Prim)==40&&offsetof(Prim,c)==24,"4-wide prim loads");
+             const float32x4_t clo4={bb.clo[0],bb.clo[1],bb.clo[2],0.f},sc4={sc[0],sc[1],sc[2],0.f};
+             const int32x4_t nb1=vdupq_n_s32(NB-1);
+             auto put=[&](int ax,int b,float32x4_t ql,float32x4_t qh){++bN[ax][b];
+                 vst1q_f32(bLo[ax][b],vminq_f32(vld1q_f32(bLo[ax][b]),ql)); vst1q_f32(bHi[ax][b],vmaxq_f32(vld1q_f32(bHi[ax][b]),qh));};
+             for(int i=s;i<e;++i){const float* q=&prim[i].lo[0];
+                const float32x4_t ql=vld1q_f32(q),qh=vld1q_f32(q+3),qc=vld1q_f32(q+6);
+                // Same float ops as binOf: (c - clo) * sc, truncated toward zero, clamped to NB-1.
+                const int32x4_t bi=vminq_s32(vcvtq_s32_f32(vmulq_f32(vsubq_f32(qc,clo4),sc4)),nb1);
+                if(use0)put(0,vgetq_lane_s32(bi,0),ql,qh); if(use1)put(1,vgetq_lane_s32(bi,1),ql,qh); if(use2)put(2,vgetq_lane_s32(bi,2),ql,qh);}}
+#else
             for(int i=s;i<e;++i){const Prim& q=prim[i];
-                for(int ax=0;ax<3;++ax){if(!(sc[ax]>0))continue;Bin& bn=bins[ax][binOf(q,ax)];++bn.n;
-                    for(int k=0;k<3;++k){bn.lo[k]=std::min(bn.lo[k],q.lo[k]);bn.hi[k]=std::max(bn.hi[k],q.hi[k]);}}}
+                for(int ax=0;ax<3;++ax){if(!(sc[ax]>0))continue;const int b=binOf(q,ax);++bN[ax][b];
+                    for(int k=0;k<3;++k){bLo[ax][b][k]=std::min(bLo[ax][b][k],q.lo[k]);bHi[ax][b][k]=std::max(bHi[ax][b][k],q.hi[k]);}}}
+#endif
+            (void)use0;(void)use1;(void)use2;
             auto area=[](const F3& a,const F3& b){float x=b[0]-a[0],y=b[1]-a[1],z=b[2]-a[2];return x*y+y*z+z*x;};
             double bestCost=INFINITY; int bestAx=-1,bestB=0;
             for(int ax=0;ax<3;++ax){
                 if(!(sc[ax]>0))continue;
                 float rArea[BVH_BINS]; int rCnt[BVH_BINS]; F3 lo={INFINITY,INFINITY,INFINITY},hi={-INFINITY,-INFINITY,-INFINITY}; int c=0;
-                for(int b=NB-1;b>0;--b){const Bin& bn=bins[ax][b];c+=bn.n;for(int k=0;k<3;++k){lo[k]=std::min(lo[k],bn.lo[k]);hi[k]=std::max(hi[k],bn.hi[k]);}rCnt[b]=c;rArea[b]=c?area(lo,hi):0;}
+                for(int b=NB-1;b>0;--b){c+=bN[ax][b];for(int k=0;k<3;++k){lo[k]=std::min(lo[k],bLo[ax][b][k]);hi[k]=std::max(hi[k],bHi[ax][b][k]);}rCnt[b]=c;rArea[b]=c?area(lo,hi):0;}
                 lo={INFINITY,INFINITY,INFINITY};hi={-INFINITY,-INFINITY,-INFINITY}; c=0;
-                for(int b=0;b<NB-1;++b){const Bin& bn=bins[ax][b];c+=bn.n;for(int k=0;k<3;++k){lo[k]=std::min(lo[k],bn.lo[k]);hi[k]=std::max(hi[k],bn.hi[k]);}
+                for(int b=0;b<NB-1;++b){c+=bN[ax][b];for(int k=0;k<3;++k){lo[k]=std::min(lo[k],bLo[ax][b][k]);hi[k]=std::max(hi[k],bHi[ax][b][k]);}
                     if(!c||!rCnt[b+1])continue;
                     const double cost=double(area(lo,hi))*c+double(rArea[b+1])*rCnt[b+1];
                     if(cost<bestCost){bestCost=cost;bestAx=ax;bestB=b+1;}}
@@ -249,7 +273,7 @@ struct BVH {
                 m=i;
                 if(m>s&&m<e){
                     L.clo=cl0;L.chi=ch0;R.clo=cl1;R.chi=ch1;
-                    for(int b=0;b<NB;++b){BB& o=b<bestB?L:R;const Bin& bn=bins[ax][b];for(int k=0;k<3;++k){o.lo[k]=std::min(o.lo[k],bn.lo[k]);o.hi[k]=std::max(o.hi[k],bn.hi[k]);}}
+                    for(int b=0;b<NB;++b){BB& o=b<bestB?L:R;for(int k=0;k<3;++k){o.lo[k]=std::min(o.lo[k],bLo[ax][b][k]);o.hi[k]=std::max(o.hi[k],bHi[ax][b][k]);}}
                     done=true;}
             }
         }
@@ -268,7 +292,8 @@ struct BVH {
     }
     // Returns the squared distance and sets `tri`; keeps `best2`/`tri` if nothing is closer.
     // Same visit order as a binary BVH walk: nearer child first, skip boxes at or beyond best2.
-    inline __attribute__((always_inline)) double closest(const V3& p,double best2,int& tri,uint64_t& tested) const {
+    // `skip` is a leaf already tested by the caller (its distance is in best2), so the walk skips it.
+    inline __attribute__((always_inline)) double closest(const V3& p,double best2,int& tri,uint64_t& tested,int skip=-1) const {
         // Separate arrays for refs and distances: a {int,double} entry gets read back with a wider
         // load than its int store, which defeats store-to-load forwarding on every push/pop.
         int sr[128]; double sd[128]; int sp=0;
@@ -277,7 +302,7 @@ struct BVH {
         while(sp){
             --sp; const int er=sr[sp];
             if(sd[sp]>=best2)continue;
-            if(er<0){const int k=~er;++tested;double d=triDist2(p,pt[k]);if(d<best2){best2=d;tri=k;}continue;}
+            if(er<0){const int k=~er;if(k==skip)continue;++tested;double d=triDist2(p,pt[k]);if(d<best2){best2=d;tri=k;}continue;}
             const CNode& n=nd[er];
             double dl,dr;
 #if defined(__aarch64__)
@@ -305,16 +330,29 @@ struct BVH {
 // Inside = nonzero winding number along a +z ray through the voxel column centre.
 static std::vector<uint8_t> insideMask(const std::vector<Tri>& t,const V3& lo,const V3& span,int R,int threads){
     std::vector<uint8_t> in(size_t(R)*R*R,0);
-    // Bin triangles by their xy footprint in voxel-column units.
+    // Bin triangles by their xy footprint in voxel-column units (CSR: count, prefix sum, fill).
+    // A triangle whose three vertices share x (or y) exactly can never pass the edge test below: with
+    // ax=bx=cx the edge functions are rounded differences of fl(X*ay), fl(X*by), fl(X*cy), and rounding is
+    // monotone, so their signs follow (cy-by), (ay-cy), (by-ay), which sum to zero and can't all agree.
+    // Such triangles (the side faces of boxes) are left out of the bins; the mask is unchanged.
     const double sx=span[0]/R,sy=span[1]/R;
-    std::vector<std::vector<uint32_t>> bins(size_t(R)*R);
+    struct FP { uint32_t id; int i0,i1,j0,j1; }; std::vector<FP> fp; fp.reserve(t.size());
+    std::vector<uint32_t> start(size_t(R)*R+1,0);
     for(uint32_t i=0;i<t.size();++i){
-        double x0=std::min({t[i].a[0],t[i].b[0],t[i].c[0]}),x1=std::max({t[i].a[0],t[i].b[0],t[i].c[0]});
-        double y0=std::min({t[i].a[1],t[i].b[1],t[i].c[1]}),y1=std::max({t[i].a[1],t[i].b[1],t[i].c[1]});
+        const Tri& tr=t[i];
+        if((tr.a[0]==tr.b[0]&&tr.a[0]==tr.c[0])||(tr.a[1]==tr.b[1]&&tr.a[1]==tr.c[1]))continue;
+        double x0=std::min({tr.a[0],tr.b[0],tr.c[0]}),x1=std::max({tr.a[0],tr.b[0],tr.c[0]});
+        double y0=std::min({tr.a[1],tr.b[1],tr.c[1]}),y1=std::max({tr.a[1],tr.b[1],tr.c[1]});
         int i0=std::max(0,int(std::floor((x0-lo[0])/sx-.5))),i1=std::min(R-1,int(std::ceil((x1-lo[0])/sx-.5)));
         int j0=std::max(0,int(std::floor((y0-lo[1])/sy-.5))),j1=std::min(R-1,int(std::ceil((y1-lo[1])/sy-.5)));
-        for(int j=j0;j<=j1;++j)for(int k=i0;k<=i1;++k)bins[size_t(j)*R+k].push_back(i);
+        if(i0>i1||j0>j1)continue;
+        fp.push_back({i,i0,i1,j0,j1});
+        for(int j=j0;j<=j1;++j)for(int k=i0;k<=i1;++k)++start[size_t(j)*R+k+1];
     }
+    for(size_t c=1;c<start.size();++c)start[c]+=start[c-1];
+    std::vector<uint32_t> items(start.back());
+    {std::vector<uint32_t> fill(start.begin(),start.end()-1);
+     for(const FP& f:fp)for(int j=f.j0;j<=f.j1;++j)for(int k=f.i0;k<=f.i1;++k)items[fill[size_t(j)*R+k]++]=f.id;}
     std::atomic<int> next{0};
     auto work=[&]{
         std::vector<std::pair<double,int>> hits;
@@ -323,8 +361,8 @@ static std::vector<uint8_t> insideMask(const std::vector<Tri>& t,const V3& lo,co
             // Tiny irrational offset keeps the ray off shared edges and vertices of axis-aligned input.
             const double x=lo[0]+(i+.5)*sx+1.2345e-9*sx,y=lo[1]+(j+.5)*sy+2.7182e-9*sy;
             hits.clear();
-            for(uint32_t k:bins[col]){
-                const Tri& tr=t[k];
+            for(uint32_t e=start[col];e<start[col+1];++e){
+                const Tri& tr=t[items[e]];
                 double ax=tr.a[0]-x,ay=tr.a[1]-y,bx=tr.b[0]-x,by=tr.b[1]-y,cx=tr.c[0]-x,cy=tr.c[1]-y;
                 double w0=bx*cy-by*cx,w1=cx*ay-cy*ax,w2=ax*by-ay*bx;
                 if(!((w0>0&&w1>0&&w2>0)||(w0<0&&w1<0&&w2<0)))continue;
@@ -393,7 +431,9 @@ int main(int argc,char** argv){
     const auto seedBound=[](const V3&){return double(INFINITY);};
 
 
-    std::vector<float> field(size_t(R)*R*R,float(clip));
+    // Left uninitialised: the workers write every voxel (culled ones as clip).
+    const size_t NV=size_t(R)*R*R; std::unique_ptr<float[]> fieldBuf(new float[NV]); float* const field=fieldBuf.get();
+    const float fclip=float(clip);
     const V3 vox{span[0]/R,span[1]/R,span[2]/R};
     const int B=block?block:1,NB=R/B;
     const double halfDiag=.5*std::sqrt(dot3(vox,vox))*B;
@@ -402,46 +442,81 @@ int main(int argc,char** argv){
     // diagonal: any trilinear sample below r has all 8 corners within a diagonal of each other,
     // so every corner it reads stays exact, and samples above r stay above r.
     const double limit=reach>0?std::min(clip,reach+std::sqrt(dot3(vox,vox))):clip;
+    // Points are addressed in half-voxel units within the grid: half coordinate h is lo + .5*h*vox
+    // (h = 2i+1 is voxel i's centre, bit-identical to lo + (i+.5)*vox). Every offset between two points
+    // of one block is in [-B,B] half-voxels per axis, so one (2B+1)^3 table holds all the distances the
+    // culling needs, rounded up (1e-12 relative and absolute) so every bound stays conservative.
+    const int TW=2*B+1; std::vector<double> dtab(size_t(TW)*TW*TW);
+    for(int z=-B;z<=B;++z)for(int y=-B;y<=B;++y)for(int x=-B;x<=B;++x){
+        const double ox=.5*x*vox[0],oy=.5*y*vox[1],oz=.5*z*vox[2];
+        dtab[(size_t(z+B)*TW+(y+B))*TW+(x+B)]=std::sqrt(ox*ox+oy*oy+oz*oz)*(1+1e-12)+1e-12;}
+    const double* const T0=dtab.data()+(size_t(B)*TW+B)*TW+B;   // T0[(z*TW+y)*TW+x] for offsets in [-B,B]
     std::atomic<int> next{0}; std::atomic<uint64_t> queries{0},tested{0},culled{0},voxCulled{0};
     t0=Clk::now();
     auto work=[&]{
         Searcher s(tris,grid); uint64_t q=0,bt=0,vc=0; int prevTri=-1;
         // Exact distance to the nearest triangle, or +inf if it is farther than `lim`.
-        // `upper` is a known upper bound on the answer (from the block centre).
+        // `upper` is a known upper bound on the answer (from a reference point).
         auto nearest=[&](const V3& p,double lim,double upper=INFINITY)->double{
             if(useGrid)return s.nearest(p,lim,std::min(seedBound(p),lim+1e-9));
             // The derived bound gets a hair of slack so rounding can't hide the true nearest triangle.
             // The seed triangle's own distance gets none: equal-distance triangles are common in box
             // scenes, and strict pruning at the seed distance is what keeps them from being tested.
             double start=std::min(lim+1e-9,upper*(1+1e-9)+1e-12); int tri=-1;
-            if(neighbour&&prevTri>=0){double dp=std::sqrt(triDist2(p,bvh.pt[prevTri]));if(dp<=start){start=dp;tri=prevTri;}}
-            else if(!neighbour)start=std::min(start,seedBound(p));
-            double d2=bvh.closest(p,start*start,tri,bt);
+            if(!neighbour)start=std::min(start,seedBound(p));
+            double best2=start*start; int skip=-1;
+            if(neighbour&&prevTri>=0){const double dp2=triDist2(p,bvh.pt[prevTri]);if(dp2<=best2){best2=dp2;tri=prevTri;skip=prevTri;}}
+            const double d2=bvh.closest(p,best2,tri,bt,skip);
             if(tri>=0)prevTri=tri;
             const double d=std::sqrt(d2); return tri>=0&&d<=lim?d:INFINITY;
         };
-        for(int b;(b=next++)<NB*NB*NB;){
-            const int bx=b%NB,by=(b/NB)%NB,bz=b/(NB*NB);
-            double dc=-INFINITY; V3 c{0,0,0};
-            if(block){
-                c={lo[0]+(bx+.5)*B*vox[0],lo[1]+(by+.5)*B*vox[1],lo[2]+(bz+.5)*B*vox[2]};
-                ++q; dc=nearest(c,limit+halfDiag);
-                if(std::isinf(dc)){
-                    // Every voxel is more than `limit` from the surface; no surface crossing inside the block.
-                    ++culled; continue;
+        auto pt=[&](int hx,int hy,int hz)->V3{return {lo[0]+.5*hx*vox[0],lo[1]+.5*hy*vox[1],lo[2]+.5*hz*vox[2]};};
+        auto T=[&](int x,int y,int z){return T0[(ptrdiff_t(z)*TW+y)*TW+x];};
+        auto fillCube=[&](int ox,int oy,int oz,int S){
+            for(int z=0;z<S;++z)for(int y=0;y<S;++y){float* f=field+(size_t(oz+z)*R+(oy+y))*R+ox;for(int x=0;x<S;++x)f[x]=fclip;}};
+        // Cube of S^3 voxels at voxel origin o, with reference distance dref at half coordinate r.
+        // 1-Lipschitz: every point p has d(p) >= dref - |p-r|. Even cubes of 4+ split into 8 subcubes;
+        // a subcube is culled from the reference bound, or from its own centre's exact distance, which
+        // is only queried when it could cull (its upper bound dref+|c-r| is past limit + half-diagonal).
+        auto cube=[&](auto& self,int ox,int oy,int oz,int S,double dref,int rx,int ry,int rz)->void{
+            if(S>=4&&!(S&1)){
+                const int h=S/2; const double hd=T(h-1,h-1,h-1);   // subcube centre to its voxel centres
+                for(int cz=0;cz<2;++cz)for(int cy=0;cy<2;++cy)for(int cx=0;cx<2;++cx){
+                    const int x0=ox+cx*h,y0=oy+cy*h,z0=oz+cz*h,hx=2*x0+h,hy=2*y0+h,hz=2*z0+h;
+                    const double rc=T(hx-rx,hy-ry,hz-rz);
+                    if(dref-rc-hd>limit){fillCube(x0,y0,z0,h);vc+=uint64_t(h)*h*h;continue;}
+                    if(dref+rc-hd>limit){
+                        ++q; const double ds=nearest(pt(hx,hy,hz),limit+hd,dref+rc);
+                        if(std::isinf(ds)){fillCube(x0,y0,z0,h);vc+=uint64_t(h)*h*h;continue;}
+                        self(self,x0,y0,z0,h,ds,hx,hy,hz);
+                    }else self(self,x0,y0,z0,h,dref,rx,ry,rz);
+                }
+                return;
+            }
+            for(int z=0;z<S;++z)for(int y=0;y<S;++y){
+                const int k=oz+z,j=oy+y; float* const f=field+(size_t(k)*R+j)*R;
+                for(int x=0;x<S;++x){const int i=ox+x;
+                    const double r=T(2*i+1-rx,2*j+1-ry,2*k+1-rz);
+                    if(dref-r>limit){f[i]=fclip;++vc;continue;}
+                    ++q; double d=nearest(pt(2*i+1,2*j+1,2*k+1),limit,dref+r);
+                    if(std::isinf(d))d=clip;
+                    f[i]=float(std::min(d,clip));
                 }
             }
-            for(int z=0;z<B;++z)for(int y=0;y<B;++y)for(int x=0;x<B;++x){
-                const int i=bx*B+x,j=by*B+y,k=bz*B+z; const size_t idx=(size_t(k)*R+j)*R+i;
-                const V3 p{lo[0]+(i+.5)*vox[0],lo[1]+(j+.5)*vox[1],lo[2]+(k+.5)*vox[2]};
-                // 1-Lipschitz: |d(p) - d(c)| <= |p - c|. Lower bound past the limit skips the query.
-                double upper=INFINITY;
-                if(block){const V3 pc=p-c;const double r=std::sqrt(dot3(pc,pc));
-                    if(dc-r>limit){++vc;continue;}
-                    upper=dc+r;}
-                ++q; double d=nearest(p,limit,upper);
+        };
+        for(int b;(b=next++)<NB*NB*NB;){
+            const int bx=b%NB,by=(b/NB)%NB,bz=b/(NB*NB);
+            if(block){
+                const int hx=(2*bx+1)*B,hy=(2*by+1)*B,hz=(2*bz+1)*B;
+                ++q; const double dc=nearest(pt(hx,hy,hz),limit+halfDiag);
+                // Every voxel is more than `limit` from the surface; no surface crossing inside the block.
+                if(std::isinf(dc)){++culled;fillCube(bx*B,by*B,bz*B,B);continue;}
+                cube(cube,bx*B,by*B,bz*B,B,dc,hx,hy,hz);
+            }else{
+                const int i=bx,j=by,k=bz;
+                ++q; double d=nearest(pt(2*i+1,2*j+1,2*k+1),limit);
                 if(std::isinf(d))d=clip;
-                field[idx]=float(std::min(d,clip));
+                field[(size_t(k)*R+j)*R+i]=float(std::min(d,clip));
             }
         }
         queries+=q; tested+=s.tested+bt; voxCulled+=vc;
@@ -450,15 +525,22 @@ int main(int argc,char** argv){
     const double tField=since(t0);
     // -float(d) is float(d) with the sign bit set, so this is bit-identical to signing per voxel.
     t0=Clk::now(); signThread.join(); const double tSignWait=since(t0);
-    for(size_t k=0;k<field.size();++k)if(inside[k])field[k]=-field[k];
+    for(size_t k=0;k<NV;++k)if(inside[k])field[k]=-field[k];
     const double tTotal=since(total);
 
-    std::ofstream(out,std::ios::binary).write((const char*)field.data(),field.size()*4);
     std::ostringstream js; js<<std::fixed<<std::setprecision(3)
       <<"{\"triangles\":"<<tris.size()<<",\"res\":"<<R<<",\"clip\":"<<clip<<",\"threads\":"<<threads<<",\"block\":"<<block<<",\"search\":\""<<search<<"\""
       <<",\"grid_cell\":"<<grid.cell<<",\"ms\":{\"load\":"<<tLoad<<",\"grid\":"<<tGrid<<",\"bvh\":"<<tBvh<<",\"sign\":"<<tSign<<",\"sign_wait\":"<<tSignWait<<",\"distance\":"<<tField<<",\"total\":"<<tTotal<<"}"
       <<",\"limit\":"<<limit<<",\"blocks\":"<<NB*NB*NB<<",\"blocks_culled\":"<<culled<<",\"voxels_culled\":"<<voxCulled<<",\"distance_queries\":"<<queries<<",\"triangle_tests\":"<<tested<<"}";
     std::cout<<js.str()<<"\n";
     if(!statsPath.empty())std::ofstream(statsPath)<<js.str()<<"\n";
+    // Raw write() loop, then flush and _exit: skips stream buffering and the teardown of the
+    // BVH, triangles and field (the OS reclaims them).
+    {const int fd=::open(out.c_str(),O_WRONLY|O_CREAT|O_TRUNC,0644);
+     if(fd<0){std::cerr<<"cannot write "<<out<<": "<<std::strerror(errno)<<"\n";return 1;}
+     const char* w=(const char*)field; size_t left=NV*4;
+     while(left){const ssize_t n=::write(fd,w,left);if(n<0){if(errno==EINTR)continue;std::cerr<<"write failed: "<<std::strerror(errno)<<"\n";::close(fd);return 1;}w+=n;left-=size_t(n);}
+     if(::close(fd)!=0){std::cerr<<"close failed: "<<std::strerror(errno)<<"\n";return 1;}}
+    std::cout.flush(); std::fflush(nullptr); std::_Exit(0);
     return 0;
 }
