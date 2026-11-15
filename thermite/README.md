@@ -24,22 +24,12 @@ The reference fields, `eval_ao.py` and the ray-traced reference live in `refs/`.
 
 Single runs on a shared host; the campaign uses 3 runs per cell per block, and 5 confirmation blocks. Negative tests: one voxel changed by 1 mm inside the band fails, and far values raised to the clip pass.
 
-## Status: staged, not started
+## Status: running
 
-Decided: seed is the local commit `d81792b` on `speed-prototypes`, the model is Claude Opus 5.5, and the budget is $20 and 4 h.
-
-Staged in `../thermite-staging/` (outside the repo):
-- `dpnns-ao-seed.bundle`: seed commit `d81792ba4f2963c5ecaa38714ea3e5d700419553`.
-- `bake-sdf-kit.bundle`: the kit as its own repo (`../thermite-kit-bake-sdf`), commit `4a5b0bc69ca6f485a8e9c3a07b81d3b82de1fa97`.
-- `assign-payload.json`: built with `thermite assign-payload` with nothing issued. It carries both bundles as imports.
-
-Not started because `local-1`, the only enrolled rig, is running another session's campaign (`procgen-boolean-quality-2`, assigned 12:51). A second judge on the same 6 CPUs would corrupt both campaigns' timings.
-
-To start once the rig is free:
-1. Copy both bundles into `~/thermite/.dev/inbox/repos/`.
-2. Issue the payload: `thermite command --kind assign_campaign --payload @assign-payload.json --rig local-1 --control http://127.0.0.1:8800 --token-file <owner token>`.
-3. If it doesn't start agents itself, give the model with `run start bake-sdf-speed --rig local-1 --provider <anthropic provider name in control Settings> --model claude-opus-5-5 …`.
-
-The rig's `model-api-key` file is 17 bytes, which looks like a placeholder, so a provider must be set up in control's Settings first.
+- **Run `bake-sdf-speed-2`** was assigned to `local-1` on 2026-11-15 at 13:10 JST, from contract v2 (sha256 `ced2fc07…`). It is seeded from `d81792b`, uses kit `4a5b0bc`, and is capped at $20 and 4 h.
+- **Agents:** Claude Code 2.1.325 on a Claude subscription (`claude-code:opus-5.5`, set on the rig's Workers line). The rig's harness and supervisor images add only the `claude` binary; see the comments in `~/thermite/compose.override.yaml`.
+- **Run `bake-sdf-speed-1`** failed its baseline jobs ("contract names no kit"): v1 of the contract had no `project.kit`. v2 names the seed and kit by the repos the assign payload imports (`dpnns-ao`, `bake-sdf-kit`).
+- **Staging:** bundles and payloads are in `../thermite-staging/`, and the bundles also sit in `~/thermite/.dev/inbox/repos/`.
+- **Results:** follow the run on the dashboard (http://127.0.0.1:8800/ui). Its champions land in the rig's results repository.
 
 GPU work (runtime AO, the mover bake) can't run on this rig: it is a CPU target in a Linux container with no browser GPU. Those stay with `benchmark/mover-bench.js` on the Mac.
