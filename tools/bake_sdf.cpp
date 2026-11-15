@@ -33,6 +33,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 using V3 = std::array<double,3>;
 static V3 operator-(const V3& a,const V3& b){return {a[0]-b[0],a[1]-b[1],a[2]-b[2]};}
@@ -156,6 +159,7 @@ struct Searcher {
 #ifndef BVH_LEAF
 #define BVH_LEAF 1   // one triangle per leaf: Archive -21% vs 4, dense mesh unchanged, output identical
 #endif
+static_assert(BVH_LEAF==1,"compact BVH nodes inline one-triangle leaves");
 struct BVH {
     struct Node { V3 lo,hi; int left=-1,right=-1,start=0,count=0; };
     // Build primitive: triangle bounds, centroid and index, partitioned in place (contiguous, cache friendly).
@@ -177,6 +181,28 @@ struct BVH {
         nodes=buildTree(0,int(t.size()),depth);
         order.resize(t.size()); for(size_t i=0;i<t.size();++i)order[i]=prim[i].id;
         std::vector<Prim>().swap(prim);
+        compact();
+    }
+    // Query layout: one 64-byte node per internal node, holding both children's boxes (float32,
+    // structure of arrays: [axis][child]) and child references. A reference >= 0 is an internal
+    // node; < 0 is a one-triangle leaf, ~ref the triangle index (leaves get no node of their own).
+    // The float boxes are the build's boxes exactly (those were already float values, rounded
+    // outward), and box distances are still computed in double, so every pruning decision is the
+    // same as with the double nodes.
+    struct alignas(64) CNode { float lo[3][2],hi[3][2]; int child[2]; };
+    std::vector<CNode> cn; int rootRef=0; V3 rootLo,rootHi;
+    int ref(int i) const {const Node& n=nodes[i];return n.count==1?~int(order[n.start]):i;}
+    void compact(){
+        // Internal nodes keep their pre-order rank among internal nodes.
+        std::vector<int> map(nodes.size(),-1); int m=0;
+        for(size_t i=0;i<nodes.size();++i)if(!(nodes[i].count==1))map[i]=m++;
+        cn.resize(m);
+        for(size_t i=0;i<nodes.size();++i){if(map[i]<0)continue;const Node& n=nodes[i];CNode& c=cn[map[i]];
+            const int ch[2]={n.left,n.right};
+            for(int j=0;j<2;++j){const Node& x=nodes[ch[j]];for(int k=0;k<3;++k){c.lo[k][j]=float(x.lo[k]);c.hi[k][j]=float(x.hi[k]);}
+                const int r=ref(ch[j]);c.child[j]=r<0?r:map[r];}}
+        rootLo=nodes[0].lo; rootHi=nodes[0].hi; const int r=ref(0); rootRef=r<0?r:map[r];
+        std::vector<Node>().swap(nodes); std::vector<uint32_t>().swap(order);
     }
     std::vector<Node> buildTree(int s,int e,int depth){
         std::vector<Node> out;
@@ -241,15 +267,35 @@ struct BVH {
     }
     static double boxDist2(const V3& p,const Node& n){double d=0;for(int k=0;k<3;++k){double v=std::max({n.lo[k]-p[k],0.,p[k]-n.hi[k]});d+=v*v;}return d;}
     // Returns the squared distance and sets `tri`; keeps `best2`/`tri` if nothing is closer.
-    double closest(const V3& p,double best2,int& tri,uint64_t& tested) const {
-        int stack[128]; int sp=0; stack[sp++]=0;
+    // Same visit order as a binary BVH walk: nearer child first, skip boxes at or beyond best2.
+    inline __attribute__((always_inline)) double closest(const V3& p,double best2,int& tri,uint64_t& tested) const {
+        // Separate arrays for refs and distances: a {int,double} entry gets read back with a wider
+        // load than its int store, which defeats store-to-load forwarding on every push/pop.
+        int sr[128]; double sd[128]; int sp=0;
+        {double d=0;for(int k=0;k<3;++k){double v=std::max({rootLo[k]-p[k],0.,p[k]-rootHi[k]});d+=v*v;}sr[0]=rootRef;sd[0]=d;sp=1;}
+        const CNode* const nd=cn.data();
         while(sp){
-            const Node& n=nodes[stack[--sp]];
-            if(boxDist2(p,n)>=best2)continue;
-            if(n.count){for(int i=0;i<n.count;++i){uint32_t k=order[n.start+i];++tested;double d=triDist2(p,t[k]);if(d<best2){best2=d;tri=int(k);}}continue;}
-            const double dl=boxDist2(p,nodes[n.left]),dr=boxDist2(p,nodes[n.right]);
-            if(dl<dr){if(dr<best2)stack[sp++]=n.right;if(dl<best2)stack[sp++]=n.left;}
-            else{if(dl<best2)stack[sp++]=n.left;if(dr<best2)stack[sp++]=n.right;}
+            --sp; const int er=sr[sp];
+            if(sd[sp]>=best2)continue;
+            if(er<0){const int k=~er;++tested;double d=triDist2(p,t[k]);if(d<best2){best2=d;tri=k;}continue;}
+            const CNode& n=nd[er];
+            double dl,dr;
+#if defined(__aarch64__)
+            // Both children at once: lane j = child j. max(lo-p, p-hi, 0) per axis, branch free.
+            {float64x2_t acc=vdupq_n_f64(0);
+             for(int k=0;k<3;++k){const float64x2_t pk=vdupq_n_f64(p[k]);
+                const float64x2_t v=vmaxq_f64(vmaxq_f64(vsubq_f64(vcvt_f64_f32(vld1_f32(n.lo[k])),pk),vsubq_f64(pk,vcvt_f64_f32(vld1_f32(n.hi[k])))),vdupq_n_f64(0));
+                acc=k?vaddq_f64(acc,vmulq_f64(v,v)):vmulq_f64(v,v);}
+             dl=vgetq_lane_f64(acc,0); dr=vgetq_lane_f64(acc,1);}
+#else
+            dl=0; dr=0;
+            for(int k=0;k<3;++k){
+                const double l0=double(n.lo[k][0])-p[k],l1=double(n.lo[k][1])-p[k],h0=p[k]-double(n.hi[k][0]),h1=p[k]-double(n.hi[k][1]);
+                const double v0=std::fmax(std::fmax(l0,h0),0.),v1=std::fmax(std::fmax(l1,h1),0.);
+                dl+=v0*v0; dr+=v1*v1;}
+#endif
+            if(dl<dr){if(dr<best2){sr[sp]=n.child[1];sd[sp++]=dr;}if(dl<best2){sr[sp]=n.child[0];sd[sp++]=dl;}}
+            else{if(dl<best2){sr[sp]=n.child[0];sd[sp++]=dl;}if(dr<best2){sr[sp]=n.child[1];sd[sp++]=dr;}}
         }
         return best2;
     }
