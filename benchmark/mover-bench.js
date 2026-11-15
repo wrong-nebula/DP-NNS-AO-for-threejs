@@ -127,5 +127,28 @@ async function refMAE(tag,poses=['0.0','11.1']){
   }
   return out;
 }
-window.moverBench={run,runTimes,ab,refMAE,POSES};
+// AO error near moving objects for candidate moverScale vectors, against the ray-traced reference
+// (export_reference_movers.py), on the pixels the movers change. Poses are split into a fit set and
+// a held-out set, so a weight chosen on one is checked on the other.
+//   await moverBench.scoreMoverScale([[1,1,1,1],[.5,.5,.5,.5]])
+async function scoreMoverScale(scales,{fit=[0,7.4,14.8,22.2],hold=[3.7,11.1,18.5,25.9],mode=14}={}){
+  const d=setup(), gl=d.renderer.getContext(), refs={};
+  for(const t of [...fit,...hold]){const k=t.toFixed(1);
+    refs[t]={ao:new Float32Array(await (await fetch(`/benchmark/ref_movers_${k}.f32`)).arrayBuffer()),
+             flags:new Uint8Array(await (await fetch(`/benchmark/ref_movers_${k}.u8`)).arrayBuffer())};}
+  d.setDynamicAO(true);
+  const prev=d.dyn.moverScale.value.toArray();
+  const score=poses=>{let sA=0,nA=0,sAll=0,nAll=0,signed=0;
+    for(const [t,m] of poses){const {ao,flags}=refs[t];
+      for(let j=0;j<180;j++)for(let i=0;i<320;i++){const k=j*320+i;if(!(flags[k]&1)||!Number.isFinite(ao[k]))continue;
+        const e=m[(719-(2+4*j))*1280+2+4*i]/255-ao[k];sAll+=Math.abs(e);nAll++;if(flags[k]&2){sA+=Math.abs(e);signed+=e;nA++;}}}
+    return {affected:+(sA/nA).toFixed(5),signed:+(signed/nA).toFixed(4),all:+(sAll/nAll).toFixed(5)};};
+  const out=[];
+  for(const s of scales){d.setMoverScale(...s);const masks={};
+    for(const t of [...fit,...hold]){d.updateMovers(t);masks[t]=readMask(d,gl,mode);}
+    out.push({scale:s,fit:score(fit.map(t=>[t,masks[t]])),hold:score(hold.map(t=>[t,masks[t]]))});}
+  d.setMoverScale(...prev);
+  return out;
+}
+window.moverBench={run,runTimes,ab,refMAE,scoreMoverScale,POSES};
 })();
