@@ -13,7 +13,7 @@
 // Output float32, x fastest, then y, then z; voxel i at lo + (i + 0.5) * span / res. Negative inside.
 //
 //   bake_sdf --boxes archive.json --lo -1 -1 -1 --span 26 18 8 --res 128 --clip 1.5 --out archive.f32
-// Options: --threads N  --block B (0 disables culling)  --search bvh-neighbour|bvh|grid  --cell metres  --subdiv n (boxes)  --stats file.json
+// Options: --threads N  --block B (0 disables culling)  --reach r (AO reach; distances past r + 1 voxel diagonal are not resolved)  --search bvh-neighbour|bvh|grid  --cell metres  --subdiv n (boxes)  --stats file.json
 // Build:   c++ -O3 -std=c++17 -pthread bake_sdf.cpp -o bake_sdf    (no dependencies)
 #include <algorithm>
 #include <array>
@@ -144,28 +144,51 @@ struct Searcher {
 };
 
 // ------------------------------------------------------------------ triangle BVH
-// Binary BVH, median split on the longest centroid axis, leaves of up to 4 triangles.
+// Binary BVH, median split on the longest centroid axis, leaves of up to BVH_LEAF triangles.
 // Closest-triangle queries visit the nearer child first and skip boxes beyond the best distance,
 // so a good starting bound (e.g. the previous voxel's triangle) prunes most of the tree.
+#ifndef BVH_LEAF
+#define BVH_LEAF 1   // one triangle per leaf: Archive -21% vs 4, dense mesh unchanged, output identical
+#endif
 struct BVH {
     struct Node { V3 lo,hi; int left=-1,right=-1,start=0,count=0; };
     std::vector<Node> nodes; std::vector<uint32_t> order; const std::vector<Tri>& t;
-    explicit BVH(const std::vector<Tri>& tris):t(tris){
+    // threads > 1 builds the top subtrees in parallel. The node array is identical to the serial
+    // build (same splits, same pre-order layout), so queries and output do not change.
+    explicit BVH(const std::vector<Tri>& tris,int threads=1):t(tris){
         order.resize(t.size()); std::iota(order.begin(),order.end(),0);
         std::vector<V3> cen(t.size()); for(size_t i=0;i<t.size();++i)cen[i]=(t[i].a+t[i].b+t[i].c)*(1./3);
-        nodes.reserve(2*t.size()/4+2);
-        build(0,int(t.size()),cen);
+        int depth=0; while((2<<depth)<=threads&&depth<6)++depth;   // 2^depth subtrees
+        nodes=buildTree(0,int(t.size()),cen,depth);
     }
-    int build(int s,int e,const std::vector<V3>& cen){
+    std::vector<Node> buildTree(int s,int e,const std::vector<V3>& cen,int depth){
+        std::vector<Node> out;
+        if(depth<=0||e-s<=8192){out.reserve(2*(e-s)/4+2);build(s,e,cen,out);return out;}
+        int ax; Node n=split(s,e,cen,ax); const int m=(s+e)/2;
+        std::vector<Node> L,R;
+        std::thread th([&]{L=buildTree(s,m,cen,depth-1);}); R=buildTree(m,e,cen,depth-1); th.join();
+        out.reserve(1+L.size()+R.size()); out.push_back(n);
+        auto append=[&](const std::vector<Node>& v){const int off=int(out.size());for(Node x:v){if(x.left>=0){x.left+=off;x.right+=off;}out.push_back(x);}return off;};
+        out[0].left=append(L); out[0].right=append(R);
+        return out;
+    }
+    // Bounds of [s,e); for internal nodes also partitions `order` at the median of the longest centroid axis.
+    Node split(int s,int e,const std::vector<V3>& cen,int& ax){
         Node n; n.lo={INFINITY,INFINITY,INFINITY}; n.hi={-INFINITY,-INFINITY,-INFINITY}; V3 clo=n.lo,chi=n.hi;
         for(int i=s;i<e;++i){const Tri& x=t[order[i]];for(const V3* p:{&x.a,&x.b,&x.c})for(int k=0;k<3;++k){n.lo[k]=std::min(n.lo[k],(*p)[k]);n.hi[k]=std::max(n.hi[k],(*p)[k]);}
             for(int k=0;k<3;++k){clo[k]=std::min(clo[k],cen[order[i]][k]);chi[k]=std::max(chi[k],cen[order[i]][k]);}}
-        const int id=int(nodes.size()); nodes.push_back(n);
-        if(e-s<=4){nodes[id].start=s;nodes[id].count=e-s;return id;}
-        int ax=0; for(int k=1;k<3;++k)if(chi[k]-clo[k]>chi[ax]-clo[ax])ax=k;
+        ax=0; if(e-s<=BVH_LEAF)return n;
+        for(int k=1;k<3;++k)if(chi[k]-clo[k]>chi[ax]-clo[ax])ax=k;
         const int m=(s+e)/2;
         std::nth_element(order.begin()+s,order.begin()+m,order.begin()+e,[&](uint32_t a,uint32_t b){return cen[a][ax]<cen[b][ax];});
-        const int l=build(s,m,cen),r=build(m,e,cen); nodes[id].left=l; nodes[id].right=r; return id;
+        return n;
+    }
+    int build(int s,int e,const std::vector<V3>& cen,std::vector<Node>& out){
+        int ax; Node n=split(s,e,cen,ax);
+        const int id=int(out.size()); out.push_back(n);
+        if(e-s<=BVH_LEAF){out[id].start=s;out[id].count=e-s;return id;}
+        const int m=(s+e)/2;
+        const int l=build(s,m,cen,out),r=build(m,e,cen,out); out[id].left=l; out[id].right=r; return id;
     }
     static double boxDist2(const V3& p,const Node& n){double d=0;for(int k=0;k<3;++k){double v=std::max({n.lo[k]-p[k],0.,p[k]-n.hi[k]});d+=v*v;}return d;}
     // Returns the squared distance and sets `tri`; keeps `best2`/`tri` if nothing is closer.
@@ -228,7 +251,7 @@ static std::vector<uint8_t> insideMask(const std::vector<Tri>& t,const V3& lo,co
 }
 
 int main(int argc,char** argv){
-    std::string boxes,obj,out,statsPath,search="bvh-neighbour"; int subdiv=1; double cellOverride=0; V3 lo{0,0,0},span{0,0,0}; int R=128,block=8,threads=int(std::max(1u,std::thread::hardware_concurrency())); double clip=1.5;
+    std::string boxes,obj,out,statsPath,search="bvh-neighbour"; int subdiv=1; double cellOverride=0; V3 lo{0,0,0},span{0,0,0}; int R=128,block=8,threads=int(std::max(1u,std::thread::hardware_concurrency())); double clip=1.5,reach=0;
     for(int i=1;i<argc;++i){
         std::string a=argv[i]; auto need=[&](int n){if(i+n>=argc)throw std::runtime_error("missing value for "+a);};
         if(a=="--boxes"){need(1);boxes=argv[++i];}
@@ -239,6 +262,7 @@ int main(int argc,char** argv){
         else if(a=="--span"){need(3);for(int k=0;k<3;++k)span[k]=std::atof(argv[++i]);}
         else if(a=="--res"){need(1);R=std::atoi(argv[++i]);}
         else if(a=="--clip"){need(1);clip=std::atof(argv[++i]);}
+        else if(a=="--reach"){need(1);reach=std::atof(argv[++i]);}
         else if(a=="--threads"){need(1);threads=std::max(1,std::atoi(argv[++i]));}
         else if(a=="--block"){need(1);block=std::max(0,std::atoi(argv[++i]));}
         else if(a=="--search"){need(1);search=argv[++i];}
@@ -257,10 +281,11 @@ int main(int argc,char** argv){
     double edge=0; for(auto& x:tris)edge+=std::sqrt(dot3(x.b-x.a,x.b-x.a));
     edge/=tris.size();
     const double ext=std::max({span[0],span[1],span[2]});
-    t0=Clk::now(); TriGrid grid(tris,cellOverride>0?cellOverride:std::clamp(2*edge,ext/256,clip/2)); const double tGrid=since(t0);
-    t0=Clk::now(); BVH bvh(tris); const double tBvh=since(t0);
     // --search: bvh-neighbour (previous voxel's triangle as the starting bound, default) | bvh | grid
     const bool useGrid=search=="grid",neighbour=search=="bvh-neighbour";
+    // Only the search that is used gets built.
+    t0=Clk::now(); std::vector<Tri> noTris{tris[0]}; TriGrid grid(useGrid?tris:noTris,cellOverride>0?cellOverride:std::clamp(2*edge,ext/256,clip/2)); const double tGrid=since(t0);
+    t0=Clk::now(); BVH bvh(useGrid?noTris:tris,threads); const double tBvh=since(t0);
 
     const auto seedBound=[](const V3&){return double(INFINITY);};
     if(!(useGrid||neighbour||search=="bvh"))throw std::runtime_error("unknown --search "+search);
@@ -271,27 +296,37 @@ int main(int argc,char** argv){
     const V3 vox{span[0]/R,span[1]/R,span[2]/R};
     const int B=block?block:1,NB=R/B;
     const double halfDiag=.5*std::sqrt(dot3(vox,vox))*B;
-    std::atomic<int> next{0}; std::atomic<uint64_t> queries{0},tested{0},culled{0};
+    // Distances above `limit` are written as clip without being resolved. With --reach r (the
+    // farthest distance the AO shader can use, 1.12-.045 for the viewer), limit = r + one voxel
+    // diagonal: any trilinear sample below r has all 8 corners within a diagonal of each other,
+    // so every corner it reads stays exact, and samples above r stay above r.
+    const double limit=reach>0?std::min(clip,reach+std::sqrt(dot3(vox,vox))):clip;
+    std::atomic<int> next{0}; std::atomic<uint64_t> queries{0},tested{0},culled{0},voxCulled{0};
     t0=Clk::now();
     auto work=[&]{
-        Searcher s(tris,grid); uint64_t q=0,bt=0; int prevTri=-1;
-        // Exact distance to the nearest triangle, or +inf if it is farther than `limit`.
-        auto nearest=[&](const V3& p,double limit)->double{
-            if(useGrid)return s.nearest(p,limit,std::min(seedBound(p),limit+1e-9));
-            double start=limit+1e-9; int tri=-1;
-            if(neighbour&&prevTri>=0){start=std::min(start,std::sqrt(triDist2(p,tris[prevTri])));tri=prevTri;}
+        Searcher s(tris,grid); uint64_t q=0,bt=0,vc=0; int prevTri=-1;
+        // Exact distance to the nearest triangle, or +inf if it is farther than `lim`.
+        // `upper` is a known upper bound on the answer (from the block centre).
+        auto nearest=[&](const V3& p,double lim,double upper=INFINITY)->double{
+            if(useGrid)return s.nearest(p,lim,std::min(seedBound(p),lim+1e-9));
+            // The derived bound gets a hair of slack so rounding can't hide the true nearest triangle.
+            // The seed triangle's own distance gets none: equal-distance triangles are common in box
+            // scenes, and strict pruning at the seed distance is what keeps them from being tested.
+            double start=std::min(lim+1e-9,upper*(1+1e-9)+1e-12); int tri=-1;
+            if(neighbour&&prevTri>=0){double dp=std::sqrt(triDist2(p,tris[prevTri]));if(dp<=start){start=dp;tri=prevTri;}}
             else if(!neighbour)start=std::min(start,seedBound(p));
             double d2=bvh.closest(p,start*start,tri,bt);
             if(tri>=0)prevTri=tri;
-            const double d=std::sqrt(d2); return d<=limit?d:INFINITY;
+            const double d=std::sqrt(d2); return tri>=0&&d<=lim?d:INFINITY;
         };
         for(int b;(b=next++)<NB*NB*NB;){
             const int bx=b%NB,by=(b/NB)%NB,bz=b/(NB*NB);
+            double dc=-INFINITY; V3 c{0,0,0};
             if(block){
-                const V3 c{lo[0]+(bx+.5)*B*vox[0],lo[1]+(by+.5)*B*vox[1],lo[2]+(bz+.5)*B*vox[2]};
-                ++q;
-                if(std::isinf(nearest(c,clip+halfDiag))){
-                    // Every voxel is more than `clip` from the surface; no surface crossing inside the block.
+                c={lo[0]+(bx+.5)*B*vox[0],lo[1]+(by+.5)*B*vox[1],lo[2]+(bz+.5)*B*vox[2]};
+                ++q; dc=nearest(c,limit+halfDiag);
+                if(std::isinf(dc)){
+                    // Every voxel is more than `limit` from the surface; no surface crossing inside the block.
                     for(int z=0;z<B;++z)for(int y=0;y<B;++y)for(int x=0;x<B;++x){size_t k=(size_t(bz*B+z)*R+by*B+y)*R+bx*B+x;field[k]=inside[k]?-float(clip):float(clip);}
                     ++culled; continue;
                 }
@@ -299,12 +334,17 @@ int main(int argc,char** argv){
             for(int z=0;z<B;++z)for(int y=0;y<B;++y)for(int x=0;x<B;++x){
                 const int i=bx*B+x,j=by*B+y,k=bz*B+z; const size_t idx=(size_t(k)*R+j)*R+i;
                 const V3 p{lo[0]+(i+.5)*vox[0],lo[1]+(j+.5)*vox[1],lo[2]+(k+.5)*vox[2]};
-                ++q; double d=nearest(p,clip);
+                // 1-Lipschitz: |d(p) - d(c)| <= |p - c|. Lower bound past the limit skips the query.
+                double upper=INFINITY;
+                if(block){const V3 pc=p-c;const double r=std::sqrt(dot3(pc,pc));
+                    if(dc-r>limit){field[idx]=inside[idx]?-float(clip):float(clip);++vc;continue;}
+                    upper=dc+r;}
+                ++q; double d=nearest(p,limit,upper);
                 if(std::isinf(d))d=clip;
                 field[idx]=inside[idx]?-float(d):float(std::min(d,clip));
             }
         }
-        queries+=q; tested+=s.tested+bt;
+        queries+=q; tested+=s.tested+bt; voxCulled+=vc;
     };
     std::vector<std::thread> pool; for(int k=0;k<threads;++k)pool.emplace_back(work); for(auto& p:pool)p.join();
     const double tField=since(t0);
@@ -314,7 +354,7 @@ int main(int argc,char** argv){
     std::ostringstream js; js<<std::fixed<<std::setprecision(3)
       <<"{\"triangles\":"<<tris.size()<<",\"res\":"<<R<<",\"clip\":"<<clip<<",\"threads\":"<<threads<<",\"block\":"<<block<<",\"search\":\""<<search<<"\""
       <<",\"grid_cell\":"<<grid.cell<<",\"ms\":{\"load\":"<<tLoad<<",\"grid\":"<<tGrid<<",\"bvh\":"<<tBvh<<",\"sign\":"<<tSign<<",\"distance\":"<<tField<<",\"total\":"<<tTotal<<"}"
-      <<",\"blocks\":"<<NB*NB*NB<<",\"blocks_culled\":"<<culled<<",\"distance_queries\":"<<queries<<",\"triangle_tests\":"<<tested<<"}";
+      <<",\"limit\":"<<limit<<",\"blocks\":"<<NB*NB*NB<<",\"blocks_culled\":"<<culled<<",\"voxels_culled\":"<<voxCulled<<",\"distance_queries\":"<<queries<<",\"triangle_tests\":"<<tested<<"}";
     std::cout<<js.str()<<"\n";
     if(!statsPath.empty())std::ofstream(statsPath)<<js.str()<<"\n";
     return 0;
