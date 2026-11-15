@@ -1,11 +1,16 @@
 {
   "schema_version": 1,
   "campaign": "bake-sdf-speed",
-  "version": 1,
+  "version": 2,
   "title": "Faster static SDF bake (tools/bake_sdf.cpp) with output identical where the AO reads it",
   "mode": "hill_climb",
   "project": {
-    "repo": "https://github.com/wrong-nebula/DP-NNS-AO-for-threejs.git"
+    "repo": "dpnns-ao",
+    "commit": "d81792ba4f2963c5ecaa38714ea3e5d700419553",
+    "kit": {
+      "repo": "bake-sdf-kit",
+      "commit": "4a5b0bc69ca6f485a8e9c3a07b81d3b82de1fa97"
+    }
   },
   "target": {
     "type": "cpu",
