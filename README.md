@@ -46,8 +46,57 @@ c++ -O3 -std=c++17 -pthread tools/bake_sdf.cpp -o bake_sdf
 ./bake_sdf --obj scene.obj --lo -1 -1 -1 --span 26 18 8 --res 128 --clip 1.5 --out scene.f32
 ```
 
-Distances are exact (closest point on the nearest triangle), far space is skipped, sign comes from winding numbers, and all cores are used. On an Apple M1, the Archive takes 115 ms and a 488k-triangle version of it 307 ms. Outside the geometry the output matches the analytic field exactly, and AO accuracy is unchanged. See [precompute.md](benchmark/precompute.md).
+Distances are exact (closest point on the nearest triangle), far space is skipped, sign comes from winding numbers, and all cores are used. On an Apple M1, the Archive takes about 35 ms and a 488k-triangle version of it about 150 ms (originally 115 ms and 307 ms; see below). Outside the geometry the output matches the analytic field exactly, and AO accuracy is unchanged. See [precompute.md](benchmark/precompute.md).
 
 DP-NNS was evaluated as an SDF baking accelerator in an earlier experiment. As a seed for this baker it cost more to build than it saved, so the tool doesn't use it.
+
+## What I improved on the paper
+
+Every change below keeps the AO exactly as it was:
+- **Static bake:** baked fields are bit-identical to the original wherever the AO can read them.
+- **Static AO:** MAE stays 0.0401 (wall correction) / 0.0421 (original four-tap) against the 512-ray reference.
+- **Moving objects:** AO error is unchanged against a new ray-traced reference that includes all 11 moving objects at 8 poses ([reference_movers.py](benchmark/reference_movers.py)).
+
+Measured on an Apple M1.
+
+| What | Before | After |
+|---|---:|---:|
+| Static bake, Archive (1,908 triangles), 8 threads | ~115 ms | **~35 ms** (3.3× faster) |
+| Static bake, dense Archive (488k triangles), 8 threads | ~308 ms | **~150 ms** (2× faster) |
+| Moving-object bake at page load | 60 ms | **12 ms** (5× faster) |
+| Runtime AO, 11 moving objects | 0.79 ms | **0.62 ms** (−21%) |
+| Runtime AO, 16 moving objects | 1.10 ms | **0.79 ms** (−28%) |
+
+### Static bake (`tools/bake_sdf.cpp`)
+
+The bake is dominated by about 1.5 million exact closest-triangle queries, one per voxel within reach of a surface. Most of the work went into making each query cheaper and skipping queries that cannot change the output. The BVH's node layout and traversal order never affect which triangle is nearest, so every change below produces a bit-identical field.
+
+- **Binned SAH build.** The BVH used to split each node at the median centroid along its longest axis. It now picks the split from 16 bins per axis by the surface-area heuristic, down to one triangle per leaf. Node visits per query fall from 35.8 to 10.0 on the Archive and from 39.6 to 17.1 on the dense mesh. Leaf bounds are stored in float32, rounded outward, so every box still contains its triangles and pruning stays conservative.
+- **Cache-line nodes.** After the build, internal nodes are packed into 64-byte nodes that hold both children's bounds (structure-of-arrays by axis) and their references. One-triangle leaves become direct references in their parent. Traversal loads one cache line per visit, tests both children's box distances together with NEON in double precision, and keeps each child's distance on the stack so a popped node is never re-tested. A stack of `{int, double}` pairs defeated store-to-load forwarding and was 1.6× slower than two separate arrays.
+- **In-place, parallel build.** The SAH build writes nodes straight into their final pre-order slots, partitioning in place (no intermediate tree), with the top subtrees built on separate threads. The winding-number sign pass starts on its own thread right after loading and overlaps the tree build and the distance pass. Distances are written unsigned, and inside voxels are negated at the end.
+- **Hierarchical Lipschitz culling.** A signed distance field is 1-Lipschitz: it changes by at most the distance moved. Each 8³ block queries its centre once. Sub-blocks of 4³, then 2³, whose bound already puts every voxel beyond the clip distance are filled without per-voxel queries, and the remaining voxels start their search from the centre's bound. The bounds come from a precomputed half-voxel distance table, so the culls need no square roots.
+- **Cheaper sign pass.** The sign comes from counting surface crossings along a vertical ray per voxel column. Triangles whose three vertices share an x or y coordinate project to a line and can never be crossed, so they are skipped. The rest are binned per column in a compact (CSR) layout.
+- **Earlier exact steps:**
+  - the top levels of the tree build run in parallel and produce the same node array;
+  - the unused uniform-grid search is no longer built;
+  - each voxel's lower bound from its block centre skips queries that cannot land inside the clip distance.
+- **Optional `--reach r`:** values beyond the AO's reach plus one voxel diagonal are written as the clip value without being resolved. A trilinear sample below the reach reads only corners within one diagonal of each other, so the AO is identical.
+
+### Moving-object bake (GPU, at page load)
+
+Each mesh's 64³ field is baked by a fragment shader that loops over every triangle for every voxel, computing the exact distance and a generalised winding number (sum of solid angles) for the sign.
+
+- **Lazy baking.** Only the meshes that render through their baked field (the teapot and torus knot, 10.4k of 18.5k triangles) are baked at load. The analytic shapes are baked the first time "Baked SDF for all movers" is switched on, and the atlas shrinks from 11 slabs to 2. 60 → 41 ms.
+- **Winding term only inside the mesh box.** From any point outside a convex set that contains the mesh, every triangle lies within an open half-space of directions. The total solid angle is then below 2π and the winding number below ½, so the sign is always "outside". The `atan`-based winding term, about half the cost per triangle, is evaluated only for voxels inside the mesh's bounding box, a few percent of the 3.3 m cube. 41 → 12 ms.
+
+### Runtime AO with moving objects
+
+Splitting the original cost showed that deciding which objects can affect each pixel (about 0.31 ms) cost more than evaluating them (about 0.26 ms). Every floor and wall pixel looped over all 11 objects, because the large floor and wall instances are within reach of every object.
+
+- **World-cell object mask.** Each frame the CPU fills a 26 × 18 × 8 grid of 1 m cells (an `R32UI` 3D texture, 7.5 KB), setting object *i*'s bit in every cell within its bounding radius + 1.12 + (1.12 − 0.044) m. That set contains every pixel the exact per-pixel test can pass. The fragment shader reads one texel, ANDs it with the per-instance mask, and runs the exact sphere test only on the bits left. Candidate tests per pixel fell from 3.8 to about 0.5.
+- **Bounded loops with early exit.** The object loops keep a fixed bound and `break` once no higher bits are set. Open-ended loops over set bits (`m &= m - 1`) made every mode slower, the static path included, presumably because the compiler can no longer bound them.
+- **Separate no-object shader.** When no moving object is in the AO, a `NO_DYN` variant without any object code is used, so the static path pays nothing for the object support.
+
+Measurements and rejected ideas: [speed-plan.md](benchmark/speed-plan.md).
 
 [DP-NNS paper](https://arxiv.org/abs/2611.15320)
