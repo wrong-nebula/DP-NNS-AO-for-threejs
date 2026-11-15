@@ -139,19 +139,19 @@ const vec4 R=vec4(.16,.48,.80,1.12);
 // "SDF wall correction" AO, from the AO accuracy campaign against ray-traced AO
 // (accuracy/ao_formula.py is the reference version). Its fourth tap on non-horizontal faces sits
 // 0.8 m out at 45 degrees up, to see overhangs (shelves, stair undersides); on floors and tops it
-// stays 1.12 m along the normal. Floors/tops and other faces get their own per-tap biases and
-// response curves; structural walls keep the shipped wall-corrected weighting without that tap.
+// stays 1.12 m along the normal. Floors/tops, other faces and structural walls each get their own
+// per-tap biases and response curves.
 vec3 wallCorrectionTap3(vec3 n){
   float h=n.z*n.z;
   return n*vec3(.5657,.5657,.5657+.5543*h)+vec3(0.,0.,.5657*(1.-h));
 }
 float aoWallCorrection(vec4 d,vec3 normal){
-  vec4 t=clamp(1.-(d+.045)/R,0.,1.);
   float vertical=wallFace*(1.-abs(normal.z));
-  float farSupport=.40+.60*max(t.x,t.y);
   float k=.92/2.9;
-  vec4 w=mix(k*vec4(1.,.8166666667,.6333333333,.45),vec4(.46,.24,.21*farSupport,0.),vertical);
-  float wallAO=1.-dot(t,w);
+  // Structural walls: GPU-robust refit (linear clamps and one square, no sqrt), with each clamp's
+  // kink away from where an open wall's taps sit, so filtering rounding is not amplified.
+  vec4 v=clamp(1.-(d+vec4(.1526,-.0907,-.5168,.1875))/vec4(R.xyz,.8),0.,1.);
+  float wallAO=clamp(1.1383-(.0598*v.x*v.x+.5477*v.y+.038*v.z+.0891*v.w),0.,1.);
   vec4 s=clamp(1.-(d+vec4(.024,.078,0.,.02))/R,0.,1.);
   float far=s.w*s.w;far*=far;far*=far;
   float flatAO=1.-k*(s.x*s.x+.8166666667*sqrt(s.y)+.6333333333*sqrt(s.z)+.45*far);
