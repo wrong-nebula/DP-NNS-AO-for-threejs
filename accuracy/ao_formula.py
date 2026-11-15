@@ -23,10 +23,15 @@ import numpy as np
 
 def ao(n, wall, sample):
     r0, r1, r2, r3 = 0.16, 0.48, 0.80, 1.12
-    t0 = np.clip(1 - (sample(n * r0) + 0.045) / r0, 0, 1)
-    t1 = np.clip(1 - (sample(n * r1) + 0.045) / r1, 0, 1)
-    t2 = np.clip(1 - (sample(n * r2) + 0.045) / r2, 0, 1)
-    t3 = np.clip(1 - (sample(n * r3) + 0.045) / r3, 0, 1)
+    d0 = sample(n * r0)
+    d1 = sample(n * r1)
+    d2 = sample(n * r2)
+    d3 = sample(n * r3)
+    # Seed (shipped) linear response: kept unchanged on the structural walls.
+    t0 = np.clip(1 - (d0 + 0.045) / r0, 0, 1)
+    t1 = np.clip(1 - (d1 + 0.045) / r1, 0, 1)
+    t2 = np.clip(1 - (d2 + 0.045) / r2, 0, 1)
+    t3 = np.clip(1 - (d3 + 0.045) / r3, 0, 1)
     vertical = wall * (1 - np.abs(n[:, 2]))
     far = 0.40 + 0.60 * np.maximum(t0, t1)
     k = 0.92 / 2.9
@@ -34,4 +39,14 @@ def ao(n, wall, sample):
     w1 = k * 0.8166666667 + (0.24 - k * 0.8166666667) * vertical
     w2 = k * 0.6333333333 + (0.21 * far - k * 0.6333333333) * vertical
     w3 = k * 0.45 + (0.16 * far - k * 0.45) * vertical
-    return 1 - (t0 * w0 + t1 * w1 + t2 * w2 + t3 * w3)
+    seed = 1 - (t0 * w0 + t1 * w1 + t2 * w2 + t3 * w3)
+    # Elsewhere: per-tap bias and shader-friendly power on the same taps.
+    # Near tap squared (convex), middle taps square-rooted (concave), far tap ^8
+    # (only deep occlusion counts). Bases are clamped to [0, 1] before any power.
+    s0 = np.clip(1 - (d0 + 0.024) / r0, 0, 1)
+    s1 = np.clip(1 - (d1 + 0.078) / r1, 0, 1)
+    s2 = np.clip(1 - d2 / r2, 0, 1)
+    s3 = np.clip(1 - (d3 + 0.02) / r3, 0, 1)
+    s3 = np.square(np.square(np.square(s3)))
+    tuned = 1 - k * (np.square(s0) + 0.8166666667 * np.sqrt(s1) + 0.6333333333 * np.sqrt(s2) + 0.45 * s3)
+    return seed * vertical + tuned * (1 - vertical)
