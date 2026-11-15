@@ -32,19 +32,17 @@ def ao(n, wall, sample):
     # n * n is (0, 0, 1) on horizontal faces, so up * n * n and up * (1 - n * n) pick
     # the per-face-class length without any per-pixel scalar broadcast.
     d3 = sample(n * (0.5657 + 0.5543 * (up * n * n)) + 0.5657 * (up * (1 - n * n)))
-    t0 = np.clip(1 - (d0 + 0.045) / r0, 0, 1)
-    t1 = np.clip(1 - (d1 + 0.045) / r1, 0, 1)
-    t2 = np.clip(1 - (d2 + 0.045) / r2, 0, 1)
-    t3 = np.clip(1 - (d3 + 0.045) / r3, 0, 1)
     vertical = wall * (1 - np.abs(n[:, 2]))
-    far = 0.40 + 0.60 * np.maximum(t0, t1)
     k = 0.92 / 2.9
-    w0 = k + (0.46 - k) * vertical
-    w1 = k * 0.8166666667 + (0.24 - k * 0.8166666667) * vertical
-    w2 = k * 0.6333333333 + (0.21 * far - k * 0.6333333333) * vertical
-    # The tilted fourth tap sees overhangs a structural wall does not need: drop it there.
-    w3 = k * 0.45 * (1 - vertical)
-    seed = 1 - (t0 * w0 + t1 * w1 + t2 * w2 + t3 * w3)
+    # Structural walls: refit with GPU-robust terms only (square, linear clamps; no sqrt).
+    # The biases put each clamp's kink away from where an open wall's taps sit
+    # (d ~ r), so 8-bit trilinear / half-float rounding is not amplified. The
+    # constant 0.1383 lifts open walls to 1 (output clip).
+    v0 = np.clip(1 - (d0 + 0.1526) / r0, 0, 1)
+    v1 = np.clip(1 - (d1 - 0.0907) / r1, 0, 1)
+    v2 = np.clip(1 - (d2 - 0.5168) / r2, 0, 1)
+    v3 = np.clip(1 - (d3 + 0.1875) / 0.8, 0, 1)
+    walls = np.clip(1.1383 - (0.0598 * np.square(v0) + 0.5477 * v1 + 0.038 * v2 + 0.0891 * v3), 0, 1)
     # Floors and tops (n.z > 0.7): champion per-tap bias + power on the 4 normal taps.
     s0 = np.clip(1 - (d0 + 0.024) / r0, 0, 1)
     s1 = np.clip(1 - (d1 + 0.078) / r1, 0, 1)
@@ -59,4 +57,4 @@ def ao(n, wall, sample):
     u3 = np.clip(1 - (d3 + 0.2143) / 0.8, 0, 1)
     side = 1 - (0.1337 * np.square(u0) + 0.1146 * np.sqrt(u1) + 0.3459 * np.sqrt(u2) + 0.202 * u3)
     tuned = np.where(n[:, 2] > 0.7, flat, side)
-    return seed * vertical + tuned * (1 - vertical)
+    return walls * vertical + tuned * (1 - vertical)
