@@ -29,7 +29,7 @@ These are median GPU elapsed times per draw on an Apple M1 at 1280 × 720 over 2
 | Three.js 0.170 SSAOPass (legacy, full resolution) | 8.68 | 10.57 |
 | Three.js 0.170 GTAOPass (legacy, full resolution) | 20.72 | 24.38 |
 
-Against these legacy Three.js 0.170 WebGL2 passes, SSAO and GTAO took about 6× and 15× as long as the SDF modes with all 11 objects moving. **These ratios overstate the gap to current Three.js.** The legacy passes run at full resolution, re-render the scene for their own normals and depth, and blur at full resolution. Three.js r187's WebGPU SSAO and GTAO (half resolution, MRT normals, TRAA) narrow the gap: on an M1, SSAO 0.5× costs about the same as the SDF, and GTAO 0.5× + TRAA about 7× as much; see [r187-results.md](benchmark/r187-results.md). SDF cost grows with the number of moving objects near each pixel. SSAO and GTAO cost the same regardless of what moves. Accuracy with moving objects has not been measured against ray-traced AO.
+Against these legacy Three.js 0.170 WebGL2 passes, SSAO and GTAO took about 6× and 15× as long as the SDF modes with all 11 objects moving. **These ratios overstate the gap to current Three.js.** The legacy passes run at full resolution, re-render the scene for their own normals and depth, and blur at full resolution. Three.js r187's WebGPU SSAO and GTAO (half resolution, MRT normals, TRAA) narrow the gap: on an M1, SSAO 0.5× costs about the same as the SDF, and GTAO 0.5× + TRAA about 7× as much; see [r187-results.md](benchmark/r187-results.md). SDF cost grows with the number of moving objects near each pixel. SSAO and GTAO cost the same regardless of what moves. Accuracy with moving objects is measured against a ray-traced reference that includes all 11 objects at 8 poses ([reference_movers.py](benchmark/reference_movers.py)); see *Moving-object AO accuracy* below.
 
 ## Static benchmark
 
@@ -66,6 +66,7 @@ Measured on an Apple M1.
 | Moving-object bake at page load | 60 ms | **12 ms** (5× faster) |
 | Runtime AO, 11 moving objects | 0.79 ms | **0.62 ms** (−21%) |
 | Runtime AO, 16 moving objects | 1.10 ms | **0.79 ms** (−28%) |
+| AO error near moving objects (vs ray-traced, held-out poses) | 0.097 | **0.050** (−48%) |
 
 ### Static bake (`tools/bake_sdf.cpp`)
 
@@ -88,6 +89,20 @@ Each mesh's 64³ field is baked by a fragment shader that loops over every trian
 
 - **Lazy baking.** Only the meshes that render through their baked field (the teapot and torus knot, 10.4k of 18.5k triangles) are baked at load. The analytic shapes are baked the first time "Baked SDF for all movers" is switched on, and the atlas shrinks from 11 slabs to 2. 60 → 41 ms.
 - **Winding term only inside the mesh box.** From any point outside a convex set that contains the mesh, every triangle lies within an open half-space of directions. The total solid angle is then below 2π and the winding number below ½, so the sign is always "outside". The `atan`-based winding term, about half the cost per triangle, is evaluated only for voxels inside the mesh's bounding box, a few percent of the 3.3 m cube. 41 → 12 ms.
+
+### Moving-object AO accuracy
+
+Moving objects entered the AO through `min()`: each tap took the nearer of the static field and the nearest object, so an object's occlusion counted as fully as a wall's at the same distance. A small object blocks much less of the hemisphere than a wall, and against the ray-traced reference the pixels near moving objects came out too dark: on average by 0.07, with an error of 0.097. That is *worse* than leaving the objects out of the AO, which makes them too light (0.093).
+
+The shader now keeps the static-only tap distances and weights only the extra occlusion the objects add: `occ = occStatic + (occAll − occStatic) · moverScale`. The weight 0.5 was fitted on 4 of the reference's 8 poses and confirmed on the other 4, in both SDF modes:
+
+| Held-out poses | Before (weight 1) | Objects ignored (weight 0) | **After (weight 0.5)** |
+|---|---:|---:|---:|
+| Error near moving objects | 0.097 | 0.093 | **0.050** |
+| Mean bias near moving objects | −0.070 (too dark) | +0.085 (too light) | **+0.007** |
+| Error over all pixels, wall correction / original | 0.050 / 0.052 | 0.048 / — | **0.043 / 0.045** |
+
+Per-tap weights gained only 0.001 more, with an irregular pattern, so the single weight was kept. Pixels without a moving object in reach, and every pixel with moving objects off, are unchanged: the static masks are pixel-identical in all three modes. The cost is a few vector operations and no extra texture reads. `aoDemo.setMoverScale(w)` changes the weight live, and `moverBench.scoreMoverScale([...])` re-runs the fit.
 
 ### Runtime AO with moving objects
 

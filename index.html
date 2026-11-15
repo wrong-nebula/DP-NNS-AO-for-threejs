@@ -139,9 +139,16 @@ const vec4 R=vec4(.16,.48,.80,1.12);
 // Scene distance at the four tap points p+normal*R. The static samples are fetched
 // together up front; each nearby mover is transformed to local space once and all
 // four taps are tested against it.
+// Static-only tap distances of the last tapDistances() call, so the occlusion moving objects add
+// can be weighted on its own (moverScale).
+vec4 dStatic=vec4(1e4);
+// Weight of the extra occlusion moving objects add, per tap. A small object blocks less of the
+// hemisphere than a wall at the same distance, which the distance-only taps cannot tell apart.
+uniform vec4 moverScale;
 vec4 tapDistances(vec3 p,vec3 normal){
   vec4 d=vec4(staticDistance(p+normal*R.x),staticDistance(p+normal*R.y),
               staticDistance(p+normal*R.z),staticDistance(p+normal*R.w));
+  dStatic=d;
   #ifdef NO_DYN
     return d;
   #endif
@@ -203,7 +210,9 @@ void main(){
     if(((cand>>i)&1)!=0&&distance(p+normal*R.w,dynSphere[i].xyz)-dynSphere[i].w<R.w-.044)dynMask|=1<<i;
   }
   #if defined(FAST)
-    vec4 taps=clamp(1.-(tapDistances(p,normal)+.045)/R,0.,1.);
+    vec4 tapsAll=clamp(1.-(tapDistances(p,normal)+.045)/R,0.,1.);
+    vec4 tapsStatic=clamp(1.-(dStatic+.045)/R,0.,1.);
+    vec4 taps=tapsStatic+(tapsAll-tapsStatic)*moverScale;
     #ifdef CONTACT
       // Emphasize near contacts while retaining longer-range contributions.
       ao=1.-dot(taps,vec4(.46,.24,.21,.16));
@@ -219,7 +228,9 @@ void main(){
   #elif TAPS == 4
     // Same radii and weights as the generic loop below, evaluated four-wide.
     vec4 w=1.-.55*vec4(0.,1.,2.,3.)/3.;
-    vec4 occ=clamp((R-tapDistances(p,normal)-.045)/R,0.,1.);
+    vec4 occAll=clamp((R-tapDistances(p,normal)-.045)/R,0.,1.);
+    vec4 occStatic=clamp((R-dStatic-.045)/R,0.,1.);
+    vec4 occ=occStatic+(occAll-occStatic)*moverScale;
     ao=1.-.92*dot(w,occ)/dot(w,vec4(1.));
   #elif TAPS > 0
     float sum=0.,weights=0.;
@@ -412,7 +423,10 @@ try {
     dynCount:{value:0},
     meshAtlas:{value:atlas},
     moverCells:{value:null},
-    meshSlabs:{value:Math.max(1,meshMovers.length)}
+    meshSlabs:{value:Math.max(1,meshMovers.length)},
+    // 0.5: fitted against the ray-traced reference with all 11 movers (4 poses), confirmed on 4
+    // held-out poses: AO error near movers 0.097 -> 0.050; 1 = the full, distance-only occlusion.
+    moverScale:{value:new T.Vector4(.5,.5,.5,.5)}
   };
   // Two compiled variants per mode: with mover code, and without it (NO_DYN) for when no mover
   // is in the AO, so the static path carries none of the mover loops.
@@ -560,7 +574,7 @@ try {
   document.querySelector('#dynao').onchange=event=>{dynamicAO=event.target.checked;updateMovers(simTime);resetFps();};
   document.querySelector('#forcemesh').onchange=event=>{forceMesh=event.target.checked;if(forceMesh)ensureAllBaked();updateMovers(simTime);resetFps();};
   // Debug hook for timing from the console.
-  window.aoDemo={renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,bakeSyncMs,bakeGpuMs,totalTris,get atlas(){return baked.tex;},meshRes:MESH_RES,setMask:on=>{mask.value=on;},select:mode=>select(mode),
+  window.aoDemo={renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,bakeSyncMs,bakeGpuMs,totalTris,get atlas(){return baked.tex;},meshRes:MESH_RES,setMask:on=>{mask.value=on;},setMoverScale:(x,y=x,z=x,w=x)=>dyn.moverScale.value.set(x,y,z,w),select:mode=>select(mode),
     setDynamicAO:on=>{dynamicAO=on;updateMovers(simTime);},
     setForceMesh:on=>{forceMesh=on;if(on)ensureAllBaked();updateMovers(simTime);}};
   document.addEventListener('visibilitychange',resetFps);
