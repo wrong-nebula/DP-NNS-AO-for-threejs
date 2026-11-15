@@ -26,14 +26,14 @@ These are median GPU elapsed times per draw on an Apple M1 at 1280 × 720 over 2
 | SDF modes, no moving objects in AO | 0.35–0.41 | 0.42–0.49 |
 | SDF modes, exact shapes | 1.33–1.36 | 1.54–1.61 |
 | SDF modes, all baked fields | 1.33–1.39 | 1.51–1.75 |
-| Three.js SSAO | 8.68 | 10.57 |
-| Three.js GTAO | 20.72 | 24.38 |
+| Three.js 0.170 SSAOPass (legacy, full resolution) | 8.68 | 10.57 |
+| Three.js 0.170 GTAOPass (legacy, full resolution) | 20.72 | 24.38 |
 
-SSAO and GTAO took about 6× and 15× as long as the SDF modes with all 11 objects moving. SDF cost grows with the number of moving objects near each pixel. SSAO and GTAO cost the same regardless of what moves. Accuracy with moving objects has not been measured against ray-traced AO.
+Against these legacy Three.js 0.170 WebGL2 passes, SSAO and GTAO took about 6× and 15× as long as the SDF modes with all 11 objects moving. **These ratios overstate the gap to current Three.js.** The legacy passes run at full resolution, re-render the scene for their own normals and depth, and blur at full resolution. Three.js r187's WebGPU SSAO and GTAO (half resolution, MRT normals, TRAA) cost the same order of magnitude as the SDF AO; see [r187-results.md](benchmark/r187-results.md). SDF cost grows with the number of moving objects near each pixel. SSAO and GTAO cost the same regardless of what moves. Accuracy with moving objects has not been measured against ray-traced AO.
 
 ## Static benchmark
 
-The [benchmark](benchmark/final-benchmark.md) compares four-tap SDF AO with the Three.js SSAO and GTAO passes on an Apple M1 in the static scene. It includes [GPU timings](benchmark/final-timings.json), [accuracy measurements](benchmark/final-accuracy.json), and a [side-by-side comparison](benchmark/final-comparison.png) against ray-traced AO. The live FPS counter measures browser frame cadence. The benchmark uses GPU elapsed queries.
+The [benchmark](benchmark/final-benchmark.md) compares four-tap SDF AO with the legacy Three.js 0.170 SSAO and GTAO passes on an Apple M1 in the static scene. A [comparison with Three.js r187's WebGPU SSAO and GTAO](benchmark/r187-results.md) finds similar GPU cost (about 0.2–0.3 ms per frame for every method) and lower AO error for the SDF: 0.040, against 0.051–0.053 for tuned GTAO + TRAA and 0.063–0.065 for tuned SSAO. It includes [GPU timings](benchmark/final-timings.json), [accuracy measurements](benchmark/final-accuracy.json), and a [side-by-side comparison](benchmark/final-comparison.png) against ray-traced AO. The live FPS counter measures browser frame cadence. The benchmark uses GPU elapsed queries.
 
 The Archive volume was baked from analytic box distances. The runtime AO shader samples the baked volume.
 
