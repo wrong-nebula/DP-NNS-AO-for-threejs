@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archive AO · Three.js r187 WebGPU benchmark</title>
+<style>body{margin:0;background:#121821;color:#f1f5f8;font:15px system-ui,sans-serif}main{max-width:1320px;margin:auto;padding:20px}canvas{display:block;width:100%;height:auto}pre{white-space:pre-wrap;color:#c4d0db;background:#121821}</style>
+<main><h1>Archive AO · Three.js r187 WebGPU</h1>
+<p>Same scene, camera and 1280 × 720 resolution as <code>final.html</code>. Run <code>await r187Bench.run()</code> in the console.</p>
+<div id="view"></div><pre id="status">Loading…</pre></main>
+<script type="importmap">{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.webgpu.js",
+  "three/webgpu":"https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.webgpu.js",
+  "three/tsl":"https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.tsl.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.187.0/examples/jsm/"}}</script>
+<script type="module">
+// A like-for-like comparison of the four-tap SDF AO with Three.js r187's own SSAO and GTAO, set up
+// the way the official webgpu_postprocessing_ao example does it: an MRT pre-pass (packed view
+// normals + velocity), the AO node at a resolution scale, and the AO fed to the scene's ambient
+// light through builtinAOContext. GTAO is temporally filtered and resolved with TRAA; SSAO is
+// self-denoised (blur). The SDF AO is the viewer's "SDF wall correction" formula in TSL, given to
+// the material as its aoNode: no pre-pass and no post-processing pass.
+// GPU time: WebGPU timestamp queries over 12 frames per sample, every mode interleaved per round.
+// AO error: mean absolute difference from the 512-ray reference (reference.py) at the 57,216
+// benchmark pixels, on AO-only output (SDF: float render of the AO term; SSAO: its blurred AO
+// target; GTAO: its AO target averaged over 32 temporally rotated frames, which TRAA converges to
+// on a still camera).
+import * as THREE from 'three/webgpu';
+import {Fn,vec3,vec4,float,select,clamp,abs,max,mix,dot,normalize,positionWorld,normalWorld,texture3D,
+  instancedBufferAttribute,screenUV,pass,mrt,sample,packNormalToRGB,unpackRGBToNormal,normalView,velocity,
+  builtinAOContext,uniform} from 'three/tsl';
+import {ao} from 'three/addons/tsl/display/GTAONode.js';
+import {ssao} from 'three/addons/tsl/display/SSAONode.js';
+import {traa} from 'three/addons/tsl/display/TRAANode.js';
+
+const W=1280,H=720,RADIUS=1.12;
+// Tuned on this scene for the lowest AO error against the reference (the SDF wall weights were
+// tuned on it too): SSAO intensity swept 1-6 (best 3), GTAO scale swept 1-3 (best 1.75).
+const TUNE={ssao:3,gtao:1.75};
+const status=document.querySelector('#status');
+const log=s=>{status.textContent+='\n'+s;};
+try{
+  // ---- scene: the Archive boxes, as in final.html ----------------------------------------------
+  const boxes=await (await fetch('archive.json')).json();
+  const renderer=new THREE.WebGPURenderer({antialias:false,trackTimestamp:true});
+  renderer.setPixelRatio(1);renderer.setSize(W,H,false);
+  document.querySelector('#view').append(renderer.domElement);
+  await renderer.init();
+  if(!renderer.backend.isWebGPUBackend)throw Error('WebGPU backend unavailable (fell back to WebGL)');
+  const scene=new THREE.Scene();scene.background=new THREE.Color('#17212e');
+  const camera=new THREE.PerspectiveCamera(37,W/H,.1,100);camera.up.set(0,0,1);
+  camera.position.set(18,-4,7.3);camera.lookAt(10.8,8.8,1.4);camera.updateMatrixWorld();
+  scene.add(new THREE.AmbientLight(0xffffff,.74*Math.PI));
+  const sun=new THREE.DirectionalLight(0xffffff,.26*Math.PI);sun.position.set(-.4,-.55,1);scene.add(sun);
+
+  // ---- the baked field, as the viewer uploads it (half floats, trilinear) -----------------------
+  const f32=new Float32Array(await (await fetch('archive.f32')).arrayBuffer());
+  if(f32.length!==128**3)throw Error('unexpected field size');
+  const half=new Uint16Array(f32.length);for(let i=0;i<f32.length;i++)half[i]=THREE.DataUtils.toHalfFloat(f32[i]);
+  const field=new THREE.Data3DTexture(half,128,128,128);
+  field.format=THREE.RedFormat;field.type=THREE.HalfFloatType;field.minFilter=field.magFilter=THREE.LinearFilter;
+  field.wrapS=field.wrapT=field.wrapR=THREE.ClampToEdgeWrapping;field.needsUpdate=true;
+
+  const walls=new Float32Array(boxes.length);walls[1]=walls[2]=1;
+  const wallFace=instancedBufferAttribute(new THREE.InstancedBufferAttribute(walls,1));
+  const R=vec4(.16,.48,.80,1.12);
+  const staticDistance=Fn(([pos])=>{
+    const uv=pos.add(1).mul(vec3(1/26,1/18,1/8)).toVar();
+    const outside=uv.x.lessThan(0).or(uv.y.lessThan(0)).or(uv.z.lessThan(0)).or(uv.x.greaterThan(1)).or(uv.y.greaterThan(1)).or(uv.z.greaterThan(1));
+    return select(outside,float(1e4),texture3D(field,uv,float(0)).r);
+  });
+  // index.html's FAST (SDF wall correction) path, tap for tap.
+  const sdfAO=Fn(()=>{
+    const p=positionWorld,n=normalize(normalWorld);
+    const d=vec4(staticDistance(p.add(n.mul(R.x))),staticDistance(p.add(n.mul(R.y))),
+                 staticDistance(p.add(n.mul(R.z))),staticDistance(p.add(n.mul(R.w))));
+    const taps=clamp(float(1).sub(d.add(.045).div(R)),0,1).toVar();
+    const vertical=wallFace.mul(float(1).sub(abs(n.z)));
+    const farSupport=float(.4).add(float(.6).mul(max(taps.x,taps.y)));
+    const original=vec4(1,.8166666667,.6333333333,.45).mul(.92/2.9);
+    const corrected=vec4(.46,.24,farSupport.mul(.21),farSupport.mul(.16));
+    return float(1).sub(dot(taps,mix(original,corrected,vertical)));
+  })();
+  const albedo=Fn(()=>mix(vec3(.28,.34,.43),vec3(.64,.69,.75),clamp(positionWorld.z.div(4).add(.14),0,1)))();
+  const plain=new THREE.MeshLambertNodeMaterial();plain.colorNode=albedo;
+  const withSDF=new THREE.MeshLambertNodeMaterial();withSDF.colorNode=albedo;withSDF.aoNode=sdfAO;
+  const sdfMask=new THREE.MeshBasicNodeMaterial();sdfMask.colorNode=vec3(sdfAO);
+  const mesh=new THREE.InstancedMesh(new THREE.BoxGeometry(1,1,1),plain,boxes.length);
+  const m4=new THREE.Matrix4();
+  boxes.forEach(([x,y,z,hx,hy,hz],i)=>mesh.setMatrixAt(i,m4.makeScale(2*hx,2*hy,2*hz).setPosition(x,y,z)));
+  scene.add(mesh);
+
+  // ---- pipelines ----------------------------------------------------------------------------------
+  function prePassNodes(){
+    const prePass=pass(scene,camera);prePass.transparent=false;
+    prePass.setMRT(mrt({output:packNormalToRGB(normalView),velocity}));
+    prePass.getTexture('output').type=THREE.UnsignedByteType;  // as the example: bandwidth
+    const normal=sample(uv=>unpackRGBToNormal(prePass.getTextureNode().sample(uv)));
+    return {prePass,depth:prePass.getTextureNode('depth'),normal,vel:prePass.getTextureNode('velocity')};
+  }
+  // `tune` sets SSAO's intensity or GTAO's scale before the first frame. Changing a live node's
+  // uniforms did not take effect reliably between frames, so each tuned value gets a fresh pipeline.
+  function screenSpace(kind,scale,tune){
+    const {depth,normal,vel}=prePassNodes();
+    const scenePass=pass(scene,camera);
+    const node=kind==='ssao'?ssao(depth,normal,camera):ao(depth,normal,camera);
+    node.samples.value=16;node.radius.value=RADIUS;node.resolutionScale=scale;
+    if(kind==='gtao'){node.thickness.value=1;node.scale.value=tune??1;node.useTemporalFiltering=true;}
+    else if(tune!==undefined)node.intensity.value=tune;
+    scenePass.contextNode=builtinAOContext(node.getTextureNode().sample(screenUV).r);
+    const p=new THREE.RenderPipeline(renderer);
+    p.outputNode=kind==='gtao'?traa(scenePass,depth,vel,camera):scenePass;
+    return {pipeline:p,aoNode:node,material:plain};
+  }
+  function forward(material){const p=new THREE.RenderPipeline(renderer);p.outputNode=pass(scene,camera);return {pipeline:p,material};}
+  const modes={
+    off:{label:'AO off',...forward(plain)},
+    sdf:{label:'4-tap SDF (wall correction), forward shader',...forward(withSDF)},
+    ssao05:{label:'SSAO 0.5× (16 samples, blur)',...screenSpace('ssao',.5,TUNE.ssao)},
+    gtao05:{label:'GTAO 0.5× + TRAA (16 samples)',...screenSpace('gtao',.5,TUNE.gtao)},
+    ssao1:{label:'SSAO 1× (16 samples, blur)',...screenSpace('ssao',1,TUNE.ssao)},
+    gtao1:{label:'GTAO 1× + TRAA (16 samples)',...screenSpace('gtao',1,TUNE.gtao)},
+  };
+  const frame=k=>{mesh.material=modes[k].material;modes[k].pipeline.render();};
+
+  // ---- GPU timing -----------------------------------------------------------------------------------
+  const median=a=>{const s=[...a].sort((x,y)=>x-y);return s[s.length>>1];};
+  const q=(a,p)=>{const s=[...a].sort((x,y)=>x-y);return s[Math.min(s.length-1,Math.floor(p*(s.length-1)))];};
+  async function gpuMs(k,frames=12){
+    await renderer.resolveTimestampsAsync('render');            // drop anything pending
+    for(let i=0;i<frames;i++)frame(k);
+    const total=await renderer.resolveTimestampsAsync('render'); // ms over all passes of these frames
+    return total/frames;
+  }
+  async function timings(rounds=20){
+    const keys=Object.keys(modes),t=Object.fromEntries(keys.map(k=>[k,[]]));
+    for(const k of keys){for(let i=0;i<30;i++)frame(k);await renderer.resolveTimestampsAsync('render');}
+    for(let r=0;r<rounds;r++)for(let j=0;j<keys.length;j++){const k=keys[(r+j)%keys.length];t[k].push(await gpuMs(k));}
+    return Object.fromEntries(keys.map(k=>[k,{p50:+median(t[k]).toFixed(4),p95:+q(t[k],.95).toFixed(4)}]));
+  }
+
+  // ---- AO error vs the 512-ray reference ----------------------------------------------------------
+  const ref=new Float32Array(await (await fetch('ref_static.f32')).arrayBuffer());   // 320×180, NaN = no surface
+  async function readRT(rt){
+    const px=await renderer.readRenderTargetPixelsAsync(rt,0,0,rt.width,rt.height);
+    const ch=px.length/(rt.width*rt.height), norm=px instanceof Uint8Array?1/255:1;
+    return {w:rt.width,h:rt.height,get:(x,y)=>px[(y*rt.width+x)*ch]*norm};
+  }
+  function mae(img,flipY){
+    let s=0,n=0;
+    for(let j=0;j<180;j++)for(let i=0;i<320;i++){const r=ref[j*320+i];if(!Number.isFinite(r))continue;
+      const x=Math.min(img.w-1,Math.floor((2+4*i)*img.w/W)),y0=Math.min(img.h-1,Math.floor((2+4*j)*img.h/H));
+      s+=Math.abs(img.get(x,flipY?img.h-1-y0:y0)-r);n++;}
+    return {mae:+(s/n).toFixed(5),pixels:n};
+  }
+  const best=img=>{const a=mae(img,false),b=mae(img,true);return a.mae<=b.mae?{...a,flipped:false}:{...b,flipped:true};};
+  // AO error of one screen-space configuration, measured on a pipeline built for it. Frames are
+  // rendered first so the history and blur are settled; GTAO is then averaged over 32 frames.
+  async function errorOf(kind,scale,tune){
+    const m=screenSpace(kind,scale,tune),node=m.aoNode,frames=kind==='gtao'?32:4;
+    const run=()=>{mesh.material=m.material;m.pipeline.render();};
+    for(let i=0;i<8;i++)run();
+    const tex=node.getTextureNode().value;
+    let acc=null,img=null;
+    for(let f=0;f<frames;f++){
+      run();
+      const target=[node._blurRenderTarget,node._aoRenderTarget].find(t=>t&&t.texture===tex)||node._aoRenderTarget;
+      img=await readRT(target);
+      if(!acc)acc=new Float32Array(img.w*img.h);
+      for(let y=0;y<img.h;y++)for(let x=0;x<img.w;x++)acc[y*img.w+x]+=img.get(x,y)/frames;
+    }
+    m.pipeline.dispose?.();node.dispose?.();
+    const w=img.w;return best({w,h:img.h,get:(x,y)=>acc[y*w+x]});
+  }
+  async function errors(){
+    const out={};
+    const rt=new THREE.RenderTarget(W,H,{type:THREE.FloatType});
+    mesh.material=sdfMask;renderer.setRenderTarget(rt);renderer.render(scene,camera);renderer.setRenderTarget(null);
+    out.sdf=best(await readRT(rt));rt.dispose();
+    for(const k of ['ssao05','gtao05','ssao1','gtao1']){
+      const m=modes[k],node=m.aoNode,frames=k.startsWith('gtao')?32:1;
+      const tex=node.getTextureNode().value;
+      let acc=null,img=null;
+      for(let f=0;f<frames;f++){
+        frame(k);
+        const target=[node._blurRenderTarget,node._aoRenderTarget].find(t=>t&&t.texture===tex)||node._aoRenderTarget;
+        img=await readRT(target);
+        if(!acc)acc=new Float32Array(img.w*img.h);
+        for(let y=0;y<img.h;y++)for(let x=0;x<img.w;x++)acc[y*img.w+x]+=img.get(x,y)/frames;
+      }
+      const w=img.w;out[k]=best({w,h:img.h,get:(x,y)=>acc[y*w+x]});
+    }
+    return out;
+  }
+
+  window.r187Bench={renderer,modes,frame,timings,errors,errorOf,async run({rounds=20}={}){
+    status.textContent='Running…';
+    const rt=new THREE.RenderTarget(W,H,{type:THREE.FloatType});
+    mesh.material=sdfMask;renderer.setRenderTarget(rt);renderer.render(scene,camera);renderer.setRenderTarget(null);
+    const err={sdf:best(await readRT(rt))};rt.dispose();
+    for(const [k,kind,sc] of [['ssao05','ssao',.5],['gtao05','gtao',.5],['ssao1','ssao',1],['gtao1','gtao',1]])err[k]=await errorOf(kind,sc,TUNE[kind]);
+    const t=await timings(rounds);
+    const rows=Object.entries(modes).map(([k,m])=>({mode:k,label:m.label,gpu_p50_ms:t[k].p50,gpu_p95_ms:t[k].p95,mae:err[k]?.mae??null}));
+    status.textContent=rows.map(r=>`${r.label.padEnd(44)} ${r.gpu_p50_ms.toFixed(3)} ms (p95 ${r.gpu_p95_ms.toFixed(3)})  MAE ${r.mae??'—'}`).join('\n');
+    return {three:THREE.REVISION,tune:TUNE,backend:'WebGPU',width:W,height:H,rounds,framesPerSample:12,rows,errors:err};
+  }};
+  frame('sdf');
+  status.textContent=`Ready · three r${THREE.REVISION} · WebGPU · ${W} × ${H}`;
+}catch(e){status.textContent='Error: '+e.message;console.error(e);throw e;}
+</script>
+</html>
