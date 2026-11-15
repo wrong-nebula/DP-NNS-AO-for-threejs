@@ -23,11 +23,15 @@ import numpy as np
 
 def ao(n, wall, sample):
     r0, r1, r2, r3 = 0.16, 0.48, 0.80, 1.12
+    up = (0.0, 0.0, 1.0)
     d0 = sample(n * r0)
     d1 = sample(n * r1)
     d2 = sample(n * r2)
-    d3 = sample(n * r3)
-    # Seed (shipped) linear response: kept unchanged on the structural walls.
+    # Fourth tap: 1.12 m along the normal on floors, tops and undersides; on vertical
+    # faces 0.8 m tilted 45 degrees up (0.5657 out, 0.5657 up), to see overhangs.
+    # n * n is (0, 0, 1) on horizontal faces, so up * n * n and up * (1 - n * n) pick
+    # the per-face-class length without any per-pixel scalar broadcast.
+    d3 = sample(n * (0.5657 + 0.5543 * (up * n * n)) + 0.5657 * (up * (1 - n * n)))
     t0 = np.clip(1 - (d0 + 0.045) / r0, 0, 1)
     t1 = np.clip(1 - (d1 + 0.045) / r1, 0, 1)
     t2 = np.clip(1 - (d2 + 0.045) / r2, 0, 1)
@@ -38,15 +42,21 @@ def ao(n, wall, sample):
     w0 = k + (0.46 - k) * vertical
     w1 = k * 0.8166666667 + (0.24 - k * 0.8166666667) * vertical
     w2 = k * 0.6333333333 + (0.21 * far - k * 0.6333333333) * vertical
-    w3 = k * 0.45 + (0.16 * far - k * 0.45) * vertical
+    # The tilted fourth tap sees overhangs a structural wall does not need: drop it there.
+    w3 = k * 0.45 * (1 - vertical)
     seed = 1 - (t0 * w0 + t1 * w1 + t2 * w2 + t3 * w3)
-    # Elsewhere: per-tap bias and shader-friendly power on the same taps.
-    # Near tap squared (convex), middle taps square-rooted (concave), far tap ^8
-    # (only deep occlusion counts). Bases are clamped to [0, 1] before any power.
+    # Floors and tops (n.z > 0.7): champion per-tap bias + power on the 4 normal taps.
     s0 = np.clip(1 - (d0 + 0.024) / r0, 0, 1)
     s1 = np.clip(1 - (d1 + 0.078) / r1, 0, 1)
     s2 = np.clip(1 - d2 / r2, 0, 1)
     s3 = np.clip(1 - (d3 + 0.02) / r3, 0, 1)
     s3 = np.square(np.square(np.square(s3)))
-    tuned = 1 - k * (np.square(s0) + 0.8166666667 * np.sqrt(s1) + 0.6333333333 * np.sqrt(s2) + 0.45 * s3)
+    flat = 1 - k * (np.square(s0) + 0.8166666667 * np.sqrt(s1) + 0.6333333333 * np.sqrt(s2) + 0.45 * s3)
+    # Other faces: own bias/weights, linear response on the tilted tap.
+    u0 = np.clip(1 - (d0 - 0.0061) / r0, 0, 1)
+    u1 = np.clip(1 - (d1 + 0.1163) / r1, 0, 1)
+    u2 = np.clip(1 - (d2 + 0.0024) / r2, 0, 1)
+    u3 = np.clip(1 - (d3 + 0.2143) / 0.8, 0, 1)
+    side = 1 - (0.1337 * np.square(u0) + 0.1146 * np.sqrt(u1) + 0.3459 * np.sqrt(u2) + 0.202 * u3)
+    tuned = np.where(n[:, 2] > 0.7, flat, side)
     return seed * vertical + tuned * (1 - vertical)
