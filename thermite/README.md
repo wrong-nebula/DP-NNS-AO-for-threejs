@@ -24,11 +24,22 @@ The reference fields, `eval_ao.py` and the ray-traced reference live in `refs/`.
 
 Single runs on a shared host; the campaign uses 3 runs per cell per block, and 5 confirmation blocks. Negative tests: one voxel changed by 1 mm inside the band fails, and far values raised to the clip pass.
 
-## To start it (owner decisions)
+## Status: staged, not started
 
-1. Commit the seed (this branch) and the kit somewhere the rig's supervisor can fetch: a git remote, or a bundle via `thermite kit add` for the kit.
-2. Give a model: `--model NAME=URL` or `run start … --provider P --model M`. The rig has none configured.
-3. LLM budget: the contract caps it at $20 (`budget.llm_usd`) and wall time at 4 h.
-4. `thermite assign --contract thermite/bake-sdf-speed.contract.json --run bake-sdf-speed-1 --seed <repo>@<commit> --kit <kit repo> --control http://127.0.0.1:8800 --token-file <owner token> --rig local-1`
+Decided: seed is the local commit `d81792b` on `speed-prototypes`, the model is Claude Opus 5.5, and the budget is $20 and 4 h.
+
+Staged in `../thermite-staging/` (outside the repo):
+- `dpnns-ao-seed.bundle`: seed commit `d81792ba4f2963c5ecaa38714ea3e5d700419553`.
+- `bake-sdf-kit.bundle`: the kit as its own repo (`../thermite-kit-bake-sdf`), commit `4a5b0bc69ca6f485a8e9c3a07b81d3b82de1fa97`.
+- `assign-payload.json`: built with `thermite assign-payload` with nothing issued. It carries both bundles as imports.
+
+Not started because `local-1`, the only enrolled rig, is running another session's campaign (`procgen-boolean-quality-2`, assigned 12:51). A second judge on the same 6 CPUs would corrupt both campaigns' timings.
+
+To start once the rig is free:
+1. Copy both bundles into `~/thermite/.dev/inbox/repos/`.
+2. Issue the payload: `thermite command --kind assign_campaign --payload @assign-payload.json --rig local-1 --control http://127.0.0.1:8800 --token-file <owner token>`.
+3. If it doesn't start agents itself, give the model with `run start bake-sdf-speed --rig local-1 --provider <anthropic provider name in control Settings> --model claude-opus-5-5 …`.
+
+The rig's `model-api-key` file is 17 bytes, which looks like a placeholder, so a provider must be set up in control's Settings first.
 
 GPU work (runtime AO, the mover bake) can't run on this rig: it is a CPU target in a Linux container with no browser GPU. Those stay with `benchmark/mover-bench.js` on the Mac.
