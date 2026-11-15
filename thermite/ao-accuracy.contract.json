@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
   "campaign": "ao-accuracy",
-  "version": 2,
+  "version": 3,
   "title": "Static SDF AO closer to ray-traced ground truth, at most 4 texture reads per pixel",
   "mode": "hill_climb",
   "project": {
     "repo": "dpnns-ao",
-    "commit": "2a15b995c17097713efe8c4bbe18b96a91a44575",
+    "commit": "5c4a2d7cf741c046f209bdd5e928e04dfa9d827d",
     "kit": {
       "repo": "ao-accuracy-kit",
-      "commit": "57c2415c9c59e193abf8a6c92da3199cc9187469"
+      "commit": "1148651d71d636bb9cfd14523ffec8747a806e14"
     }
   },
   "target": {
@@ -72,7 +72,7 @@
     "runs_per_cell": 1,
     "confirm_blocks": 2
   },
-  "additional_information": "Improve the accuracy of a screen-free ambient occlusion formula. The function to edit is `ao(n, wall, sample)` in accuracy/ao_formula.py. Its docstring states the interface and the rules, which the judge enforces before running it.\n\nWhat it computes: per visible pixel of a 1280x720 render of a static scene (159 axis-aligned boxes: floor, two walls, stairs, shelves, crates), the ambient visibility in [0, 1]. The judge compares it with a ray-traced reference: 512 cosine-weighted rays per pixel, a hit counting as occluded within 1.12 m. The score is the mean absolute error over each camera view's pixels; three views are visible to the judge's cells and three more are held out.\n\nWhat the formula sees: the surface normal, a flag for the two large structural walls, and `sample(offset)`, the trilinearly interpolated signed distance to the scene (half-float 128^3 volume over a 26 x 18 x 8 m box, voxels about 20 x 14 x 6 cm, clipped at +1.5 m, negative inside) at the pixel's surface point plus an offset. At most 4 sample calls: each is one 3D texture read in the GLSL shader the formula is ported to, so the per-pixel cost stays the same. It does not see positions or the scene layout.\n\nThe seed is the shipped 'SDF wall correction' formula: 4 taps along the normal at 0.16 / 0.48 / 0.80 / 1.12 m, occlusion clamp(1 - (d + 0.045) / r), weighted, with weights shifted toward the near taps on structural walls to stop them over-darkening. Its MAE: 0.0401 on the main view; 0.025-0.050 across views.\n\nHard limits: at most 4 samples, and no more over-darkening on structural walls than the seed (mean of max(0, reference - ao) over wall pixels). The held-out views must not get worse.\n\nThe winning formula will be ported by hand to GLSL, so keep it to arithmetic a fragment shader can do in a few lines.",
+  "additional_information": "Improve the accuracy of a screen-free ambient occlusion formula. The function to edit is `ao(n, wall, sample)` in accuracy/ao_formula.py. Its docstring states the interface and the rules, which the judge enforces before running it.\n\nWhat it computes: per visible pixel of a 1280x720 render of a static scene (159 axis-aligned boxes: floor, two walls, stairs, shelves, crates), the ambient visibility in [0, 1]. The judge compares it with a ray-traced reference: 512 cosine-weighted rays per pixel, a hit counting as occluded within 1.12 m. The score is the mean absolute error over each camera view's pixels; three views are visible to the judge's cells and three more are held out.\n\nWhat the formula sees: the surface normal, a flag for the two large structural walls, and `sample(offset)`, the trilinearly interpolated signed distance to the scene (half-float 128^3 volume over a 26 x 18 x 8 m box, voxels about 20 x 14 x 6 cm, clipped at +1.5 m, negative inside) at the pixel's surface point plus an offset. At most 4 sample calls: each is one 3D texture read in the GLSL shader the formula is ported to, so the per-pixel cost stays the same. It does not see positions or the scene layout.\n\nThe seed is the shipped 'SDF wall correction' formula: 4 taps along the normal at 0.16 / 0.48 / 0.80 / 1.12 m, occlusion clamp(1 - (d + 0.045) / r), weighted, with weights shifted toward the near taps on structural walls to stop them over-darkening. Its MAE: 0.0401 on the main view; 0.025-0.050 across views.\n\nHard limits: at most 4 samples, and no more over-darkening on structural walls than the seed (mean of max(0, reference - ao) over wall pixels). The held-out views must not get worse.\n\nThe winning formula will be ported by hand to GLSL, so keep it to arithmetic a fragment shader can do in a few lines.\n\nThe judge samples the field as the GPU does: 8-bit trilinear weights and a half-precision filtered value. A term that is steep where its input sits near a constant (sqrt or a high power of a value that is ~0 on every wall, for example) amplifies those rounding errors, and the judge now scores that as it will render. The seed of this run is the third champion of the previous run (per-tap curves and a tilted fourth tap on non-horizontal faces); its structural-wall refit was rejected on the GPU for that reason.",
   "ideas": [
     "Tap placement: different radii, or offsets tilted away from the normal (a small cone) to see occluders beside the surface rather than straight above it",
     "Nonlinear distance-to-occlusion response per tap (smoothstep, a power) instead of the linear clamp",
