@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "campaign": "traced-ao",
+  "version": 1,
+  "title": "Traced SDF AO: lower error after 16 accumulated frames, at no more field reads per pixel",
+  "mode": "hill_climb",
+  "project": {
+    "repo": "dpnns-ao",
+    "commit": "8a312f1a3c5e2d50cf3d8d71f2772467cbc73ffe",
+    "kit": {
+      "repo": "traced-ao-kit",
+      "commit": "5b3dad0197cffc4a7eacef7bd859f682a5eb56e9"
+    }
+  },
+  "target": {
+    "type": "cpu",
+    "class": "local"
+  },
+  "editable_paths": [
+    "accuracy/traced_ao.py"
+  ],
+  "forbidden_patterns": [
+    "archive\\.json",
+    "\\.npz",
+    "\\.npy",
+    "open\\(",
+    "__"
+  ],
+  "objective": {
+    "policy": "single",
+    "primary": {
+      "metric": "err16",
+      "direction": "min",
+      "min_effect": 0.01
+    },
+    "secondary": []
+  },
+  "guards": [],
+  "hard_constraints": [
+    {
+      "kind": "max",
+      "metric": "reads",
+      "value": 14.25
+    },
+    {
+      "kind": "max",
+      "metric": "err1_excess",
+      "value": 0.0005
+    },
+    {
+      "kind": "max",
+      "metric": "err64_excess",
+      "value": 0.0002
+    }
+  ],
+  "monitor_only": [
+    "err1",
+    "err4",
+    "err64",
+    "formula"
+  ],
+  "cells": [
+    "main",
+    "west",
+    "north"
+  ],
+  "held_out_cells": [
+    "low",
+    "inner",
+    "above"
+  ],
+  "lanes": {
+    "count": 1,
+    "trials_per_epoch": 3
+  },
+  "budget": {
+    "wall_hours": 6
+  },
+  "acceptance": {
+    "runs_per_cell": 1,
+    "confirm_blocks": 2
+  },
+  "additional_information": "Make the \"Traced SDF (temporal)\" ambient occlusion good sooner. The file to edit is accuracy/traced_ao.py: `trace(n, frame, noise, sample)` (one frame's visibility estimate per pixel) and `show(formula, traced, frames)` (what the screen shows). Its docstring states the interface and the rules, which the judge enforces before running it.\n\nWhat it computes: per visible pixel of a 1280x720 render of a static scene (159 axis-aligned boxes: floor, two walls, stairs, shelves, crates), ambient visibility in [0, 1], compared with a ray-traced reference: 512 cosine-weighted rays per pixel, a hit counting as occluded within 1.12 m. Three camera views are judge cells and three more are held out; each view is scored at a fixed subset of 20,000 pixels.\n\nHow the judge runs it: it simulates the viewer on a still camera for 64 frames. Each frame trace() returns an estimate, the viewer accumulates it (mean += (est - mean) / frames, frames = min(frame + 1, 128); that rule is fixed), and show() turns the formula's AO, the mean and the frame count into what is displayed. `formula` is the shipped four-tap wall-correction AO (fixed, not editable). The score, err16, is the mean absolute error of the shown AO after 16 frames: how good the mode is a quarter of a second after a camera cut or a newly revealed surface. err1, err4 and err64 are reported too.\n\nWhat trace() sees: the surface normal, the frame index, per-pixel noise in [0, 1) that changes every frame (interleaved gradient noise on the GPU), and sample(offset, live): the signed distance to the scene (half-float 128^3 volume over a 26 x 18 x 8 m box, voxels about 20 x 14 x 6 cm, clipped at +1.5 m, negative inside) at the pixel's surface point plus an offset, for the pixels where `live` is True. It does not see positions or the scene layout. The judge samples the field as the GPU does: 8-bit trilinear weights, half-precision result.\n\nCost: every live pixel in a sample() call is one 3D texture read in the shader, and the judge counts them. The seed uses about 14.0 reads per pixel per frame (2 directions, sphere-traced in up to 16 steps, most rays stopping early). Hard limit: 14.25 reads per pixel per frame, averaged over the 64 frames. Spending fewer reads where they matter less and more where they matter is fair.\n\nThe seed is what index.html ships: 2 cosine-weighted directions a frame (a Fibonacci pair rotated by the noise and offset per frame by golden-ratio sequences), each sphere-traced from 2 cm out to 1.12 m with steps of at least 6 cm, blocked where the field drops below min(0.025, 0.1 * t * (w.n)) (t*(w.n) is the distance to the pixel's own tangent plane, so its own surface never counts); show() blends formula and traced mean with traced weight frames / (frames + 8). Seed err16: 0.0267 on the judge cells, 0.0236 held out (formula alone: 0.0293 / 0.0266; after 64 frames 0.0234 / 0.0207).\n\nHard limits: at most 14.25 reads per pixel per frame; no worse than the seed after 1 frame (err1) or after 64 frames (err64) on any view, beyond 0.0005 / 0.0002. The held-out views must not get worse.\n\nThe winner is ported by hand to GLSL and checked on the GPU, where the AO is traced at half resolution and upsampled with depth- and normal-aware weights (which averages some noise the CPU model keeps). Keep trace() to what a fragment shader can do: fixed-length loops, arithmetic, no data structures.",
+  "ideas": [
+    "Importance-sample directions: more directions toward the horizon or toward nearby geometry (a cheap probe tap or two), with the estimate reweighted so it stays unbiased",
+    "A soft visibility per direction from the closest approach along the ray (min of d / t, as in SDF soft shadows) instead of a hard hit, so each direction carries more information",
+    "Distance-dependent hit threshold or step schedule; stop rays early once they are clearly free",
+    "Better per-frame direction sets: stratification across frames (e.g. Hammersley / R2 sequences) so 16 frames cover the hemisphere evenly",
+    "Spend reads unevenly: 1 long ray plus several short contact rays, or more directions on frames 0-15 and fewer later",
+    "A control variate: trace the difference between true visibility and the formula's prediction, or weight show() by an estimate of the traced mean's variance instead of a fixed frames / (frames + 8)"
+  ]
+}

@@ -374,29 +374,35 @@ float staticDistance(vec3 pos){
 // "Traced SDF (temporal)": the static scene's AO as the 512-ray reference defines it, the unblocked fraction
 // of cosine-weighted directions out to 1.12 m, traced through the baked field. DIRS directions a frame
 // (a Fibonacci set rotated per pixel, the rotation and the set's cosine stratum and azimuth offsets changing
-// every frame) are blended into a
-// reprojected history. A direction is blocked where the field drops below min(.025, .1*t*(w.n)): t*(w.n) is
-// the distance to the pixel's own tangent plane, so its own surface never counts. Fitted on 3 views, checked
-// on 3 held out (benchmark/traced-results.md).
+// every frame) are blended into a reprojected history. Each direction's visibility is soft, from its closest
+// approach to the scene relative to e = min(.025, .1*t*(w.n)); t*(w.n) is the distance to the pixel's own tangent
+// plane, so its own surface never counts. Fitted on 3 views, checked on 3 held out (benchmark/traced-results.md);
+// the soft visibility came from the traced-ao Thermite campaign (accuracy/traced_ao.py is its numpy model).
 float ign(vec2 q){return fract(52.9829189*fract(dot(q,vec2(.06711056,.00583715))));}
 float tracedAO(vec3 p,vec3 n){
   vec3 a=abs(n.x)<.9?vec3(1.,0.,0.):vec3(0.,1.,0.);
   vec3 t=normalize(cross(n,a)),b=cross(n,t);
   float rot=6.2831853*ign(gl_FragCoord.xy+5.588238*mod(frame,64.)),g1=fract(frame*.6180339887),g2=fract(frame*.7548776662);
-  float blocked=0.;
+  float vis=0.;
   for(int i=0;i<DIRS;i++){
     float u=(float(i)+g1)/float(DIRS),phi=float(i)*2.39996323+6.2831853*g2+rot;
     vec3 w=t*(sqrt(u)*cos(phi))+b*(sqrt(u)*sin(phi))+n*sqrt(1.-u);
-    float cosn=dot(w,n),s=.02;
-    // 16 steps of at least 6 cm: as accurate as 24 of 4 cm on the held-out views (0.0177 vs 0.0176), cheaper.
+    float cosn=dot(w,n),s=.02,v=1.;
+    // Soft visibility (traced-ao campaign, champion 2): the closest approach, min over steps of
+    // clamp((d+e)/(4e)), e = min(.025, .1*t*(w.n)). The ramp straddles the hard test d < e (from -e to 3e), so
+    // its mean stays close to it while each direction carries a continuous value (less noise per frame); the ray
+    // stops once d < -e. Steps of at least 7.2 cm pay for the longer marching.
     for(int k=0;k<16;k++){
       float d=staticDistance(p+w*s);
-      if(d<min(.025,.1*s*cosn)){blocked+=1.;break;}
-      s+=max(d,.06);
+      float e=min(.025,.1*s*cosn);
+      v=min(v,clamp((d+e)/(4.*e),0.,1.));
+      if(d<-e)break;
+      s+=max(d,.072);
       if(s>1.12)break;
     }
+    vis+=v;
   }
-  return 1.-blocked/float(DIRS);
+  return vis/float(DIRS);
 }
 // The previous frame's accumulated static AO at p: p projected with the previous camera, the four history
 // texels around it weighted bilinearly, each only if it saw the same surface (view depth within 3% + 1 cm,
