@@ -1,6 +1,6 @@
 # Fast SDF AO
 
-Real-time ambient occlusion for Three.js from a baked signed distance field (SDF): four texture reads per pixel, exact distances to moving objects, and a fast exact baker for meshes and point clouds.
+Real-time ambient occlusion for Three.js from a baked signed distance field (SDF): four texture reads per pixel, exact distances to moving objects, and a fast exact baker for meshes and point clouds. A second mode, **Traced SDF (temporal)**, traces the hemisphere through the same field at half resolution and accumulates over frames. It has 41% less error than the four-tap formula for about 0.9 ms more per frame on an Apple M1.
 
 The project started from the DP-NNS nearest-neighbour paper, which motivates SDF baking, but it does not use DP-NNS: the baker computes exact distances to triangles with a BVH. *Why not DP-NNS* below explains why, with measurements.
 
@@ -11,12 +11,7 @@ Open `index.html` in a WebGL 2 browser. The scene and distance field are embedde
 ## Traced SDF (temporal)
 
 The **Traced SDF (temporal)** mode estimates AO the way the ray-traced reference defines it, the unblocked share of cosine-weighted directions out to 1.12 m, by tracing the baked field. The four fixed taps are not used.
-- **Half resolution:** the trace runs at half resolution in three steps.
-  1. A geometry pass writes world position, view depth, normal and a moving-surface flag.
-  2. A full-screen AO pass traces and accumulates from that.
-  3. The scene draw reads the result with depth- and normal-aware upsampling: the four nearest half-resolution texels, each used only if it saw the same surface.
-
-  This is cheaper than tracing every pixel, and also more accurate, because the upsampling averages away noise.
+- **Half resolution:** the trace runs at half the screen resolution; see *Half resolution* below.
 - **Tracing:** each frame traces 2 directions per AO pixel. Each direction is sphere-traced, with up to 16 steps of at least 6 cm. A direction counts as blocked where the field drops below `min(2.5 cm, 0.1 · t · (w·n))`. Here `t · (w·n)` is the distance to the pixel's own tangent plane, so the pixel's own surface never counts.
 - **Accumulation:** the result is blended into a history that is reprojected from the previous frame. A history texel is only reused when it saw the same surface (view depth within 3% + 1 cm, normals within about 25°). Up to 128 frames are averaged on a still camera, 32 while it moves.
 - **Moving objects:** their occlusion is added fresh every frame with the wall-correction formula, so nothing smears behind them. Their own surfaces use the formula too, since their history would belong to another surface.
@@ -32,6 +27,24 @@ The **Traced SDF (temporal)** mode estimates AO the way the ray-traced reference
 | Frame time (wall clock, p10; settled still camera / orbiting) | 0.33 / 0.34 ms | 1.21 / 1.25 ms |
 
 It is never worse than the formula, from the first frame after a cut, and it settles 41% lower. The tracing parameters were fitted on three views and checked on three held out; see [traced-results.md](benchmark/traced-results.md).
+
+### Half resolution
+
+Each frame runs three passes:
+1. **Geometry pass, half resolution:** renders the scene's world position and view depth (float), normal (half float), and a flag for moving surfaces.
+2. **AO pass, half resolution:** a full-screen pass that traces, reprojects the history and accumulates. It does no rasterization, so its cost depends only on the pixel count.
+3. **Scene draw, full resolution:** draws straight to the screen and reads the AO with depth- and normal-aware upsampling. Each pixel weighs the four nearest half-resolution texels bilinearly, using each only if it saw the same surface (view depth within 5% + 2 cm, normals within about 25°). Where none qualifies, at a silhouette or a thin edge, it shows the formula alone. The formula blend and the per-frame moving-object term run here at full resolution.
+
+Half resolution is cheaper, and also more accurate, because each screen pixel averages several noisy AO texels. The deferred pipeline at full resolution (`aoDemo.setAOScale(1)`) reproduces the earlier forward version exactly, so the gain comes from the resolution alone:
+
+| Apple M1, 1280 × 720 | Full resolution | **Half resolution (default)** |
+|---|---:|---:|
+| AO error, still camera: 1 / 16 / 256 frames | 0.0262 / 0.0217 / 0.0175 | **0.0250 / 0.0178 / 0.0160** |
+| AO error arriving after an orbit at 1° / 3° / 10° per frame | 0.0167 / 0.0188 / 0.0225 | **0.0164 / 0.0182 / 0.0212** |
+| AO error with 11 moving objects: near objects / all pixels | 0.0386 / 0.0220 | **0.0382 / 0.0202** |
+| Frame time, settled still camera / orbiting | 1.29 / 1.86 ms (forward) | **1.21 / 1.25 ms** |
+
+Full resolution timed as the earlier forward version, which did no extra geometry pass. Deferred at full resolution took about 2.1 / 2.6 ms, because a full-resolution geometry pass costs more than it saves. The AO mask at half resolution shows no blockiness or halos at outlines.
 
 ## Moving objects
 
@@ -63,6 +76,8 @@ Against these legacy Three.js 0.170 WebGL2 passes, SSAO and GTAO took about 6× 
 ## Static benchmark
 
 The [benchmark](benchmark/final-benchmark.md) compares four-tap SDF AO with the legacy Three.js 0.170 SSAO and GTAO passes on an Apple M1 in the static scene. A [comparison with Three.js r187's WebGPU SSAO and GTAO](benchmark/r187-results.md) finds the SDF about as fast as SSAO at 0.5× and about 7× faster than GTAO 0.5× + TRAA on an M1, with lower AO error: 0.040, against 0.051–0.053 for tuned GTAO and 0.063–0.065 for tuned SSAO. Reaching the SDF's accuracy takes GTAO at full resolution with 64 samples, about 35× the SDF's frame time; SSAO does not reach it at any sample count. It includes [GPU timings](benchmark/final-timings.json), [accuracy measurements](benchmark/final-accuracy.json), and a [side-by-side comparison](benchmark/final-comparison.png) against ray-traced AO. The live FPS counter measures browser frame cadence. The benchmark uses GPU elapsed queries.
+
+The **Traced SDF (temporal)** mode goes further on the same scene. Once settled, its error is 0.016: less than half of tuned GTAO's at full resolution with 64 samples (0.040). Its frame takes about 1.2 ms against GTAO's 6.7 ms, measured on different backends (WebGL2 against WebGPU), so compare the order of magnitude only.
 
 [N8AO 2.1](benchmark/n8ao-results.md), the most accurate screen-space AO measured here, was added on Three.js r187 (WebGL2, since N8AO has no WebGPU version yet):
 - **Accuracy:** its configurations score 0.041–0.046 per frame, better than r187's GTAO and SSAO. Its noise-free floor is about 0.040. The SDF's current formula scores 0.027.
@@ -129,7 +144,7 @@ DP-NNS fits many queries against one fixed point cloud: the paper's ICP registra
 ## What I improved on the first version
 
 
-Every change below keeps the AO exactly as it was:
+The speed changes below keep the AO exactly as it was; the accuracy changes are measured against ray-traced AO:
 - **Static bake:** baked fields are bit-identical to the original wherever the AO can read them.
 - **Static AO:** MAE stays 0.0401 (wall correction) / 0.0421 (original four-tap) against the 512-ray reference.
 - **Moving objects:** AO error is unchanged against a new ray-traced reference that includes all 11 moving objects at 8 poses ([reference_movers.py](benchmark/reference_movers.py)).
@@ -145,6 +160,7 @@ Measured on an Apple M1.
 | Runtime AO, 16 moving objects | 1.10 ms | **0.79 ms** (−28%) |
 | Static AO error, SDF wall correction (vs ray-traced, GPU output) | 0.0408 | **0.0275** (−33%) |
 | AO error near moving objects (vs ray-traced, held-out poses) | 0.097 | **0.041** (−58%) |
+| Static AO error, new Traced SDF (temporal) mode at half resolution, still camera (vs SDF wall correction) | 0.0270 | **0.0160** (−41%) |
 
 ### Static bake (`tools/bake_sdf.cpp`)
 
