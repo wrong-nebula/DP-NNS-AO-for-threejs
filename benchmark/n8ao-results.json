@@ -1,0 +1,195 @@
+{
+ "three": "187",
+ "n8ao": "2.1.0",
+ "backend": "WebGL2",
+ "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M1)",
+ "width": 1280,
+ "height": 720,
+ "rounds": 30,
+ "timing": "wall clock, 20-frame batches closed by a 1-pixel readback; timer = TIME_ELAPSED over 12 frames",
+ "tune": {
+  "intensity": 3,
+  "distanceFalloff": 1
+ },
+ "sweep_top": [
+  {
+   "intensity": 3,
+   "distanceFalloff": 1,
+   "converged": 0.04271
+  },
+  {
+   "intensity": 5,
+   "distanceFalloff": 0.5,
+   "converged": 0.04464
+  },
+  {
+   "intensity": 4,
+   "distanceFalloff": 1,
+   "converged": 0.04579
+  },
+  {
+   "intensity": 4,
+   "distanceFalloff": 0.5,
+   "converged": 0.04691
+  },
+  {
+   "intensity": 2,
+   "distanceFalloff": 2,
+   "converged": 0.04817
+  }
+ ],
+ "date": "2026-11-16",
+ "note": "Apple M1, Chromium (ANGLE Metal), page in a hidden pane, machine load average 15-30 from other jobs.",
+ "rows": [
+  {
+   "mode": "off",
+   "label": "AO off",
+   "frame_p10_ms": 0.245,
+   "frame_p50_ms": 0.625,
+   "ao_cost_p10_ms": 0,
+   "timer_p10_ms": 0.093,
+   "mae_frame": null,
+   "mae_converged": null
+  },
+  {
+   "mode": "sdf",
+   "label": "4-tap SDF (r187.html formula)",
+   "frame_p10_ms": 0.325,
+   "frame_p50_ms": 0.635,
+   "ao_cost_p10_ms": 0.08,
+   "timer_p10_ms": 0.2262,
+   "mae_frame": 0.04011,
+   "mae_converged": null
+  },
+  {
+   "mode": "sdf_cur",
+   "label": "4-tap SDF (current wall correction)",
+   "frame_p10_ms": 0.315,
+   "frame_p50_ms": 0.675,
+   "ao_cost_p10_ms": 0.07,
+   "timer_p10_ms": 0.2026,
+   "mae_frame": 0.02701,
+   "mae_converged": null
+  },
+  {
+   "mode": "n8_perf",
+   "label": "N8AO Performance (8 spp, denoise 4)",
+   "frame_p10_ms": 3.105,
+   "frame_p50_ms": 4.62,
+   "ao_cost_p10_ms": 2.86,
+   "timer_p10_ms": 8.7834,
+   "mae_frame": 0.04619,
+   "mae_converged": 0.04302
+  },
+  {
+   "mode": "n8_perf_noden",
+   "label": "N8AO 8 spp, no denoise",
+   "frame_p10_ms": 2.405,
+   "frame_p50_ms": 3.085,
+   "ao_cost_p10_ms": 2.16,
+   "timer_p10_ms": 3.9072,
+   "mae_frame": 0.07692,
+   "mae_converged": 0.03938
+  },
+  {
+   "mode": "n8_med",
+   "label": "N8AO Medium",
+   "frame_p10_ms": 5.34,
+   "frame_p50_ms": 6.12,
+   "ao_cost_p10_ms": 5.095,
+   "timer_p10_ms": 13.4204,
+   "mae_frame": 0.04434,
+   "mae_converged": 0.04271
+  },
+  {
+   "mode": "n8_ultra",
+   "label": "N8AO Ultra (64 spp)",
+   "frame_p10_ms": 12.515,
+   "frame_p50_ms": 14.705,
+   "ao_cost_p10_ms": 12.27,
+   "timer_p10_ms": 36.4828,
+   "mae_frame": 0.04104,
+   "mae_converged": 0.04036
+  },
+  {
+   "mode": "n8_perf_half",
+   "label": "N8AO Performance, half res",
+   "frame_p10_ms": 2.09,
+   "frame_p50_ms": 3.16,
+   "ao_cost_p10_ms": 1.845,
+   "timer_p10_ms": 4.9395,
+   "mae_frame": 0.04516,
+   "mae_converged": 0.04477
+  },
+  {
+   "mode": "n8_med_half",
+   "label": "N8AO Medium, half res",
+   "frame_p10_ms": 2.835,
+   "frame_p50_ms": 3.68,
+   "ao_cost_p10_ms": 2.59,
+   "timer_p10_ms": 7.547,
+   "mae_frame": 0.04493,
+   "mae_converged": 0.04389
+  },
+  {
+   "mode": "n8_nperf",
+   "label": "N8AO Neural-Performance",
+   "frame_p10_ms": 4.925,
+   "frame_p50_ms": 6.575,
+   "ao_cost_p10_ms": 4.68,
+   "timer_p10_ms": 9.6093,
+   "mae_frame": 0.04444,
+   "mae_converged": 0.042
+  },
+  {
+   "mode": "n8_nmed",
+   "label": "N8AO Neural-Medium",
+   "frame_p10_ms": 8.815,
+   "frame_p50_ms": 9.91,
+   "ao_cost_p10_ms": 8.57,
+   "timer_p10_ms": 22.3497,
+   "mae_frame": 0.04241,
+   "mae_converged": 0.03996
+  },
+  {
+   "mode": "n8_nperf_half",
+   "label": "N8AO Neural-Performance, half res",
+   "frame_p10_ms": 3.545,
+   "frame_p50_ms": 4.54,
+   "ao_cost_p10_ms": 3.3,
+   "timer_p10_ms": 7.758,
+   "mae_frame": 0.04382,
+   "mae_converged": 0.04367
+  },
+  {
+   "mode": "n8_nmed_half",
+   "label": "N8AO Neural-Medium, half res",
+   "frame_p10_ms": 4.285,
+   "frame_p50_ms": 5.55,
+   "ao_cost_p10_ms": 4.04,
+   "timer_p10_ms": 12.6778,
+   "mae_frame": 0.04447,
+   "mae_converged": 0.04326
+  },
+  {
+   "mode": "ssao_legacy",
+   "label": "Legacy SSAOPass (32 samples, blur)",
+   "frame_p10_ms": 2.63,
+   "frame_p50_ms": 3.18,
+   "ao_cost_p10_ms": 2.385,
+   "timer_p10_ms": 3.719,
+   "mae_frame": 0.07918,
+   "mae_converged": null
+  },
+  {
+   "mode": "gtao_legacy",
+   "label": "Legacy GTAOPass (denoised)",
+   "frame_p10_ms": 5.4,
+   "frame_p50_ms": 6.56,
+   "ao_cost_p10_ms": 5.155,
+   "timer_p10_ms": 10.3584,
+   "mae_frame": 0.08354,
+   "mae_converged": null
+  }
+ ]
+}
