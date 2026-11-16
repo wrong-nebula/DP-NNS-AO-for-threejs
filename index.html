@@ -96,6 +96,12 @@ uniform float histMax;
 // a cut or a just-revealed surface starts from the formula (never worse than it), and the blend beats either
 // alone at every history length (the two estimators' errors partly cancel).
 uniform float blendK;
+// Tracing rate: 1 = every pixel every frame; 4 = 8x8-pixel tiles in a 2x2 pattern take turns, so a quarter of
+// the screen traces each frame (whole tiles keep GPU thread groups uniform, so the skipped work is saved).
+uniform float tileRate;
+// Pixels whose history holds at least this many traced frames stop tracing (0 = off): the static AO they hold
+// no longer changes on a still camera.
+uniform float settleFrames;
 #else
 out vec4 pixel;
 #endif
@@ -329,8 +335,17 @@ void main(){
       aoStatic=aoWallCorrection(dStatic,normal);
     }else{
       vec2 h=history(p,normal);
-      frames=min(h.y+1.,histMax);
-      aoStatic=mix(h.x,tracedAO(p,normal),1./frames);
+      ivec2 tile=ivec2(gl_FragCoord.xy)>>3;
+      bool turn=tileRate<2.||(tile.x&1)+2*(tile.y&1)==int(mod(frame,4.));
+      bool settled=settleFrames>0.&&h.y>=settleFrames;
+      if(turn&&!settled){
+        frames=min(h.y+1.,histMax);
+        aoStatic=mix(h.x,tracedAO(p,normal),1./frames);
+      }else{
+        // No trace this frame: keep the history (frames counts traced samples). Without one (a just-revealed
+        // surface), frames stays 0 and the shown blend below is the formula alone until the tile's turn.
+        frames=min(h.y,histMax);aoStatic=h.x;
+      }
     }
     histOut=vec4(aoStatic,viewDepth,0.,1.);
     // Shown: formula and traced mean blended (see blendK). Only the traced mean is stored, so the blend never
@@ -574,7 +589,13 @@ try {
     // resamples the history, so a moving history is kept short). Set per frame in render().
     histMax:{value:128},
     // 8: lowest error across still (1-256 frames) and orbiting cameras; 16 is marginally better still, worse moving.
-    blendK:{value:8}};
+    blendK:{value:8},
+    // 1: every pixel traces every frame. 4 (aoDemo.traced.tileRate.value=4) cuts ~0.43 ms at any camera speed, but
+    // converges 4x slower (orbit at 3 deg/frame 0.0190 -> 0.0224, with movers 0.0215 -> 0.0256), so it is off.
+    tileRate:{value:1},
+    // 64: on a still camera the frame drops by ~0.6 ms once settled (about 1 s at 60 fps), with the same error
+    // as tracing on (0.0175 at 256 frames; 32 settles at 0.0188).
+    settleFrames:{value:64}};
   const lastCamera=new T.Matrix4();
   const tracedCopy=new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,uniforms:{src:{value:null}},
     vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',
