@@ -84,3 +84,32 @@ A linear ramp to pure traced over F frames was tried first. It handed over too e
 
 - **With moving objects** (4 held-out poses, animated for 2 s): 0.0216 over all pixels and 0.0387 near objects. Without the blend: 0.0225 and 0.0392.
 - **Cost:** 4 more texture reads per static pixel, measured at +0.14 ms per frame in an interleaved A/B: 1.44 → 1.58 ms at p10.
+
+### Cutting the cost: settled skip and quarter-rate tiles
+
+A true half-resolution trace would need a separate G-buffer pass, which the forward-rendered viewer doesn't have. Two forward-friendly options were tried instead:
+- **Settled skip:** pixels whose history holds `settleFrames` traced frames stop tracing.
+- **Quarter-rate tiles:** 8×8-pixel tiles in a 2×2 pattern take turns, so a quarter of the screen traces each frame. Whole tiles keep GPU thread groups uniform, so the skipped work is actually saved.
+
+A just-revealed pixel whose tile isn't tracing shows the formula alone until its turn.
+
+| Main view, AO error | Still: 16 / 64 / 256 frames | Orbit at 1° / 3° / 10° per frame | Moving objects: near / all |
+|---|---:|---:|---:|
+| Every pixel, every frame | 0.0217 / 0.0175 / 0.0170 | 0.0167 / 0.0190 / 0.0233 | 0.0385 / 0.0215 |
+| + settled skip at 128 | 0.0217 / 0.0175 / 0.0176 | (same) | (same) |
+| + settled skip at 64 (default) | 0.0217 / 0.0175 / 0.0175 | (same) | (same) |
+| + settled skip at 32 | — / 0.0188 / 0.0188 | (same) | (same) |
+| Quarter-rate tiles | 0.0256 / 0.0214 / 0.0181 | 0.0190 / 0.0224 / 0.0255 | 0.0399 / 0.0256 |
+| *Formula* | *0.0270* | *0.0270* | *0.0411 / 0.0300* |
+
+Frame time on the wall clock, p10 / p50, interleaved over 6 rounds, with the moving objects drawn but out of the AO:
+
+| Setting | Still, after 600 frames | Orbiting at 1° per frame |
+|---|---:|---:|
+| Formula | 0.31 / 0.43 ms | 0.34 / 0.36 ms |
+| Every pixel, every frame | 1.88 / 2.07 ms | 2.08 / 2.30 ms |
+| Settled skip at 128 | **1.30** / 1.42 ms | 2.00 / 2.11 ms |
+| Quarter-rate tiles | 1.46 / 1.68 ms | **1.65** / 1.84 ms |
+| Both | **1.14** / 1.35 ms | **1.42** / 1.73 ms |
+
+**Shipped:** the settled skip at 64 is on, because it costs nothing measurable in accuracy. Quarter-rate tiles are off but available as `aoDemo.traced.tileRate.value = 4`. They save about 0.43 ms at any camera speed but give up about a fifth of the gain over the formula in motion and near moving objects.
