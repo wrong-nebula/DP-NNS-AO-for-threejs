@@ -15,6 +15,7 @@ nav label{display:flex;align-items:center;gap:5px;padding:6px}
 <button data-taps="4" aria-pressed="false">Original SDF</button>
 <button data-taps="14" aria-pressed="false">SDF wall correction</button>
 <button data-taps="34" aria-pressed="false">Reweighted SDF</button>
+<button data-taps="64" aria-pressed="false">Traced SDF (temporal)</button>
 <button data-taps="32" aria-pressed="false">SSAO</button><button data-taps="36" aria-pressed="false">GTAO</button><label><input id="mask" type="checkbox"> AO mask</label><label><input id="animate" type="checkbox" checked> Animate movers</label><label><input id="dynao" type="checkbox" checked> Movers in SDF AO</label><label><input id="forcemesh" type="checkbox"> Baked SDF for all movers</label></nav>
 <div id="view"><output id="fps" aria-label="Live rendering frame rate"><strong id="fps-value">— FPS</strong><small id="frame-ms">Frame interval</small></output></div><output id="status">Loading distance field…</output></main>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
@@ -38,7 +39,9 @@ out vec3 n;
 in float wall;
 in vec3 boundsHalf; // half extents of the (centered) geometry, in instance space
 in float selfSkip; // mover index if this instance is a convex mover, else -1
+in float moving; // 1 on moving objects (their surfaces keep no AO history)
 flat out float wallFace;
+flat out float movingFace;
 #define MAX_DYN ${MAX_DYN}
 uniform vec4 dynSphere[MAX_DYN];
 uniform int dynCount;
@@ -61,6 +64,7 @@ void main(){
   p=world.xyz;
   n=normalize(mat3(modelMatrix)*mat3(instanceMatrix)*normal);
   wallFace=wall;
+  movingFace=moving;
   gl_Position=projectionMatrix*viewMatrix*world;
 }`;
 const fragmentShader=`
@@ -76,8 +80,21 @@ uniform highp usampler3D moverCells;
 in vec3 p;
 in vec3 n;
 flat in float wallFace;
+flat in float movingFace;
 flat in int instMask;
+#ifdef TRACED
+// Colour, the static AO history (accumulated AO, frames, view depth) and the normal, for the next frame.
+layout(location=0) out vec4 pixel;
+layout(location=1) out vec4 histOut;
+layout(location=2) out vec4 normalOut;
+uniform sampler2D histTex;
+uniform sampler2D normalTex;
+uniform mat4 prevViewProj;
+uniform float frame;
+uniform float histMax;
+#else
 out vec4 pixel;
+#endif
 uniform bool showMask;
 const vec3 scale=1./vec3(26.,18.,8.);
 // Moving objects: rigid world->local transforms, a shape type and its parameters.
@@ -166,6 +183,61 @@ float aoWallCorrection(vec4 d,vec3 normal){
   float sideAO=clamp(1.106-(.1429*u.x*u.x+.1795*sqrt(u.y)+.2928*sqrt(u.z)+.2654*u.w),0.,1.);
   return mix(normal.z>.7?flatAO:sideAO,wallAO,vertical);
 }
+#ifdef TRACED
+// "Traced SDF (temporal)": the static scene's AO as the 512-ray reference defines it, the unblocked fraction
+// of cosine-weighted directions out to 1.12 m, traced through the baked field. DIRS directions a frame
+// (a Fibonacci set rotated per pixel, the rotation and the set's cosine stratum and azimuth offsets changing
+// every frame) are blended into a
+// reprojected history. A direction is blocked where the field drops below min(.025, .1*t*(w.n)): t*(w.n) is
+// the distance to the pixel's own tangent plane, so its own surface never counts. Fitted on 3 views, checked
+// on 3 held out (benchmark/traced-results.md).
+float ign(vec2 q){return fract(52.9829189*fract(dot(q,vec2(.06711056,.00583715))));}
+float tracedAO(vec3 p,vec3 n){
+  vec3 a=abs(n.x)<.9?vec3(1.,0.,0.):vec3(0.,1.,0.);
+  vec3 t=normalize(cross(n,a)),b=cross(n,t);
+  float rot=6.2831853*ign(gl_FragCoord.xy+5.588238*mod(frame,64.)),g1=fract(frame*.6180339887),g2=fract(frame*.7548776662);
+  float blocked=0.;
+  for(int i=0;i<DIRS;i++){
+    float u=(float(i)+g1)/float(DIRS),phi=float(i)*2.39996323+6.2831853*g2+rot;
+    vec3 w=t*(sqrt(u)*cos(phi))+b*(sqrt(u)*sin(phi))+n*sqrt(1.-u);
+    float cosn=dot(w,n),s=.02;
+    // 16 steps of at least 6 cm: as accurate as 24 of 4 cm on the held-out views (0.0177 vs 0.0176), cheaper.
+    for(int k=0;k<16;k++){
+      float d=staticDistance(p+w*s);
+      if(d<min(.025,.1*s*cosn)){blocked+=1.;break;}
+      s+=max(d,.06);
+      if(s>1.12)break;
+    }
+  }
+  return 1.-blocked/float(DIRS);
+}
+// The previous frame's accumulated static AO at p: p projected with the previous camera, the four history
+// texels around it weighted bilinearly, each only if it saw the same surface (view depth within 3% + 1 cm,
+// normals within ~25 degrees) and holds a static-surface history. x: AO, y: frames (0 = none).
+// histTex: AO, view depth (float); normalTex: normal, frames/255.
+vec2 history(vec3 p,vec3 n){
+  vec4 c=prevViewProj*vec4(p,1.);
+  if(c.w<=0.)return vec2(0.);
+  vec2 res=vec2(textureSize(histTex,0));
+  vec2 f=(c.xy/c.w*.5+.5)*res-.5;
+  // A still camera reprojects onto texel centres: snap there, or the bilinear fetch re-blurs the history every frame.
+  f=mix(f,round(f),vec2(lessThan(abs(f-round(f)),vec2(.02))));
+  ivec2 i0=ivec2(floor(f));vec2 w=f-floor(f);
+  vec2 acc=vec2(0.);float ws=0.;
+  for(int k=0;k<4;k++){
+    ivec2 o=ivec2(k&1,k>>1),q=i0+o;
+    float bw=(o.x==1?w.x:1.-w.x)*(o.y==1?w.y:1.-w.y);
+    // A still camera lands on one texel (snapped above): the other three weigh nothing and are not read.
+    if(bw<1e-4||any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,ivec2(res))))continue;
+    vec2 h=texelFetch(histTex,q,0).xy;
+    vec4 hn=texelFetch(normalTex,q,0);
+    float frames=hn.w*255.;
+    if(frames<.5||abs(h.y-c.w)>.03*c.w+.01||dot(hn.xyz*2.-1.,n)<.9)continue;
+    acc+=bw*vec2(h.x,frames);ws+=bw;
+  }
+  return ws>.01?acc/ws:vec2(0.);
+}
+#endif
 // Scene distance at the four tap points p+normal*R. The static samples are fetched
 // together up front; each nearby mover is transformed to local space once and all
 // four taps are tested against it.
@@ -244,7 +316,23 @@ void main(){
     // fails, every tap does.
     if(((cand>>i)&1)!=0&&distance(p+normal*R.w,dynSphere[i].xyz)-dynSphere[i].w<R.w-.044)dynMask|=1<<i;
   }
-  #if defined(FAST)
+  #if defined(TRACED)
+    float viewDepth=-(viewMatrix*vec4(p,1.)).z;
+    vec4 dAll=dynMask!=0||movingFace>.5?tapDistances(p,normal,wallCorrectionTap2(normal),wallCorrectionTap3(normal)):vec4(1e4);
+    float aoStatic,frames=0.;
+    if(movingFace>.5){
+      // Moving surfaces: the four-tap formula every frame (their history would be another surface's).
+      aoStatic=aoWallCorrection(dStatic,normal);
+    }else{
+      vec2 h=history(p,normal);
+      frames=min(h.y+1.,histMax);
+      aoStatic=mix(h.x,tracedAO(p,normal),1./frames);
+    }
+    // Movers add occlusion every frame through the four-tap formula (not accumulated, so nothing lags behind them).
+    ao=dynMask!=0?aoStatic+(aoWallCorrection(dAll,normal)-aoWallCorrection(dStatic,normal))*moverScale.x:aoStatic;
+    histOut=vec4(aoStatic,viewDepth,0.,1.);
+    normalOut=vec4(normal*.5+.5,frames/255.);
+  #elif defined(FAST)
     #ifdef CONTACT
       vec4 dAll=tapDistances(p,normal,normal*R.z,normal*R.w);
       vec4 tapsAll=clamp(1.-(dAll+.045)/R,0.,1.);
@@ -446,7 +534,7 @@ try {
   const bakeSyncMs=performance.now()-bakeStart;
   const bakeGpuMs=new Promise(ok=>{const poll=()=>{if(!bakeQuery)return ok(NaN);if(bgl.getQueryParameter(bakeQuery,bgl.QUERY_RESULT_AVAILABLE))return ok(bgl.getQueryParameter(bakeQuery,bgl.QUERY_RESULT)/1e6);setTimeout(poll,5);};poll();});
 
-  const variants=[0,4,14,34,32,36];
+  const variants=[0,4,14,34,32,36,64];
   const mask={value:false};
   const dyn={
     dynInv:{value:Array.from({length:MAX_DYN},()=>new T.Matrix4())},
@@ -461,12 +549,28 @@ try {
     // held-out poses: AO error near movers 0.097 -> 0.050; 1 = the full, distance-only occlusion.
     moverScale:{value:new T.Vector4(.5,.5,.5,.5)}
   };
+  // Traced SDF (temporal): two history targets, ping-ponged. Attachment 0: colour; 1: static AO history
+  // (AO, view depth; float); 2: normal and frames (frames/255 in alpha). The frame renders into one while reading the other.
+  const makeHistory=()=>{const rt=new T.WebGLRenderTarget(W,H,{count:3});
+    rt.textures[1].type=T.FloatType;   // half floats round away the small updates of a long history (drift)
+    rt.textures[1].format=T.RGFormat;
+    for(const t of rt.textures.slice(1)){t.minFilter=t.magFilter=T.NearestFilter;t.generateMipmaps=false;}
+    return rt;};
+  const histories=[makeHistory(),makeHistory()];let histIndex=0;
+  const traced={histTex:{value:null},normalTex:{value:null},prevViewProj:{value:new T.Matrix4()},frame:{value:0},
+    // Frames the history averages over at most: 128 on a still camera, 32 while it moves (each reprojection
+    // resamples the history, so a moving history is kept short). Set per frame in render().
+    histMax:{value:128}};
+  const lastCamera=new T.Matrix4();
+  const tracedCopy=new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,uniforms:{src:{value:null}},
+    vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',
+    fragmentShader:'precision highp float;uniform sampler2D src;out vec4 o;void main(){o=texelFetch(src,ivec2(gl_FragCoord.xy),0);}'}));
   // Two compiled variants per mode: with mover code, and without it (NO_DYN) for when no mover
   // is in the AO, so the static path carries none of the mover loops.
   const makeMaterials=extra=>Object.fromEntries(variants.map(mode=>[mode,new T.ShaderMaterial({
     glslVersion:T.GLSL3,vertexShader,fragmentShader,
-    defines:{...(mode===34?{FAST:1,CONTACT:1}:mode===14?{FAST:1}:{TAPS:mode}),...extra},
-    uniforms:{field:{value:field},showMask:mask,...dyn}
+    defines:{...(mode===64?{TRACED:1,DIRS:2}:mode===34?{FAST:1,CONTACT:1}:mode===14?{FAST:1}:{TAPS:mode}),...extra},
+    uniforms:{field:{value:field},showMask:mask,...dyn,...traced}
   })]));
   const materials=makeMaterials({}),staticMaterials=makeMaterials({NO_DYN:1});
   if(!boxes.length||boxes.some(b=>b.length!==6||b.some(v=>!Number.isFinite(v))))throw Error('Invalid geometry');
@@ -475,6 +579,7 @@ try {
   walls[1]=walls[2]=1;
   mesh.geometry.setAttribute('wall',new T.InstancedBufferAttribute(walls,1));
   mesh.geometry.setAttribute('selfSkip',new T.InstancedBufferAttribute(new Float32Array(boxes.length).fill(-1),1));
+  mesh.geometry.setAttribute('moving',new T.InstancedBufferAttribute(new Float32Array(boxes.length),1));
   mesh.geometry.setAttribute('boundsHalf',new T.InstancedBufferAttribute(new Float32Array(boxes.length*3).fill(.5),3));
   const matrix=new T.Matrix4();
   boxes.forEach(([x,y,z,hx,hy,hz],i)=>mesh.setMatrixAt(i,matrix.makeScale(2*hx,2*hy,2*hz).setPosition(x,y,z)));
@@ -484,6 +589,7 @@ try {
     m.geometry.setAttribute('wall',new T.InstancedBufferAttribute(new Float32Array([0]),1));
     m.geometry.setAttribute('selfSkip',new T.InstancedBufferAttribute(new Float32Array([m.type<=4?movers.indexOf(m):-1]),1));
     m.geometry.setAttribute('boundsHalf',new T.InstancedBufferAttribute(new Float32Array(m.half),3));
+    m.geometry.setAttribute('moving',new T.InstancedBufferAttribute(new Float32Array([1]),1));
     m.object=new T.InstancedMesh(m.geometry,materials[0],1);
     m.object.instanceMatrix.setUsage(T.DynamicDrawUsage);
     m.object.frustumCulled=false;
@@ -578,6 +684,19 @@ try {
       screenMaterial.uniforms.aoMap.value=taps===32?ssao.blurRenderTarget.texture:gtao.pdRenderTarget.texture;
       setMaterial(screenMaterial);
     } else setMaterial((dyn.dynCount.value>0?materials:staticMaterials)[taps]);
+    if(taps===64){
+      // Render into this frame's history target, reading the last frame's, then copy the colour out.
+      const cur=histories[histIndex],prev=histories[1-histIndex];
+      traced.histTex.value=prev.textures[1];traced.normalTex.value=prev.textures[2];
+      camera.updateMatrixWorld();
+      traced.histMax.value=camera.matrixWorld.equals(lastCamera)?128:32;lastCamera.copy(camera.matrixWorld);
+      renderer.setRenderTarget(cur);renderer.render(scene,camera);
+      traced.prevViewProj.value.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
+      traced.frame.value++;histIndex=1-histIndex;
+      tracedCopy.material.uniforms.src.value=cur.textures[0];
+      renderer.setRenderTarget(null);tracedCopy.render(renderer);
+      return;
+    }
     renderer.setRenderTarget(null);
     renderer.render(scene,camera);
   }
@@ -608,7 +727,8 @@ try {
   document.querySelector('#forcemesh').onchange=event=>{forceMesh=event.target.checked;if(forceMesh)ensureAllBaked();updateMovers(simTime);resetFps();};
   // Debug hook for timing from the console.
   window.aoDemo={renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,bakeSyncMs,bakeGpuMs,totalTris,get atlas(){return baked.tex;},meshRes:MESH_RES,setMask:on=>{mask.value=on;},setMoverScale:(x,y=x,z=x,w=x)=>dyn.moverScale.value.set(x,y,z,w),select:mode=>select(mode),
-    setDynamicAO:on=>{dynamicAO=on;updateMovers(simTime);},
+    setDynamicAO:on=>{dynamicAO=on;updateMovers(simTime);},traced,
+    resetHistory:()=>{for(const rt of histories){renderer.setRenderTarget(rt);renderer.clear();}renderer.setRenderTarget(null);},
     setForceMesh:on=>{forceMesh=on;if(on)ensureAllBaked();updateMovers(simTime);}};
   document.addEventListener('visibilitychange',resetFps);
   select(selected);
