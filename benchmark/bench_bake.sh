@@ -3,8 +3,10 @@
 #   benchmark/bench_bake.sh ./bake_champion ./bake_candidate [rounds=7]
 # Runs both on the Archive (box JSON) and its 16x16-subdivided dense mesh, alternating every run
 # so machine load hits both equally. Prints median totals and the load average before/after.
-# Guards (exit 1 on failure): candidate fields are bit-identical to the champion's, and
-# eval_ao.py MAE stays within 1e-4 of the shipped numbers (0.0421 original, 0.0401 wall correction).
+# Guards (exit 1 on failure): candidate fields are bit-identical to the champion's, random voxels match
+# brute force (bake_sdf --validate: every triangle and its winding number, so a wrong-but-consistent
+# change can't pass), and eval_ao.py MAE stays within 1e-4 of the shipped numbers (0.0421 original,
+# 0.0401 wall correction).
 set -euo pipefail
 CHAMP=$1; CAND=$2; ROUNDS=${3:-7}
 cd "$(dirname "$0")/.."
@@ -30,5 +32,8 @@ printf 'dense    champion %8.1f ms   candidate %8.1f ms   (%+.1f%%)\n' "$md" "$m
 ok=1
 cmp -s "$TMP/champ.f32" "$TMP/cand.f32" && echo "archive field: bit-identical" || { echo "archive field: DIFFERS"; ok=0; }
 cmp -s "$TMP/champ.dense.f32" "$TMP/cand.dense.f32" && echo "dense field:   bit-identical" || { echo "dense field:   DIFFERS"; ok=0; }
+# Brute-force check, outside the timed runs. Older binaries without --validate fail here too.
+"$CAND" "${A[@]}" --validate 50000 --out "$TMP/v.f32" >/dev/null && echo "archive brute force: 50000 voxels exact" || { echo "archive brute force: FAILED"; ok=0; }
+"$CAND" "${A[@]}" --subdiv 16 --validate 1000 --out "$TMP/v.f32" >/dev/null && echo "dense brute force:   1000 voxels exact" || { echo "dense brute force:   FAILED"; ok=0; }
 python3 -I benchmark/eval_ao.py "$TMP/cand.f32" --max-mae4 0.0422 --max-mae14 0.0402 || { echo "MAE guard FAILED"; ok=0; }
 ((ok)) && echo "GUARDS: PASS" || { echo "GUARDS: FAIL"; exit 1; }
