@@ -113,3 +113,28 @@ Frame time on the wall clock, p10 / p50, interleaved over 6 rounds, with the mov
 | Both | **1.14** / 1.35 ms | **1.42** / 1.73 ms |
 
 **Shipped:** the settled skip at 64 is on, because it costs nothing measurable in accuracy. Quarter-rate tiles are off but available as `aoDemo.traced.tileRate.value = 4`. They save about 0.43 ms at any camera speed but give up about a fifth of the gain over the formula in motion and near moving objects.
+
+### True half resolution (deferred)
+
+The forward version traced in the scene draw itself, at full resolution, and wrote its history through extra render targets plus a copy to the screen. The traced mode is now deferred, in three passes at the AO resolution (`aoDemo.setAOScale`, 0.5 by default):
+1. **Geometry pass:** world position and view depth (float), normal (half float) and a moving-surface flag.
+2. **AO pass (full screen):** traces 2 directions per pixel and accumulates into the reprojected history. The settled skip and the optional tiles work as before.
+3. **Scene draw:** writes straight to the screen. It reads the AO with depth- and normal-aware upsampling: the four nearest AO texels weighted bilinearly, each used only if it saw the same surface (view depth within 5% + 2 cm, normals within about 25°). If none qualifies, the pixel shows the formula alone.
+
+At scale 1 the deferred pipeline reproduces the forward version exactly (0.0262 / 0.0217 / 0.0175 at 1 / 16 / 64 frames). At scale 0.5 it is more accurate everywhere, because the upsampling averages several noisy AO texels:
+
+| Main view, AO error | Still: 1 / 4 / 16 / 64 / 256 frames | Orbit at 1° / 3° / 10° per frame | Moving objects: near / all |
+|---|---:|---:|---:|
+| Forward, full resolution (previous) | 0.0262 / 0.0253 / 0.0217 / 0.0175 / 0.0175 | 0.0167 / 0.0188 / 0.0225 | 0.0386 / 0.0220 |
+| **Deferred, half resolution** | **0.0250 / 0.0220 / 0.0178 / 0.0160 / 0.0160** | **0.0164 / 0.0182 / 0.0212** | **0.0382 / 0.0202** |
+| *Formula* | *0.0270* | *0.0270* | *0.0411 / 0.0300* |
+
+Frame time, wall clock, p10 / p50, 12 interleaved rounds:
+
+| Mode | Settled still camera | Orbiting at 1° per frame |
+|---|---:|---:|
+| Formula | 0.33 / 0.34 ms | 0.34 / 0.41 ms |
+| Forward, full resolution (previous) | 1.29 / 1.37 ms | 1.86 / 2.02 ms |
+| **Deferred, half resolution** | **1.21 / 1.27 ms** | **1.25 / 1.35 ms** |
+
+A noisier 3-way run put deferred at full resolution at 2.10 / 2.58 ms (still / orbiting): the full-resolution geometry pass costs more than it saves. The AO mask showed no blockiness or halos at outlines at half resolution.
