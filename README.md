@@ -11,21 +11,27 @@ Open `index.html` in a WebGL 2 browser. The scene and distance field are embedde
 ## Traced SDF (temporal)
 
 The **Traced SDF (temporal)** mode estimates AO the way the ray-traced reference defines it, the unblocked share of cosine-weighted directions out to 1.12 m, by tracing the baked field. The four fixed taps are not used.
-- **Tracing:** each frame traces 2 directions per pixel. Each direction is sphere-traced, with up to 16 steps of at least 6 cm. A direction counts as blocked where the field drops below `min(2.5 cm, 0.1 · t · (w·n))`. Here `t · (w·n)` is the distance to the pixel's own tangent plane, so the pixel's own surface never counts.
+- **Half resolution:** the trace runs at half resolution in three steps.
+  1. A geometry pass writes world position, view depth, normal and a moving-surface flag.
+  2. A full-screen AO pass traces and accumulates from that.
+  3. The scene draw reads the result with depth- and normal-aware upsampling: the four nearest half-resolution texels, each used only if it saw the same surface.
+
+  This is cheaper than tracing every pixel, and also more accurate, because the upsampling averages away noise.
+- **Tracing:** each frame traces 2 directions per AO pixel. Each direction is sphere-traced, with up to 16 steps of at least 6 cm. A direction counts as blocked where the field drops below `min(2.5 cm, 0.1 · t · (w·n))`. Here `t · (w·n)` is the distance to the pixel's own tangent plane, so the pixel's own surface never counts.
 - **Accumulation:** the result is blended into a history that is reprojected from the previous frame. A history texel is only reused when it saw the same surface (view depth within 3% + 1 cm, normals within about 25°). Up to 128 frames are averaged on a still camera, 32 while it moves.
 - **Moving objects:** their occlusion is added fresh every frame with the wall-correction formula, so nothing smears behind them. Their own surfaces use the formula too, since their history would belong to another surface.
 - **Settled pixels stop tracing:** once a pixel's history holds 64 traced frames, about 1 s at 60 fps on a still camera, it stops tracing. Its static AO no longer changes, and a settled frame costs about 0.6 ms less with the same error.
-- **Optional quarter-rate tracing** (`aoDemo.traced.tileRate.value = 4`): 8×8-pixel tiles take turns, so a quarter of the screen traces each frame. It saves about 0.43 ms at any camera speed but converges 4× slower, so it is off by default.
+- **Optional quarter-rate tracing** (`aoDemo.traced.tileRate.value = 4`): 8×8-pixel tiles take turns, so a quarter of the screen traces each frame. Measured before the move to half resolution, it saved about 0.43 ms at any camera speed but converged 4× slower, so it is off by default.
 - **Shown value:** a blend of the wall-correction formula and the traced mean, with traced weight `frames / (frames + 8)`. A camera cut or a just-revealed surface therefore starts at the formula's quality instead of a one-frame trace (0.099). The blend also beats either estimate alone at every history length, because their errors partly cancel. Only the traced mean is stored, so the blend never feeds back into the history.
 
 | SDF wall correction formula → traced (temporal), Apple M1, 1280 × 720 | Formula | Traced |
 |---|---:|---:|
-| AO error, still camera: 1 / 16 / 64 / 256 frames | 0.0270 | **0.0262 / 0.0218 / 0.0175 / 0.0170** |
-| AO error arriving after an orbit at 1° / 3° / 10° per frame | 0.0270 | **0.0167 / 0.0188 / 0.0225** |
-| AO error with all 11 objects moving (held-out poses): all pixels / near objects | 0.0300 / 0.0411 | **0.0216 / 0.0387** |
-| Frame time (wall clock, p10; settled still camera / orbiting) | 0.31 / 0.34 ms | 1.30 / 2.00 ms (quarter rate: 1.14 / 1.42 ms) |
+| AO error, still camera: 1 / 16 / 64 / 256 frames | 0.0270 | **0.0250 / 0.0178 / 0.0160 / 0.0160** |
+| AO error arriving after an orbit at 1° / 3° / 10° per frame | 0.0270 | **0.0164 / 0.0182 / 0.0212** |
+| AO error with all 11 objects moving (held-out poses): all pixels / near objects | 0.0300 / 0.0411 | **0.0202 / 0.0382** |
+| Frame time (wall clock, p10; settled still camera / orbiting) | 0.33 / 0.34 ms | 1.21 / 1.25 ms |
 
-It is never worse than the formula, from the first frame after a cut, and it settles 37% lower. The tracing parameters were fitted on three views and checked on three held out; see [traced-results.md](benchmark/traced-results.md).
+It is never worse than the formula, from the first frame after a cut, and it settles 41% lower. The tracing parameters were fitted on three views and checked on three held out; see [traced-results.md](benchmark/traced-results.md).
 
 ## Moving objects
 
