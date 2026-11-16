@@ -14,15 +14,16 @@ The **Traced SDF (temporal)** mode estimates AO the way the ray-traced reference
 - **Tracing:** each frame traces 2 directions per pixel. Each direction is sphere-traced, with up to 16 steps of at least 6 cm. A direction counts as blocked where the field drops below `min(2.5 cm, 0.1 · t · (w·n))`. Here `t · (w·n)` is the distance to the pixel's own tangent plane, so the pixel's own surface never counts.
 - **Accumulation:** the result is blended into a history that is reprojected from the previous frame. A history texel is only reused when it saw the same surface (view depth within 3% + 1 cm, normals within about 25°). Up to 128 frames are averaged on a still camera, 32 while it moves.
 - **Moving objects:** their occlusion is added fresh every frame with the wall-correction formula, so nothing smears behind them. Their own surfaces use the formula too, since their history would belong to another surface.
+- **Shown value:** a blend of the wall-correction formula and the traced mean, with traced weight `frames / (frames + 8)`. A camera cut or a just-revealed surface therefore starts at the formula's quality instead of a one-frame trace (0.099). The blend also beats either estimate alone at every history length, because their errors partly cancel. Only the traced mean is stored, so the blend never feeds back into the history.
 
 | SDF wall correction formula → traced (temporal), Apple M1, 1280 × 720 | Formula | Traced |
 |---|---:|---:|
-| AO error, still camera | 0.0270 | **0.0191** after 64 frames, **0.0179** after 256 |
-| AO error arriving after an orbit at 1° / 3° / 10° per frame | 0.0270 | 0.0220 / 0.0270 / 0.0415 |
-| AO error with all 11 objects moving (held-out poses): all pixels / near objects | 0.0300 / 0.0411 | **0.0225 / 0.0392** |
-| Frame time (wall clock, p10) | 0.32 ms | 1.35–1.43 ms |
+| AO error, still camera: 1 / 16 / 64 / 256 frames | 0.0270 | **0.0262 / 0.0218 / 0.0175 / 0.0170** |
+| AO error arriving after an orbit at 1° / 3° / 10° per frame | 0.0270 | **0.0167 / 0.0188 / 0.0225** |
+| AO error with all 11 objects moving (held-out poses): all pixels / near objects | 0.0300 / 0.0411 | **0.0216 / 0.0387** |
+| Frame time (wall clock, p10) | 0.32 ms | about 1.6 ms |
 
-A still camera passes the formula after about 20 frames, a third of a second at 60 fps. The first frame after a cut is noisy, at 0.099. The three parameters were fitted on three views and checked on three held out; see [traced-results.md](benchmark/traced-results.md).
+It is never worse than the formula, from the first frame after a cut, and it settles 37% lower. The tracing parameters were fitted on three views and checked on three held out; see [traced-results.md](benchmark/traced-results.md).
 
 ## Moving objects
 
