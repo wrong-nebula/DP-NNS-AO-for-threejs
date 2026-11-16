@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archive AO · N8AO 2.1 benchmark (Three.js r187, WebGL2)</title>
+<style>body{margin:0;background:#121821;color:#f1f5f8;font:15px system-ui,sans-serif}main{max-width:1320px;margin:auto;padding:20px}canvas{display:block;width:100%;height:auto}pre{white-space:pre-wrap;color:#c4d0db}</style>
+<main><h1>Archive AO · N8AO 2.1 vs SDF (Three.js r187, WebGL2)</h1>
+<p>Same scene, camera and 1280 × 720 resolution as <code>final.html</code> and <code>r187.html</code>. N8AO has no WebGPU version yet, so this page runs r187 on WebGL2. Run <code>await n8aoBench.run()</code> in the console.</p>
+<div id="view"></div><pre id="status">Loading…</pre></main>
+<script type="importmap">{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.187.0/examples/jsm/",
+  "three/examples/jsm/":"https://cdn.jsdelivr.net/npm/three@0.187.0/examples/jsm/",
+  "postprocessing":"https://cdn.jsdelivr.net/npm/postprocessing@6.39.6/build/index.js",
+  "n8ao":"https://cdn.jsdelivr.net/npm/n8ao@2.1.0/dist/N8AO.js"}}</script>
+<script type="module">
+// N8AO 2.1 against the four-tap SDF AO, on the same footing as r187.html's SSAO/GTAO comparison:
+// - GPU time: EXT_disjoint_timer_query_webgl2 over 12 frames per sample, every mode interleaved per round.
+//   A frame is the whole frame: the forward draw for AO off and the SDF modes, N8AOPass (its own scene
+//   render, AO, denoise, composite) for N8AO.
+// - AO error: mean absolute difference from the 512-ray reference (reference.py) at the 57,216 benchmark
+//   pixels, on AO-only output: the SDF's AO term, N8AO's "AO" display mode (gamma correction off).
+//   N8AO is scored frame by frame (what one frame shows, noise included) and, with accumulation on a
+//   still camera, converged (its noise-free floor). Its intensity and distance falloff are swept for the
+//   lowest converged error, as SSAO's intensity and GTAO's scale were in r187.html.
+import * as T from 'three';
+import {EffectComposer} from 'three/addons/postprocessing/EffectComposer.js';
+import {N8AOPass} from 'n8ao';
+import {SSAOPass} from 'three/addons/postprocessing/SSAOPass.js';
+import {GTAOPass} from 'three/addons/postprocessing/GTAOPass.js';
+
+const W=1280,H=720,RADIUS=1.12;
+const status=document.querySelector('#status');
+const vertexShader=`
+out vec3 p;out vec3 n;in float wall;flat out float wallFace;
+void main(){vec4 world=modelMatrix*instanceMatrix*vec4(position,1.);p=world.xyz;
+  n=normalize(mat3(modelMatrix)*mat3(instanceMatrix)*normal);wallFace=wall;gl_Position=projectionMatrix*viewMatrix*world;}`;
+// AO off, the r187.html formula (FAST) and the viewer's current wall correction (CURRENT, index.html).
+const fragmentShader=`
+precision highp float;precision highp sampler3D;
+uniform sampler3D field;uniform sampler2D aoMap;uniform bool showMask;
+in vec3 p;in vec3 n;flat in float wallFace;out vec4 pixel;
+const vec3 scale=1./vec3(26.,18.,8.);
+const vec4 R=vec4(.16,.48,.80,1.12);
+float staticDistance(vec3 pos){vec3 uv=(pos+1.)*scale;
+  if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return 1e4;return texture(field,uv).r;}
+vec3 wallCorrectionTap2(vec3 n){float h=n.z*n.z;return n*vec3(.7,.7,.7+.1*h)-vec3(0.,0.,.4*(1.-h));}
+vec3 wallCorrectionTap3(vec3 n){float h=n.z*n.z;return n*vec3(.5657,.5657,.5657+.5543*h)+vec3(0.,0.,.5657*(1.-h));}
+float aoWallCorrection(vec4 d,vec3 normal){
+  float vertical=wallFace*(1.-abs(normal.z));float k=.92/2.9;
+  vec4 v=clamp(1.-(d+vec4(.1523,-.0624,.4135,-.2624))/vec4(R.xyz,.8),0.,1.);
+  float wallAO=clamp(1.1356-(7.212*v.x*v.x+.4812*v.y+.1365*v.z+.1172*v.w),0.,1.);
+  vec4 s=clamp(1.-(d+vec4(.024,.078,0.,.02))/R,0.,1.);
+  float far=s.w*s.w;far*=far;far*=far;
+  float flatAO=1.-k*(s.x*s.x+.8166666667*sqrt(s.y)+.6333333333*sqrt(s.z)+.45*far);
+  vec4 u=clamp(1.-(d+vec4(-.0644,.0633,.1349,.1475))/vec4(R.xy,.8,.8),0.,1.);
+  float sideAO=clamp(1.106-(.1429*u.x*u.x+.1795*sqrt(u.y)+.2928*sqrt(u.z)+.2654*u.w),0.,1.);
+  return mix(normal.z>.7?flatAO:sideAO,wallAO,vertical);}
+void main(){
+  vec3 normal=normalize(n);float ao=1.;
+  #if defined(FAST)
+    vec4 d=vec4(staticDistance(p+normal*R.x),staticDistance(p+normal*R.y),staticDistance(p+normal*R.z),staticDistance(p+normal*R.w));
+    vec4 taps=clamp(1.-(d+.045)/R,0.,1.);
+    float vertical=wallFace*(1.-abs(normal.z));float farSupport=.40+.60*max(taps.x,taps.y);
+    vec4 original=.92*vec4(1.,.8166666667,.6333333333,.45)/2.9;vec4 corrected=vec4(.46,.24,.21*farSupport,.16*farSupport);
+    ao=1.-dot(taps,mix(original,corrected,vertical));
+  #elif defined(CURRENT)
+    vec4 d=vec4(staticDistance(p+normal*R.x),staticDistance(p+normal*R.y),
+                staticDistance(p+wallCorrectionTap2(normal)),staticDistance(p+wallCorrectionTap3(normal)));
+    ao=aoWallCorrection(d,normal);
+  #elif defined(SCREEN_AO)
+    ao=texelFetch(aoMap,ivec2(gl_FragCoord.xy),0).r;
+  #endif
+  if(showMask){pixel=vec4(vec3(ao),1.);return;}
+  float sun=max(0.,dot(normal,normalize(vec3(-.4,-.55,1.))));
+  vec3 albedo=mix(vec3(.28,.34,.43),vec3(.64,.69,.75),clamp(p.z/4.+.14,0.,1.));
+  if(p.z<.005)albedo=vec3(.37,.41,.44);
+  pixel=vec4(pow(albedo*(.26*sun+.74*ao),vec3(1./2.2)),1.);}`;
+try{
+  const [volume,boxes,refBuf]=await Promise.all(['archive.f32','archive.json','ref_static.f32'].map(f=>fetch(f).then(r=>{if(!r.ok)throw Error('missing '+f);return f.endsWith('json')?r.json():r.arrayBuffer();})));
+  const src=new Float32Array(volume);if(src.length!==128**3)throw Error('unexpected field size');
+  const field=new T.Data3DTexture(Uint16Array.from(src,v=>T.DataUtils.toHalfFloat(v)),128,128,128);
+  field.format=T.RedFormat;field.type=T.HalfFloatType;field.minFilter=field.magFilter=T.LinearFilter;field.needsUpdate=true;
+  const renderer=new T.WebGLRenderer({antialias:false,preserveDrawingBuffer:true});
+  renderer.setPixelRatio(1);renderer.setSize(W,H,false);document.querySelector('#view').append(renderer.domElement);
+  const gl=renderer.getContext(),timer=gl.getExtension('EXT_disjoint_timer_query_webgl2'),dbg=gl.getExtension('WEBGL_debug_renderer_info');
+  const scene=new T.Scene();scene.background=new T.Color('#17212e');
+  const camera=new T.PerspectiveCamera(37,W/H,.1,100);camera.up.set(0,0,1);camera.position.set(18,-4,7.3);camera.lookAt(10.8,8.8,1.4);camera.updateMatrixWorld();
+  const mask={value:false};
+  const mat=defines=>new T.ShaderMaterial({glslVersion:T.GLSL3,vertexShader,fragmentShader,defines,uniforms:{field:{value:field},aoMap:{value:null},showMask:mask}});
+  const plain=mat({}),fast=mat({FAST:1}),current=mat({CURRENT:1});
+  const mesh=new T.InstancedMesh(new T.BoxGeometry(1,1,1),plain,boxes.length);
+  const walls=new Float32Array(boxes.length);walls[1]=walls[2]=1;mesh.geometry.setAttribute('wall',new T.InstancedBufferAttribute(walls,1));
+  const m4=new T.Matrix4();boxes.forEach(([x,y,z,hx,hy,hz],i)=>mesh.setMatrixAt(i,m4.makeScale(2*hx,2*hy,2*hz).setPosition(x,y,z)));
+  scene.add(mesh);
+
+  // ---- N8AO configurations -------------------------------------------------------------------------
+  const TUNE={intensity:3,distanceFalloff:1};   // replaced by the sweep in run()
+  function makeN8(cfg){
+    const composer=new EffectComposer(renderer);composer.setPixelRatio(1);composer.setSize(W,H);
+    const pass=new N8AOPass(scene,camera,W,H);composer.addPass(pass);
+    const c=pass.configuration;
+    if(cfg.mode)pass.setQualityMode(cfg.mode);
+    Object.assign(c,{aoRadius:RADIUS,screenSpaceRadius:false,gammaCorrection:false,intensity:TUNE.intensity,distanceFalloff:TUNE.distanceFalloff,halfRes:!!cfg.halfRes},cfg.set||{});
+    return {composer,pass};
+  }
+  const n8Configs={
+    n8_perf:{label:'N8AO Performance (8 spp, denoise 4)',mode:'Performance'},
+    n8_perf_noden:{label:'N8AO 8 spp, no denoise',mode:'Performance',set:{denoiseIterations:0}},
+    n8_med:{label:'N8AO Medium',mode:'Medium'},
+    n8_ultra:{label:'N8AO Ultra (64 spp)',mode:'Ultra'},
+    n8_perf_half:{label:'N8AO Performance, half res',mode:'Performance',halfRes:true},
+    n8_med_half:{label:'N8AO Medium, half res',mode:'Medium',halfRes:true},
+    n8_nperf:{label:'N8AO Neural-Performance',mode:'Neural-Performance'},
+    n8_nmed:{label:'N8AO Neural-Medium',mode:'Neural-Medium'},
+    n8_nperf_half:{label:'N8AO Neural-Performance, half res',mode:'Neural-Performance',halfRes:true},
+    n8_nmed_half:{label:'N8AO Neural-Medium, half res',mode:'Neural-Medium',halfRes:true},
+  };
+  const modes={
+    off:{label:'AO off',material:plain},
+    sdf:{label:'4-tap SDF (r187.html formula)',material:fast},
+    sdf_cur:{label:'4-tap SDF (current wall correction)',material:current},
+  };
+  function buildN8(){
+    for(const [k,cfg] of Object.entries(n8Configs)){modes[k]?.n8?.composer.dispose();modes[k]={label:cfg.label,cfg,n8:makeN8(cfg)};}
+  }
+  buildN8();
+  // Legacy WebGL passes (r187's SSAOPass / GTAOPass), set up exactly as final.html: denoised AO target,
+  // then the same forward draw reads it as its ambient term.
+  const origRandom=Math.random;let seed=2804,ssao;
+  try{Math.random=()=>{seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed/4294967296;};ssao=new SSAOPass(scene,camera,W,H,32);}finally{Math.random=origRandom;}
+  ssao.kernelRadius=RADIUS;ssao.minDistance=.045/(camera.far-camera.near);ssao.maxDistance=RADIUS/(camera.far-camera.near);
+  ssao.output=SSAOPass.OUTPUT.Blur;
+  const ssaoRender=ssao._renderPass.bind(ssao);ssao._renderPass=(r,material,...a)=>{if(material!==ssao.copyMaterial)ssaoRender(r,material,...a);};   // skip the final copy, as final.html did
+  const gtao=new GTAOPass(scene,camera,W,H);gtao.updateGtaoMaterial({radius:RADIUS,screenSpaceRadius:false,thickness:RADIUS});gtao.output=GTAOPass.OUTPUT.Off;
+  const scratch=new T.WebGLRenderTarget(W,H,{depthBuffer:false});
+  const screenAO=mat({SCREEN_AO:1});
+  modes.ssao_legacy={label:'Legacy SSAOPass (32 samples, blur)',legacy:ssao,aoTex:()=>ssao.blurRenderTarget.texture};
+  modes.gtao_legacy={label:'Legacy GTAOPass (denoised)',legacy:gtao,aoTex:()=>gtao.pdRenderTarget.texture};
+  const frame=k=>{const m=modes[k];
+    if(m.n8){mesh.material=plain;m.n8.composer.render();return;}
+    if(m.legacy){mesh.material=plain;m.legacy.render(renderer,scratch,scratch);screenAO.uniforms.aoMap.value=m.aoTex();mesh.material=screenAO;}
+    else mesh.material=m.material;
+    renderer.setRenderTarget(null);renderer.render(scene,camera);};
+
+  // ---- GPU timing ------------------------------------------------------------------------------------
+  const quant=(a,p)=>{const s=[...a].sort((x,y)=>x-y);return s[Math.min(s.length-1,Math.floor(p*(s.length-1)))];};
+  async function gpuMs(k,frames=12){
+    if(!timer)throw Error('EXT_disjoint_timer_query_webgl2 unavailable');
+    const q=gl.createQuery();gl.beginQuery(timer.TIME_ELAPSED_EXT,q);
+    for(let i=0;i<frames;i++)frame(k);
+    gl.endQuery(timer.TIME_ELAPSED_EXT);gl.flush();
+    try{for(let i=0;i<2000;i++){
+      if(gl.getQueryParameter(q,gl.QUERY_RESULT_AVAILABLE)){if(gl.getParameter(timer.GPU_DISJOINT_EXT))return null;return gl.getQueryParameter(q,gl.QUERY_RESULT)/frames/1e6;}
+      await new Promise(r=>setTimeout(r,2));}
+      throw Error('GPU timer timed out');}finally{gl.deleteQuery(q);}
+  }
+  // Wall clock per frame over batches of 20 frames, each batch closed by a 1-pixel readback (which waits for
+  // the GPU). Includes each method's CPU submission cost. On ANGLE/Metal an active TIME_ELAPSED query
+  // inflated N8AO's many-pass frames about 3-4x (13.4 ms timer vs 4.1 ms wall clock for Medium), so this is
+  // the primary measure; the timer columns are kept for reference.
+  const px1=new Uint8Array(4);const sync=()=>gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px1);
+  function wallMs(k,frames=20){for(let i=0;i<2;i++)frame(k);sync();const t0=performance.now();for(let i=0;i<frames;i++)frame(k);sync();return (performance.now()-t0)/frames;}
+  async function wallTimings(rounds=30,keys=Object.keys(modes)){
+    const t=Object.fromEntries(keys.map(k=>[k,[]]));
+    for(const k of keys){for(let i=0;i<10;i++)frame(k);sync();}
+    for(let r=0;r<rounds;r++){for(let j=0;j<keys.length;j++){const k=keys[(r+j)%keys.length];t[k].push(wallMs(k));}await new Promise(r=>setTimeout(r,0));}
+    return Object.fromEntries(keys.map(k=>[k,{p10:+quant(t[k],.1).toFixed(4),p50:+quant(t[k],.5).toFixed(4),p95:+quant(t[k],.95).toFixed(4),n:t[k].length}]));
+  }
+  async function timings(rounds=30,keys=Object.keys(modes)){
+    const t=Object.fromEntries(keys.map(k=>[k,[]]));
+    for(const k of keys){for(let i=0;i<20;i++)frame(k);}gl.finish();
+    for(let r=0;r<rounds;r++)for(let j=0;j<keys.length;j++){const k=keys[(r+j)%keys.length];const v=await gpuMs(k);if(v!=null)t[k].push(v);}
+    return Object.fromEntries(keys.map(k=>[k,{p10:+quant(t[k],.1).toFixed(4),p50:+quant(t[k],.5).toFixed(4),p95:+quant(t[k],.95).toFixed(4),n:t[k].length}]));
+  }
+
+  // ---- AO error vs the 512-ray reference --------------------------------------------------------------
+  const ref=new Float32Array(refBuf);   // 320×180, NaN = no surface
+  const px=new Uint8Array(W*H*4);
+  function readCanvas(){gl.readPixels(0,0,W,H,gl.RGBA,gl.UNSIGNED_BYTE,px);return (x,y)=>px[((H-1-y)*W+x)*4]/255;}   // y down
+  function mae(get){let s=0,n=0;
+    for(let j=0;j<180;j++)for(let i=0;i<320;i++){const r=ref[j*320+i];if(!Number.isFinite(r))continue;s+=Math.abs(get(2+4*i,2+4*j)-r);n++;}
+    return +(s/n).toFixed(5);}
+  function legacyError(k){mask.value=true;frame(k);const e=mae(readCanvas());mask.value=false;return e;}
+  function sdfError(material){mask.value=true;mesh.material=material;renderer.setRenderTarget(null);renderer.render(scene,camera);const e=mae(readCanvas());mask.value=false;return e;}
+  // One N8AO configuration: per-frame error (mean over 8 frames, after 16 warm-up frames) and, with
+  // accumulation on the still camera, the converged error after 96 frames.
+  async function n8Error(cfg,{converged=true}={}){
+    const {composer,pass}=makeN8(cfg);pass.setDisplayMode('AO');mesh.material=plain;
+    for(let i=0;i<16;i++)composer.render();
+    let per=0;for(let i=0;i<8;i++){composer.render();per+=mae(readCanvas())/8;}
+    let conv=null;
+    if(converged){pass.configuration.accumulate=true;for(let i=0;i<96;i++)composer.render();conv=mae(readCanvas());}
+    composer.dispose();pass.dispose?.();
+    return {perFrame:+per.toFixed(5),converged:conv};
+  }
+  // Intensity and distance falloff for the lowest converged error (Medium; accumulation removes noise,
+  // so the look is tuned apart from the quality mode).
+  async function sweep(){
+    const out=[];
+    for(const distanceFalloff of [.25,.5,1,2])for(const intensity of [1,1.5,2,3,4,5,6]){
+      Object.assign(TUNE,{intensity,distanceFalloff});
+      const e=await n8Error({mode:'Medium'});out.push({intensity,distanceFalloff,converged:e.converged});
+      status.textContent=`Sweep: intensity ${intensity}, falloff ${distanceFalloff}: ${e.converged}`;
+    }
+    out.sort((a,b)=>a.converged-b.converged);Object.assign(TUNE,{intensity:out[0].intensity,distanceFalloff:out[0].distanceFalloff});
+    return out;
+  }
+
+  window.n8aoBench={renderer,modes,frame,timings,wallTimings,sweep,n8Error,sdfError,legacyError,TUNE,async run({rounds=30,doSweep=true}={}){
+    status.textContent='Running…';
+    const sweepResult=doSweep?await sweep():null;
+    buildN8();   // timed passes with the tuned look
+    const err={sdf:{perFrame:sdfError(fast),converged:null},sdf_cur:{perFrame:sdfError(current),converged:null},
+      ssao_legacy:{perFrame:legacyError('ssao_legacy'),converged:null},gtao_legacy:{perFrame:legacyError('gtao_legacy'),converged:null}};
+    for(const [k,cfg] of Object.entries(n8Configs)){status.textContent='Scoring '+cfg.label;err[k]=await n8Error(cfg);}
+    status.textContent='Timing (wall clock)…';
+    const t=await wallTimings(rounds);
+    status.textContent='Timing (GPU timer)…';
+    const tq=await timings(Math.max(6,rounds>>2));
+    const off=t.off.p10;
+    const rows=Object.entries(modes).map(([k,m])=>({mode:k,label:m.label,frame_p10_ms:t[k].p10,frame_p50_ms:t[k].p50,ao_cost_p10_ms:+(t[k].p10-off).toFixed(4),
+      timer_p10_ms:tq[k].p10,mae_frame:err[k]?.perFrame??null,mae_converged:err[k]?.converged??null}));
+    status.textContent=`three r${T.REVISION} · WebGL2 · ${dbg?gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL):''} · tune ${JSON.stringify(TUNE)}\n`+
+      rows.map(r=>`${r.label.padEnd(40)} frame p10 ${r.frame_p10_ms.toFixed(3)} (p50 ${r.frame_p50_ms.toFixed(3)})  AO +${r.ao_cost_p10_ms.toFixed(3)} ms  timer ${r.timer_p10_ms.toFixed(3)}  MAE ${r.mae_frame??'—'} / conv ${r.mae_converged??'—'}`).join('\n');
+    return {three:T.REVISION,n8ao:'2.1.0',backend:'WebGL2',renderer:dbg?gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER),
+      width:W,height:H,rounds,timing:'wall clock, 20-frame batches closed by a 1-pixel readback; timer = TIME_ELAPSED over 12 frames',tune:{...TUNE},sweep:sweepResult,rows};
+  }};
+  frame('sdf_cur');
+  status.textContent=`Ready · three r${T.REVISION} · WebGL2 · N8AO 2.1.0 · ${W} × ${H} · timer ${timer?'yes':'NO'}`;
+}catch(e){status.textContent='Error: '+e.message;console.error(e);throw e;}
+</script>
+</html>

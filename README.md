@@ -22,7 +22,7 @@ Limits: up to 16 moving objects, rigid transforms only, and about 5 cm voxels in
 
 ### Timings with all 11 objects moving
 
-These are median GPU elapsed times per draw on an Apple M1 at 1280 × 720 over 25 rounds. The objects moved between rounds. They were measured in a visible browser tab with the render loop paused. This setup reads slower than the static benchmark below, which saw 0.16 ms for SDF wall correction. Here the SDF modes took 0.35–0.41 ms without moving objects in AO, with the objects still drawn. Compare rows within this table.
+These are median GPU elapsed times per draw on an Apple M1 at 1280 × 720 over 25 rounds. The objects moved between rounds. They were measured in a visible browser tab with the render loop paused. This setup reads slower than the static benchmark below, which saw 0.16 ms for SDF wall correction. The SSAO and GTAO rows are multi-pass effects, which this WebGL timer overstates by about 1.4–2× on M1 (see *Static benchmark*), so their ratios here are upper bounds. Here the SDF modes took 0.35–0.41 ms without moving objects in AO, with the objects still drawn. Compare rows within this table.
 
 | Method | Median (ms) | p95 (ms) |
 |---|---:|---:|
@@ -38,6 +38,12 @@ Against these legacy Three.js 0.170 WebGL2 passes, SSAO and GTAO took about 6× 
 ## Static benchmark
 
 The [benchmark](benchmark/final-benchmark.md) compares four-tap SDF AO with the legacy Three.js 0.170 SSAO and GTAO passes on an Apple M1 in the static scene. A [comparison with Three.js r187's WebGPU SSAO and GTAO](benchmark/r187-results.md) finds the SDF about as fast as SSAO at 0.5× and about 7× faster than GTAO 0.5× + TRAA on an M1, with lower AO error: 0.040, against 0.051–0.053 for tuned GTAO and 0.063–0.065 for tuned SSAO. Reaching the SDF's accuracy takes GTAO at full resolution with 64 samples, about 35× the SDF's frame time; SSAO does not reach it at any sample count. It includes [GPU timings](benchmark/final-timings.json), [accuracy measurements](benchmark/final-accuracy.json), and a [side-by-side comparison](benchmark/final-comparison.png) against ray-traced AO. The live FPS counter measures browser frame cadence. The benchmark uses GPU elapsed queries.
+
+[N8AO 2.1](benchmark/n8ao-results.md), the most accurate screen-space AO measured here, was added on Three.js r187 (WebGL2, since N8AO has no WebGPU version yet):
+- **Accuracy:** its configurations score 0.041–0.046 per frame, better than r187's GTAO and SSAO. Its noise-free floor is about 0.040. The SDF's current formula scores 0.027.
+- **Speed:** its cheapest configuration (Performance, half resolution) takes about 2.1 ms a frame against 0.32 ms for the SDF; its AO work costs about 26× the SDF's. Its spatial denoiser alone costs about 0.7 ms, ten times the SDF's whole AO.
+
+**Timer caveat:** on Apple M1 / ANGLE Metal, the WebGL `EXT_disjoint_timer_query_webgl2` timer read 1.4–3× too high for multi-pass effects, compared with wall-clock time closed by a readback. N8AO Medium read 13.4 ms against 5.3 ms, and the legacy GTAOPass 10.4 ms against 5.4 ms. The legacy SSAO/GTAO figures measured with that timer are inflated by the same effect, both in this section and in the moving-object table above. Measured on wall-clock time, r187's legacy SSAOPass and GTAOPass take 2.6 ms and 5.4 ms a frame against the SDF's 0.32 ms: about 8× and 17×, not 24× and 56×. The r187 WebGPU comparison uses WebGPU timestamp queries and is not affected.
 
 The Archive volume was baked from analytic box distances. The runtime AO shader samples the baked volume.
 
