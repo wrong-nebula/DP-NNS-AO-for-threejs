@@ -67,3 +67,20 @@ The AO cost is the frame's wall-clock time over AO off: p10 of 30 interleaved ro
 - the trace, about 0.7 ms;
 - the history fetch, about 0.45 ms, halved by skipping zero-weight taps and storing frames in the normal target's alpha;
 - writing the extra targets plus the copy to the screen, about 0.45 ms.
+
+### Formula blend for young histories
+
+Without help, a pixel whose history just restarted (a camera cut, a surface revealed behind a moving object) shows a one- or two-direction trace: 0.099 error at one frame, and it takes about 16 frames to match the formula. The shown value is therefore a blend of the wall-correction formula and the traced mean, with traced weight `frames / (frames + k)`. Only the traced mean is stored, so the blend never feeds back.
+
+A linear ramp to pure traced over F frames was tried first. It handed over too early: at F = 8, error jumped from 0.0229 to 0.0362 at the hand-over. The open-ended weight has no jump, and it beats either estimate alone at every history length:
+
+| Main view, AO error | Still: 1 / 16 / 64 / 256 frames | Orbit at 1° / 3° / 10° per frame |
+|---|---:|---:|
+| Formula | 0.0270 | 0.0270 |
+| Traced only | 0.0993 / 0.0287 / 0.0191 / 0.0179 | 0.0220 / 0.0270 / 0.0415 |
+| Blend k = 4 | 0.029 / 0.0238 / 0.0181 / 0.0174 | 0.0170 / 0.0191 / 0.0237 |
+| **Blend k = 8 (shipped)** | **0.0262 / 0.0218 / 0.0175 / 0.0170** | **0.0167 / 0.0188 / 0.0225** |
+| Blend k = 16 | 0.0259 / 0.0207 / 0.0170 / 0.0166 | 0.0173 / 0.0197 / 0.0233 |
+
+- **With moving objects** (4 held-out poses, animated for 2 s): 0.0216 over all pixels and 0.0387 near objects. Without the blend: 0.0225 and 0.0392.
+- **Cost:** 4 more texture reads per static pixel, measured at +0.14 ms per frame in an interleaved A/B: 1.44 → 1.58 ms at p10.

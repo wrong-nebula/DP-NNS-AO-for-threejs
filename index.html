@@ -92,6 +92,10 @@ uniform sampler2D normalTex;
 uniform mat4 prevViewProj;
 uniform float frame;
 uniform float histMax;
+// The shown AO blends the four-tap formula with the traced mean, the traced weight frames/(frames+blendK):
+// a cut or a just-revealed surface starts from the formula (never worse than it), and the blend beats either
+// alone at every history length (the two estimators' errors partly cancel).
+uniform float blendK;
 #else
 out vec4 pixel;
 #endif
@@ -328,9 +332,17 @@ void main(){
       frames=min(h.y+1.,histMax);
       aoStatic=mix(h.x,tracedAO(p,normal),1./frames);
     }
-    // Movers add occlusion every frame through the four-tap formula (not accumulated, so nothing lags behind them).
-    ao=dynMask!=0?aoStatic+(aoWallCorrection(dAll,normal)-aoWallCorrection(dStatic,normal))*moverScale.x:aoStatic;
     histOut=vec4(aoStatic,viewDepth,0.,1.);
+    // Shown: formula and traced mean blended (see blendK). Only the traced mean is stored, so the blend never
+    // feeds back into the history.
+    float shown=aoStatic;
+    if(movingFace<.5){
+      vec4 ds=dynMask!=0?dStatic:vec4(staticDistance(p+normal*R.x),staticDistance(p+normal*R.y),
+                                       staticDistance(p+wallCorrectionTap2(normal)),staticDistance(p+wallCorrectionTap3(normal)));
+      shown=mix(aoWallCorrection(ds,normal),aoStatic,frames/(frames+blendK));
+    }
+    // Movers add occlusion every frame through the four-tap formula (not accumulated, so nothing lags behind them).
+    ao=dynMask!=0?shown+(aoWallCorrection(dAll,normal)-aoWallCorrection(dStatic,normal))*moverScale.x:shown;
     normalOut=vec4(normal*.5+.5,frames/255.);
   #elif defined(FAST)
     #ifdef CONTACT
@@ -560,7 +572,9 @@ try {
   const traced={histTex:{value:null},normalTex:{value:null},prevViewProj:{value:new T.Matrix4()},frame:{value:0},
     // Frames the history averages over at most: 128 on a still camera, 32 while it moves (each reprojection
     // resamples the history, so a moving history is kept short). Set per frame in render().
-    histMax:{value:128}};
+    histMax:{value:128},
+    // 8: lowest error across still (1-256 frames) and orbiting cameras; 16 is marginally better still, worse moving.
+    blendK:{value:8}};
   const lastCamera=new T.Matrix4();
   const tracedCopy=new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,uniforms:{src:{value:null}},
     vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',
