@@ -1,6 +1,10 @@
-# DP-NNS AO for Three.js
+# Fast SDF AO
 
-An interactive Three.js ambient occlusion comparison using the Archive scene, with stairs, shelves, and walls, plus 11 moving objects. Orbit the scene, switch among six AO modes, and inspect the live FPS counter or the AO mask.
+Real-time ambient occlusion for Three.js from a baked signed distance field (SDF): four texture reads per pixel, exact distances to moving objects, and a fast exact baker for meshes and point clouds.
+
+The project started from the DP-NNS nearest-neighbour paper, which motivates SDF baking, but it does not use DP-NNS: the baker computes exact distances to triangles with a BVH. *Why not DP-NNS* below explains why, with measurements.
+
+This repository is an interactive Three.js ambient occlusion comparison using the Archive scene, with stairs, shelves, and walls, plus 11 moving objects. Orbit the scene, switch among six AO modes, and inspect the live FPS counter or the AO mask.
 
 Open `index.html` in a WebGL 2 browser. The scene and distance field are embedded. Three.js and its addons load from a pinned CDN URL.
 
@@ -39,7 +43,7 @@ The Archive volume was baked from analytic box distances. The runtime AO shader 
 
 ## Baking a field for your own scene
 
-[`tools/bake_sdf.cpp`](tools/bake_sdf.cpp) bakes the same 128³ clipped signed field from any closed triangle mesh (OBJ) or box list (JSON). It has no dependencies:
+[`tools/bake_sdf.cpp`](tools/bake_sdf.cpp) bakes the same 128³ clipped signed field from any closed triangle mesh (OBJ), box list (JSON) or oriented point cloud (PLY). It has no dependencies:
 
 ```
 c++ -O3 -std=c++17 -pthread tools/bake_sdf.cpp -o bake_sdf
@@ -48,9 +52,51 @@ c++ -O3 -std=c++17 -pthread tools/bake_sdf.cpp -o bake_sdf
 
 Distances are exact (closest point on the nearest triangle), far space is skipped, sign comes from winding numbers, and all cores are used. On an Apple M1, the Archive takes about 35 ms and a 488k-triangle version of it about 150 ms (originally 115 ms and 307 ms; see below). Outside the geometry the output matches the analytic field exactly, and AO accuracy is unchanged. See [precompute.md](benchmark/precompute.md).
 
-DP-NNS was evaluated as an SDF baking accelerator in an earlier experiment. As a seed for this baker it cost more to build than it saved, so the tool doesn't use it.
+### From a point cloud (scans, photogrammetry, splats)
 
-## What I improved on the paper
+```
+./bake_sdf --points scan.ply --lo -1 -1 -1 --span 26 18 8 --res 128 --clip 1.5 --out scan.f32
+```
+
+The input is a PLY vertex list, ASCII or binary little-endian, with `x y z` and optionally `nx ny nz`; other properties are ignored.
+- **Distance:** to the nearest point, found exactly with a BVH over the points (median splits, four points per leaf, built in parallel).
+- **Sign:** from the side of that point's tangent plane. Clouds without normals, such as 3D Gaussian splat exports whose normals are all zero, bake an unsigned field. AO reads the field outside surfaces, where unsigned and signed agree, but thin open surfaces can't be told apart from solids.
+- **Culling:** the same Lipschitz culling as meshes, since distance to a point set is 1-Lipschitz too. A culled voxel takes its reference point's sign: the segment between them stays farther than the clip distance from every point, so it crosses no sampled surface.
+
+`--sample N` (with `--boxes` or `--obj`) bakes from N area-uniform samples of the mesh instead. Samples on surfaces covered by other geometry, such as the underside of a box standing on the floor, are dropped, as a scanner would not see them; a point a hair outside each sample along its normal is tested against the mesh's winding number. `--write-points f.ply` saves the samples.
+
+| Archive, 1M samples requested (852k kept, 148k hidden) | Points | Exact triangles |
+|---|---:|---:|
+| Mean / p95 distance error within AO reach | 8.5 / 19 mm | 0 |
+| Voxels near surfaces with the wrong sign (at contacts) | 0.14% | 0 |
+| AO error vs ray-traced, original four-tap | 0.0428 | 0.0421 |
+
+About 2.5M samples bring the AO error within 1% of the exact field's (see *Why not DP-NNS*). With a mesh, bake from the mesh: it is exact and about 20–30× faster.
+
+### Exactness check
+
+`--validate K` compares K random voxels with brute force after the bake: the distance to every triangle and the winding number of every triangle along the voxel's column (or every point, for point clouds). Any mismatch exits with status 1. [bench_bake.sh](benchmark/bench_bake.sh) runs it on the Archive (50,000 voxels) and the dense mesh (1,000) for every candidate baker. Unlike the bit-identity guard, which only compares with the previous baker, this catches a change that is wrong in a consistent way: a deliberately unsafe culling bound failed it on 1,197 of 20,000 voxels.
+
+## Why not DP-NNS
+
+[DP-NNS](https://arxiv.org/abs/2611.15320) answers exact nearest-neighbour queries over a point set. It records, at each insertion into a Delaunay triangulation, which earlier points the new point became a neighbour of, then walks that graph from a good starting point. A faithful implementation (CGAL Delaunay with exact predicates, the paper's level-consistent parallel build and grid starting points, Morton-ordered queries) was benchmarked against a kd-tree (nanoflann) and the point BVH above, on the 2.1M voxel queries of a 128³ Archive bake. All three return the exact nearest point for every query, so they produce identical fields and only their speed differs. Full results and code: [research/dpnns/RESULTS.md](research/dpnns/RESULTS.md).
+
+| 851k points, 8 threads | Build | 2.1M queries | Total |
+|---|---:|---:|---:|
+| kd-tree (nanoflann) | 50 ms | 1,137 ms | 1,187 ms |
+| BVH over points | 113 ms | 718 ms | **831 ms** |
+| DP-NNS (64³ grid start) | 3,349 ms | 229 ms | 3,578 ms |
+| *Exact triangle bake, for comparison* | | | *30 ms* |
+
+- **Fastest queries, slowest build.** DP-NNS queries are 2.7–5× faster than the kd-tree's and 1.8–4.6× faster than the BVH's, as the paper reports. Its Delaunay build is 18–50× slower than the BVH's, and a 128³ bake doesn't have enough queries to pay that back: break-even is about 8–14M queries on one cloud, a 200³–240³ grid.
+- **Not for meshes.** Turning a mesh into points first loses exactness (8.5 mm mean error at 852k points, wrong signs at contacts), and even the fastest point bake is about 20–30× slower than the exact triangle bake.
+- **Not for real time.** It runs on the CPU, each query walks hundreds of graph edges whose count varies per pixel (a poor fit for GPUs), and moving any point means rebuilding the graph. The shader instead reads the baked field with hardware trilinear filtering. Moving objects use exact analytic distances or rigidly moved baked fields.
+- **Not for this repository's licence.** CGAL's 3D triangulation package is GPL or commercially licensed.
+
+DP-NNS fits many queries against one fixed point cloud: the paper's ICP registration, or AO textures of 2048² and up baked directly from a dense scan.
+
+## What I improved on the first version
+
 
 Every change below keeps the AO exactly as it was:
 - **Static bake:** baked fields are bit-identical to the original wherever the AO can read them.
@@ -130,4 +176,4 @@ Splitting the original cost showed that deciding which objects can affect each p
 
 Measurements and rejected ideas: [speed-plan.md](benchmark/speed-plan.md).
 
-[DP-NNS paper](https://arxiv.org/abs/2611.15320)
+References: [DP-NNS paper](https://arxiv.org/abs/2611.15320)
