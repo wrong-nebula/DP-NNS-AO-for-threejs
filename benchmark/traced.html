@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archive AO · hemisphere-traced SDF AO (Three.js r187, WebGL2)</title>
+<style>body{margin:0;background:#121821;color:#f1f5f8;font:15px system-ui,sans-serif}main{max-width:1320px;margin:auto;padding:20px}canvas{display:block;width:100%;height:auto}pre{white-space:pre-wrap;color:#c4d0db}</style>
+<main><h1>Archive AO · hemisphere-traced SDF AO</h1>
+<p>Same scene, camera and 1280 × 720 resolution as <code>n8ao.html</code>. Run <code>await tracedBench.run()</code> in the console.</p>
+<div id="view"></div><pre id="status">Loading…</pre></main>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.module.js"}}</script>
+<script type="module">
+// Hemisphere-traced SDF AO: per pixel, DIRS cosine-weighted directions are sphere-traced through the baked
+// field up to R = 1.12 m; a direction is blocked when the field drops below min(EPS, K * t * (w.n)), where
+// t*(w.n) is the distance to the pixel's own tangent plane (so its own surface never counts). AO is the
+// unblocked fraction, the same quantity the 512-ray reference measures.
+// Directions: per frame a Fibonacci set of DIRS directions, rotated per pixel (interleaved gradient noise) and
+// offset per frame by golden-ratio sequences in cosine stratum and azimuth; FRAMES accumulated frames on a still
+// camera fill DIRS * FRAMES stratified directions. (A stride through one big Fibonacci set put each frame's
+// directions in a narrow azimuth wedge: one-frame error 0.09 at 8 directions instead of 0.045.) Parameters fitted on 3 views of the Archive (CPU prototype,
+// GPU-faithful filtering) and checked on 3 held-out views: EPS .025, K .1, 24 steps, min step .04, start .02.
+// Timing: wall clock over 20-frame batches closed by a 1-pixel readback (see n8ao-results.md for why).
+import * as T from 'three';
+const W=1280,H=720;
+const status=document.querySelector('#status');
+const vertexShader=`
+out vec3 p;out vec3 n;in float wall;flat out float wallFace;
+void main(){vec4 world=modelMatrix*instanceMatrix*vec4(position,1.);p=world.xyz;
+  n=normalize(mat3(modelMatrix)*mat3(instanceMatrix)*normal);wallFace=wall;gl_Position=projectionMatrix*viewMatrix*world;}`;
+const fragmentShader=`
+precision highp float;precision highp sampler3D;
+uniform sampler3D field;uniform bool showMask;uniform float frame;
+in vec3 p;in vec3 n;flat in float wallFace;out vec4 pixel;
+const vec3 scale=1./vec3(26.,18.,8.);
+const vec4 R=vec4(.16,.48,.80,1.12);
+float staticDistance(vec3 pos){vec3 uv=(pos+1.)*scale;
+  if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return 1e4;return texture(field,uv).r;}
+vec3 wallCorrectionTap2(vec3 n){float h=n.z*n.z;return n*vec3(.7,.7,.7+.1*h)-vec3(0.,0.,.4*(1.-h));}
+vec3 wallCorrectionTap3(vec3 n){float h=n.z*n.z;return n*vec3(.5657,.5657,.5657+.5543*h)+vec3(0.,0.,.5657*(1.-h));}
+float aoWallCorrection(vec4 d,vec3 normal){
+  float vertical=wallFace*(1.-abs(normal.z));float k=.92/2.9;
+  vec4 v=clamp(1.-(d+vec4(.1523,-.0624,.4135,-.2624))/vec4(R.xyz,.8),0.,1.);
+  float wallAO=clamp(1.1356-(7.212*v.x*v.x+.4812*v.y+.1365*v.z+.1172*v.w),0.,1.);
+  vec4 s=clamp(1.-(d+vec4(.024,.078,0.,.02))/R,0.,1.);
+  float far=s.w*s.w;far*=far;far*=far;
+  float flatAO=1.-k*(s.x*s.x+.8166666667*sqrt(s.y)+.6333333333*sqrt(s.z)+.45*far);
+  vec4 u=clamp(1.-(d+vec4(-.0644,.0633,.1349,.1475))/vec4(R.xy,.8,.8),0.,1.);
+  float sideAO=clamp(1.106-(.1429*u.x*u.x+.1795*sqrt(u.y)+.2928*sqrt(u.z)+.2654*u.w),0.,1.);
+  return mix(normal.z>.7?flatAO:sideAO,wallAO,vertical);}
+#ifdef DIRS
+float ign(vec2 q){return fract(52.9829189*fract(dot(q,vec2(.06711056,.00583715))));}
+float tracedAO(vec3 p,vec3 n){
+  vec3 a=abs(n.x)<.9?vec3(1.,0.,0.):vec3(0.,1.,0.);
+  vec3 t=normalize(cross(n,a)),b=cross(n,t);
+  float rot=6.2831853*ign(gl_FragCoord.xy);
+  float blocked=0.;
+  // Each frame: its own Fibonacci set of DIRS directions, offset in u (cosine strata) and azimuth by golden-ratio
+  // sequences of the frame index, so every frame covers the hemisphere and FRAMES frames fill the strata evenly.
+  float fo=mod(frame,float(FRAMES)),g1=fract(fo*.6180339887),g2=fract(fo*.7548776662);
+  for(int i=0;i<DIRS;i++){
+    float u=(float(i)+g1)/float(DIRS),phi=float(i)*2.39996323+6.2831853*g2+rot;
+    vec3 w=t*(sqrt(u)*cos(phi))+b*(sqrt(u)*sin(phi))+n*sqrt(1.-u);
+    float cosn=dot(w,n),s=.02;
+    for(int k=0;k<24;k++){
+      float d=staticDistance(p+w*s);
+      if(d<min(.025,.1*s*cosn)){blocked+=1.;break;}
+      s+=max(d,.04);
+      if(s>1.12)break;
+    }
+  }
+  return 1.-blocked/float(DIRS);
+}
+#endif
+void main(){
+  vec3 normal=normalize(n);float ao=1.;
+  #if defined(DIRS)
+    ao=tracedAO(p,normal);
+  #elif defined(CURRENT)
+    vec4 d=vec4(staticDistance(p+normal*R.x),staticDistance(p+normal*R.y),
+                staticDistance(p+wallCorrectionTap2(normal)),staticDistance(p+wallCorrectionTap3(normal)));
+    ao=aoWallCorrection(d,normal);
+  #endif
+  if(showMask){pixel=vec4(vec3(ao),1.);return;}
+  float sun=max(0.,dot(normal,normalize(vec3(-.4,-.55,1.))));
+  vec3 albedo=mix(vec3(.28,.34,.43),vec3(.64,.69,.75),clamp(p.z/4.+.14,0.,1.));
+  if(p.z<.005)albedo=vec3(.37,.41,.44);
+  pixel=vec4(pow(albedo*(.26*sun+.74*ao),vec3(1./2.2)),1.);}`;
+try{
+  const [volume,boxes,refBuf]=await Promise.all(['archive.f32','archive.json','ref_static.f32'].map(f=>fetch(f).then(r=>{if(!r.ok)throw Error('missing '+f);return f.endsWith('json')?r.json():r.arrayBuffer();})));
+  const src=new Float32Array(volume);
+  const field=new T.Data3DTexture(Uint16Array.from(src,v=>T.DataUtils.toHalfFloat(v)),128,128,128);
+  field.format=T.RedFormat;field.type=T.HalfFloatType;field.minFilter=field.magFilter=T.LinearFilter;field.needsUpdate=true;
+  const renderer=new T.WebGLRenderer({antialias:false,preserveDrawingBuffer:true});
+  renderer.setPixelRatio(1);renderer.setSize(W,H,false);document.querySelector('#view').append(renderer.domElement);
+  const gl=renderer.getContext();
+  const scene=new T.Scene();scene.background=new T.Color('#17212e');
+  const camera=new T.PerspectiveCamera(37,W/H,.1,100);camera.up.set(0,0,1);camera.position.set(18,-4,7.3);camera.lookAt(10.8,8.8,1.4);camera.updateMatrixWorld();
+  const mask={value:false},frameU={value:0};
+  const mat=defines=>new T.ShaderMaterial({glslVersion:T.GLSL3,vertexShader,fragmentShader,defines,uniforms:{field:{value:field},showMask:mask,frame:frameU}});
+  const modes={off:{label:'AO off',material:mat({}),frames:1},cur:{label:'4-tap SDF (current wall correction)',material:mat({CURRENT:1}),frames:1}};
+  for(const [dirs,frames] of [[2,32],[4,16],[8,8],[16,4],[32,2],[64,1]])modes[`tr${dirs}`]={label:`Traced, ${dirs} dirs/frame (${dirs*frames} accumulated)`,material:mat({DIRS:dirs,FRAMES:frames}),frames,dirs};
+  const mesh=new T.InstancedMesh(new T.BoxGeometry(1,1,1),modes.off.material,boxes.length);
+  const walls=new Float32Array(boxes.length);walls[1]=walls[2]=1;mesh.geometry.setAttribute('wall',new T.InstancedBufferAttribute(walls,1));
+  const m4=new T.Matrix4();boxes.forEach(([x,y,z,hx,hy,hz],i)=>mesh.setMatrixAt(i,m4.makeScale(2*hx,2*hy,2*hz).setPosition(x,y,z)));
+  scene.add(mesh);
+  let f=0;
+  const frame=(k,target=null)=>{mesh.material=modes[k].material;frameU.value=f++;renderer.setRenderTarget(target);renderer.render(scene,camera);};
+
+  // ---- AO error: one frame, and the average of FRAMES frames (the full direction set) -------------------
+  const ref=new Float32Array(refBuf);
+  const rt=new T.WebGLRenderTarget(W,H,{type:T.FloatType});
+  const buf=new Float32Array(W*H*4);
+  async function aoImage(k,frames){
+    mask.value=true;const acc=new Float32Array(W*H);
+    for(let i=0;i<frames;i++){frameU.value=i;mesh.material=modes[k].material;renderer.setRenderTarget(rt);renderer.render(scene,camera);
+      await renderer.readRenderTargetPixelsAsync(rt,0,0,W,H,buf);for(let q=0;q<W*H;q++)acc[q]+=buf[4*q]/frames;}
+    renderer.setRenderTarget(null);mask.value=false;return acc;
+  }
+  function mae(acc){let s=0,n=0;   // render targets are bottom-up
+    for(let j=0;j<180;j++)for(let i=0;i<320;i++){const r=ref[j*320+i];if(!Number.isFinite(r))continue;
+      s+=Math.abs(acc[(H-1-(2+4*j))*W+2+4*i]-r);n++;}return +(s/n).toFixed(5);}
+  async function errors(){
+    const out={};
+    for(const k of Object.keys(modes)){if(k==='off')continue;const m=modes[k];
+      out[k]={frame:mae(await aoImage(k,1)),accumulated:m.frames>1?mae(await aoImage(k,m.frames)):null};
+      status.textContent='Scored '+m.label;}
+    return out;
+  }
+  // ---- timing ----------------------------------------------------------------------------------------------
+  const quant=(a,p)=>{const s=[...a].sort((x,y)=>x-y);return s[Math.min(s.length-1,Math.floor(p*(s.length-1)))];};
+  const px1=new Uint8Array(4);const sync=()=>gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px1);
+  function wallMs(k,n=20){for(let i=0;i<2;i++)frame(k);sync();const t0=performance.now();for(let i=0;i<n;i++)frame(k);sync();return (performance.now()-t0)/n;}
+  async function timings(rounds=30){
+    const keys=Object.keys(modes),t=Object.fromEntries(keys.map(k=>[k,[]]));
+    for(const k of keys){for(let i=0;i<10;i++)frame(k);sync();}
+    for(let r=0;r<rounds;r++){for(let j=0;j<keys.length;j++){const k=keys[(r+j)%keys.length];t[k].push(wallMs(k));}await new Promise(r=>setTimeout(r,0));}
+    return Object.fromEntries(keys.map(k=>[k,{p10:+quant(t[k],.1).toFixed(3),p50:+quant(t[k],.5).toFixed(3)}]));
+  }
+  window.tracedBench={renderer,modes,frame,errors,timings,aoImage,mae,async run({rounds=30}={}){
+    status.textContent='Scoring…';const err=await errors();status.textContent='Timing…';const t=await timings(rounds);
+    const off=t.off.p10;
+    const rows=Object.entries(modes).map(([k,m])=>({mode:k,label:m.label,frame_p10_ms:t[k].p10,frame_p50_ms:t[k].p50,ao_cost_p10_ms:+(t[k].p10-off).toFixed(3),mae_frame:err[k]?.frame??null,mae_accumulated:err[k]?.accumulated??null}));
+    status.textContent=rows.map(r=>`${r.label.padEnd(44)} frame p10 ${r.frame_p10_ms.toFixed(3)} (p50 ${r.frame_p50_ms.toFixed(3)})  AO +${r.ao_cost_p10_ms.toFixed(3)} ms  MAE ${r.mae_frame??'—'} / acc ${r.mae_accumulated??'—'}`).join('\n');
+    return {three:T.REVISION,width:W,height:H,rounds,rows};
+  }};
+  frame('tr4');
+  status.textContent=`Ready · three r${T.REVISION} · WebGL2 · ${W} × ${H}`;
+}catch(e){status.textContent='Error: '+e.message;console.error(e);throw e;}
+</script>
+</html>
