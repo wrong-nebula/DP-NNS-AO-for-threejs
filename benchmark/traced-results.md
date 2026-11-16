@@ -138,3 +138,21 @@ Frame time, wall clock, p10 / p50, 12 interleaved rounds:
 | **Deferred, half resolution** | **1.21 / 1.27 ms** | **1.25 / 1.35 ms** |
 
 A noisier 3-way run put deferred at full resolution at 2.10 / 2.58 ms (still / orbiting): the full-resolution geometry pass costs more than it saves. The AO mask showed no blockiness or halos at outlines at half resolution.
+
+### Soft visibility (traced-ao Thermite campaign, champion 2)
+
+The traced-ao campaign optimizes a numpy model of the estimator, [accuracy/traced_ao.py](../accuracy/traced_ao.py), against [its contract](../thermite/traced-ao.contract.json):
+- **Simulation:** 64 frames on a still camera with the viewer's accumulation rule, at 20,000 pixels of each of the six views.
+- **Score:** error after 16 frames.
+- **Hard limits:** at most 14.25 field reads per pixel per frame (the seed uses 14.0); no worse than the seed after 1 or 64 frames.
+
+Champion 2 replaced the hard hit test with soft visibility per direction: the closest approach, `min over steps of clamp((d + e) / (4e), 0, 1)` with `e = min(0.025, 0.1 · t · (w·n))`. Rays march until `d < -e`, with steps of at least 7.2 cm, up from 6 cm. On the CPU model it scored 5.7% better on the 16-frame score, and 4–6% better on each held-out view.
+
+| Main view, GPU (M1, 1280 × 720, half resolution) | Hard hit (before) | Soft visibility |
+|---|---:|---:|
+| Still: 1 / 4 / 16 / 64 / 256 frames | 0.0250 / 0.0220 / 0.0178 / 0.0160 / 0.0160 | **0.0249 / 0.0217 / 0.0172 / 0.0153 / 0.0153** |
+| Orbit at 1° / 3° / 10° per frame | 0.0164 / 0.0182 / 0.0212 | **0.0162 / 0.0174 / 0.0206** |
+| Moving objects (4 held-out poses): near / all | 0.0382 / 0.0202 | **0.0380 / 0.0196** |
+| Frame, still / orbiting (p10, 12 interleaved rounds) | 1.11 / 1.21 ms | 1.11 / 1.24 ms (no change) |
+
+The GPU gain at 16 frames (3.4%) is smaller than the CPU model's (5.7%), as expected: the half-resolution upsampling already averages some of the noise the soft visibility removes.
