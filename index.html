@@ -21,6 +21,7 @@ nav label{display:flex;align-items:center;gap:5px;padding:6px}
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
 <script type="module">
 import * as T from 'three';
+import {CONTACT_GLSL,buildContactBVH} from './contact-bvh.js';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
 import {SSAOPass} from 'three/addons/postprocessing/SSAOPass.js';
 import {GTAOPass} from 'three/addons/postprocessing/GTAOPass.js';
@@ -371,39 +372,10 @@ float staticDistance(vec3 pos){
   if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return 1e4;
   return texture(field,uv).r;
 }
-// "Traced SDF (temporal)": the static scene's AO as the 512-ray reference defines it, the unblocked fraction
-// of cosine-weighted directions out to 1.12 m, traced through the baked field. DIRS directions a frame
-// (a Fibonacci set rotated per pixel, the rotation and the set's cosine stratum and azimuth offsets changing
-// every frame) are blended into a reprojected history. Each direction's visibility is soft, from its closest
-// approach to the scene relative to e = min(.025, .1*t*(w.n)); t*(w.n) is the distance to the pixel's own tangent
-// plane, so its own surface never counts. Fitted on 3 views, checked on 3 held out (benchmark/traced-results.md);
-// the soft visibility came from the traced-ao Thermite campaign (accuracy/traced_ao.py is its numpy model).
+// Front-loaded champion directions and its far SDF march, with exact triangle
+// visibility over the skipped near segment plus half a field-cell diagonal.
 float ign(vec2 q){return fract(52.9829189*fract(dot(q,vec2(.06711056,.00583715))));}
-float tracedAO(vec3 p,vec3 n){
-  vec3 a=abs(n.x)<.9?vec3(1.,0.,0.):vec3(0.,1.,0.);
-  vec3 t=normalize(cross(n,a)),b=cross(n,t);
-  float rot=6.2831853*ign(gl_FragCoord.xy+5.588238*mod(frame,64.)),g1=fract(frame*.6180339887),g2=fract(frame*.7548776662);
-  float vis=0.;
-  for(int i=0;i<DIRS;i++){
-    float u=(float(i)+g1)/float(DIRS),phi=float(i)*2.39996323+6.2831853*g2+rot;
-    vec3 w=t*(sqrt(u)*cos(phi))+b*(sqrt(u)*sin(phi))+n*sqrt(1.-u);
-    float cosn=dot(w,n),s=.02,v=1.;
-    // Soft visibility (traced-ao campaign, champion 2): the closest approach, min over steps of
-    // clamp((d+e)/(4e)), e = min(.025, .1*t*(w.n)). The ramp straddles the hard test d < e (from -e to 3e), so
-    // its mean stays close to it while each direction carries a continuous value (less noise per frame); the ray
-    // stops once d < -e. Steps of at least 7.2 cm pay for the longer marching.
-    for(int k=0;k<16;k++){
-      float d=staticDistance(p+w*s);
-      float e=min(.025,.1*s*cosn);
-      v=min(v,clamp((d+e)/(4.*e),0.,1.));
-      if(d<-e)break;
-      s+=max(d,.072);
-      if(s>1.12)break;
-    }
-    vis+=v;
-  }
-  return vis/float(DIRS);
-}
+${CONTACT_GLSL.replace('candidateAO(', 'tracedAO(')}
 // The previous frame's accumulated static AO at p: p projected with the previous camera, the four history
 // texels around it weighted bilinearly, each only if it saw the same surface (view depth within 3% + 1 cm,
 // normals within ~25 degrees) and holds a static-surface history. x: AO, y: frames (0 = none).
@@ -646,8 +618,8 @@ try {
     // Frames the history averages over at most: 128 on a still camera, 32 while it moves (each reprojection
     // resamples the history, so a moving history is kept short). Set per frame in render().
     histMax:{value:128},
-    // 8: lowest error across still (1-256 frames) and orbiting cameras; 16 is marginally better still, worse moving.
-    blendK:{value:8},
+    // Front-loaded 4/3/2-direction sampling converges sooner than the shipped seed.
+    blendK:{value:3},
     // 1: every AO pixel traces every frame. 4 (aoDemo.traced.tileRate.value=4): 8x8 tiles take turns, a quarter
     // tracing each frame (at full resolution it cut ~0.43 ms but converged 4x slower), so it is off.
     tileRate:{value:1},
@@ -681,6 +653,23 @@ try {
   const matrix=new T.Matrix4();
   boxes.forEach(([x,y,z,hx,hy,hz],i)=>mesh.setMatrixAt(i,matrix.makeScale(2*hx,2*hy,2*hz).setPosition(x,y,z)));
   scene.add(mesh);
+  // The static contact accelerator is independent of the baked far-distance field.
+  // Rebuilding this resource does not rebake that field; update both when changing
+  // static geometry beyond the contact range.
+  let contactResources;
+  const contactRange=.12+.5*Math.hypot(26/field.image.width,18/field.image.height,8/field.image.depth);
+  function rebuildStaticContact(objects=[mesh],{gridSize=1,range=contactRange,bias=.0003}={}){
+    const start=performance.now(),next=buildContactBVH(objects,T,{gridSize,range:range+Math.abs(bias),maxTextureSize:renderer.capabilities.maxTextureSize,max3DTextureSize:renderer.getContext().getParameter(renderer.getContext().MAX_3D_TEXTURE_SIZE)});
+    Object.assign(aoPass.material.uniforms,next.uniforms,{contactRange:{value:range},contactBias:{value:bias}});
+    const previous=contactResources;
+    contactResources={...next,range,bias,gridSize,buildMs:performance.now()-start};
+    previous?.dispose();
+    traced.frame.value=0;
+    for(const rt of histories){renderer.setRenderTarget(rt);renderer.clear();}
+    renderer.setRenderTarget(null);
+    return {triangles:next.triangles,nodes:next.nodes,bytes:next.bytes,gridDims:next.gridDims,maxTreeNodes:next.maxTreeNodes,range,bias,gridSize,buildMs:contactResources.buildMs};
+  }
+  rebuildStaticContact();
   // Each mover is drawn as a one-instance InstancedMesh so it shares the scene shader.
   for(const m of movers){
     m.geometry.setAttribute('wall',new T.InstancedBufferAttribute(new Float32Array([0]),1));
@@ -828,7 +817,7 @@ try {
   document.querySelector('#dynao').onchange=event=>{dynamicAO=event.target.checked;updateMovers(simTime);resetFps();};
   document.querySelector('#forcemesh').onchange=event=>{forceMesh=event.target.checked;if(forceMesh)ensureAllBaked();updateMovers(simTime);resetFps();};
   // Debug hook for timing from the console.
-  window.aoDemo={renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,bakeSyncMs,bakeGpuMs,totalTris,get atlas(){return baked.tex;},meshRes:MESH_RES,setMask:on=>{mask.value=on;},setMoverScale:(x,y=x,z=x,w=x)=>dyn.moverScale.value.set(x,y,z,w),select:mode=>select(mode),
+  window.aoDemo={scene,mesh,boxes,T,aoPass,field,get contactResources(){return contactResources;},rebuildStaticContact,renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,bakeSyncMs,bakeGpuMs,totalTris,get atlas(){return baked.tex;},meshRes:MESH_RES,setMask:on=>{mask.value=on;},setMoverScale:(x,y=x,z=x,w=x)=>dyn.moverScale.value.set(x,y,z,w),select:mode=>select(mode),
     setDynamicAO:on=>{dynamicAO=on;updateMovers(simTime);},traced,
     resetHistory:()=>{for(const rt of histories){renderer.setRenderTarget(rt);renderer.clear();}renderer.setRenderTarget(null);},
     setAOScale:scale=>{aoScale=scale;makeTracedTargets(scale);},
