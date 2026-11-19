@@ -10,7 +10,11 @@
 nav label{display:flex;align-items:center;gap:5px;padding:6px}
 #status{color:#c4d0db}
 </style>
-<main><h1>Archive AO viewer · moving geometry</h1><p>Drag to orbit · Scroll to zoom · Right-drag to pan</p><nav aria-label="Ambient occlusion method">
+<main><h1>Fast SDF AO · interactive viewer</h1><p>Drag to orbit · Scroll to zoom · Right-drag to pan</p><nav aria-label="Scene selector" style="margin-bottom:8px">
+<span style="display:flex;align-items:center;color:#9fb0c4;font-size:14px;padding-right:4px">Scene:</span>
+<button data-scene="archive" aria-pressed="true">Archive (Boxes)</button>
+<button data-scene="atrium" aria-pressed="false">Atrium (Curved)</button>
+</nav><nav aria-label="Ambient occlusion method">
 <button data-taps="0" aria-pressed="true">AO off</button>
 <button data-taps="4" aria-pressed="false">Original SDF</button>
 <button data-taps="14" aria-pressed="false">SDF wall correction</button>
@@ -41,8 +45,10 @@ in float wall;
 in vec3 boundsHalf; // half extents of the (centered) geometry, in instance space
 in float selfSkip; // mover index if this instance is a convex mover, else -1
 in float moving; // 1 on moving objects (their surfaces keep no AO history)
+in vec3 surfAlbedo;
 flat out float wallFace;
 flat out float movingFace;
+out vec3 vSurfAlbedo;
 #define MAX_DYN ${MAX_DYN}
 uniform vec4 dynSphere[MAX_DYN];
 uniform int dynCount;
@@ -66,6 +72,7 @@ void main(){
   n=normalize(mat3(modelMatrix)*mat3(instanceMatrix)*normal);
   wallFace=wall;
   movingFace=moving;
+  vSurfAlbedo=surfAlbedo;
   gl_Position=projectionMatrix*viewMatrix*world;
 }`;
 const fragmentShader=`
@@ -83,6 +90,8 @@ in vec3 n;
 flat in float wallFace;
 flat in float movingFace;
 flat in int instMask;
+in vec3 vSurfAlbedo;
+uniform int sceneId;
 #if defined(GBUFFER)
 // Geometry pass for the traced AO (at the AO resolution): world position and view depth; normal and a moving flag.
 layout(location=0) out vec4 pixel;
@@ -182,7 +191,8 @@ vec3 acesToneMap(vec3 x){
 vec3 linearToSrgb(vec3 c){
   return mix(12.92*c,1.055*pow(max(c,vec3(0.)),vec3(1./2.4))-.055,step(vec3(.0031308),c));
 }
-const vec3 scale=1./vec3(26.,18.,8.);
+uniform vec3 sdfMin;
+uniform vec3 sdfInvSpan;
 // Moving objects: rigid world->local transforms, a shape type and its parameters.
 // They are not in the baked scene field; their distance is evaluated here and
 // min()'d in. Types: 0 box, 1 sphere, 2 capsule, 3 cylinder, 4 rounded box,
@@ -198,7 +208,7 @@ uniform vec4 dynSphere[MAX_DYN]; // world center, bounding radius
 // if the object is within r-.045 of the tap point). See the test in main().
 int dynMask=0;
 float staticDistance(vec3 pos){
-  vec3 uv=(pos+1.)*scale;
+  vec3 uv=(pos-sdfMin)*sdfInvSpan;
   if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return 1e4;
   float d=texture(field,uv).r;
   #ifdef PACKED
@@ -507,8 +517,13 @@ void main(){
   if(showMask){pixel=vec4(vec3(ao),1.);return;}
   vec3 sunDir=normalize(vec3(-.4,-.55,1.));
   float sun=max(0.,dot(normal,sunDir));
-  vec3 albedo=mix(vec3(.28,.34,.43),vec3(.64,.69,.75),clamp(p.z/4.+.14,0.,1.));
-  if(p.z<.005)albedo=vec3(.37,.41,.44);
+  vec3 albedo;
+  if(sceneId==1){
+    albedo=vSurfAlbedo;
+  }else{
+    albedo=mix(vec3(.28,.34,.43),vec3(.64,.69,.75),clamp(p.z/4.+.14,0.,1.));
+    if(p.z<.005)albedo=vec3(.37,.41,.44);
+  }
   if(pbrMode){
     vec3 bentN=normal;
     #if defined(TRACED)
@@ -568,7 +583,8 @@ layout(location=1) out vec4 normalOut;
 #ifdef BENT_NORMALS
 layout(location=2) out vec4 bentOut;
 #endif
-const vec3 scale=1./vec3(26.,18.,8.);
+uniform vec3 sdfMin;
+uniform vec3 sdfInvSpan;
 vec2 octEncode(vec3 n){
   n/=abs(n.x)+abs(n.y)+abs(n.z);
   if(n.z<0.)n.xy=(1.-abs(n.yx))*vec2(n.x>=0.?1.:-1.,n.y>=0.?1.:-1.);
@@ -581,7 +597,7 @@ vec3 octDecodeRaw(vec2 e){
   return v;
 }
 float staticDistance(vec3 pos){
-  vec3 uv=(pos+1.)*scale;
+  vec3 uv=(pos-sdfMin)*sdfInvSpan;
   if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return 1e4;
   return texture(field,uv).r;
 }
@@ -916,10 +932,16 @@ try {
     // on (0.0175 at 256 frames; 32 settles at 0.0188).
     settleFrames:{value:64},smoothFalloff:{value:0},
     aoTex:{value:null},aoNormalTex:{value:null},aoBentTex:{value:null}};
+  const sdfUniforms={
+    field:{value:field},
+    sdfMin:{value:new T.Vector3(-1,-1,-1)},
+    sdfInvSpan:{value:new T.Vector3(1/26,1/18,1/8)},
+    sceneId:{value:0},
+  };
   // Also restore clean cumulative Halton(2,3) indexing when nd=4/3/2, avoiding any low-bit aliasing
   // when nd drops to 1 ray on converged low-variance pixels.
   const makeAOPass=extraDefines=>new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,defines:{DIRS:2,...extraDefines},
-    uniforms:{field:{value:field},gPos:{value:gTarget.textures[0]},gNormal:{value:gTarget.textures[1]},histTex:{value:histories[0].textures[0]},normalTex:{value:histories[0].textures[1]},bentTex:{value:null},hizTex1:{value:hiz1.texture},hizTex2:{value:hiz2.texture},
+    uniforms:{field:sdfUniforms.field,sdfMin:sdfUniforms.sdfMin,sdfInvSpan:sdfUniforms.sdfInvSpan,gPos:{value:gTarget.textures[0]},gNormal:{value:gTarget.textures[1]},histTex:{value:histories[0].textures[0]},normalTex:{value:histories[0].textures[1]},bentTex:{value:null},hizTex1:{value:hiz1.texture},hizTex2:{value:hiz2.texture},
       prevViewProj:traced.prevViewProj,prevView:traced.prevView,curViewProj:traced.curViewProj,curView:traced.curView,invProjXY:traced.invProjXY,frame:traced.frame,contactMode:traced.contactMode,smoothFalloff:traced.smoothFalloff,histMax:traced.histMax,settleFrames:traced.settleFrames,tileRate:traced.tileRate},
     vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',fragmentShader:aoPassFragment}));
   const aoPass=makeAOPass({});
@@ -930,11 +952,11 @@ try {
   const makeMaterials=extra=>Object.fromEntries(variants.map(mode=>[mode,new T.ShaderMaterial({
     glslVersion:T.GLSL3,vertexShader,fragmentShader,
     defines:{...(mode===64?{TRACED:1,DIRS:2}:mode===34?{FAST:1,CONTACT:1}:mode===14?{FAST:1}:{TAPS:mode}),...extra},
-    uniforms:{field:{value:field},showMask:mask,pbrMode,...dyn,...traced}
+    uniforms:{...sdfUniforms,showMask:mask,pbrMode,...dyn,...traced}
   })]));
   const materials=makeMaterials({}),staticMaterials=makeMaterials({NO_DYN:1});
   const gMaterial=new T.ShaderMaterial({glslVersion:T.GLSL3,vertexShader,fragmentShader,defines:{GBUFFER:1,NO_DYN:1,TAPS:0},
-    uniforms:{field:{value:field},showMask:mask,pbrMode,...dyn,...traced}});
+    uniforms:{...sdfUniforms,showMask:mask,pbrMode,...dyn,...traced}});
   if(!boxes.length||boxes.some(b=>b.length!==6||b.some(v=>!Number.isFinite(v))))throw Error('Invalid geometry');
   const mesh=new T.InstancedMesh(new T.BoxGeometry(1,1,1),materials[0],boxes.length);
   const walls=new Float32Array(boxes.length);
@@ -943,6 +965,7 @@ try {
   mesh.geometry.setAttribute('selfSkip',new T.InstancedBufferAttribute(new Float32Array(boxes.length).fill(-1),1));
   mesh.geometry.setAttribute('moving',new T.InstancedBufferAttribute(new Float32Array(boxes.length),1));
   mesh.geometry.setAttribute('boundsHalf',new T.InstancedBufferAttribute(new Float32Array(boxes.length*3).fill(.5),3));
+  mesh.geometry.setAttribute('surfAlbedo',new T.InstancedBufferAttribute(new Float32Array(boxes.length*3),3));
   const matrix=new T.Matrix4();
   boxes.forEach(([x,y,z,hx,hy,hz],i)=>mesh.setMatrixAt(i,matrix.makeScale(2*hx,2*hy,2*hz).setPosition(x,y,z)));
   scene.add(mesh);
@@ -971,6 +994,7 @@ try {
     m.geometry.setAttribute('selfSkip',new T.InstancedBufferAttribute(new Float32Array([m.type<=4?movers.indexOf(m):-1]),1));
     m.geometry.setAttribute('boundsHalf',new T.InstancedBufferAttribute(new Float32Array(m.half),3));
     m.geometry.setAttribute('moving',new T.InstancedBufferAttribute(new Float32Array([1]),1));
+    m.geometry.setAttribute('surfAlbedo',new T.InstancedBufferAttribute(new Float32Array([0,0,0]),3));
     m.object=new T.InstancedMesh(m.geometry,materials[0],1);
     m.object.instanceMatrix.setUsage(T.DynamicDrawUsage);
     m.object.frustumCulled=false;
@@ -1005,6 +1029,7 @@ try {
   }
   const rigid=new T.Matrix4(),euler=new T.Euler();
   let dynamicAO=true,animate=true,forceMesh=false,simTime=0,lastNow=0;
+  let activeScene='archive',atriumMesh=null,atriumField=null,atriumMeta=null,atriumLoading=null;
   function updateMovers(t){
     movers.forEach((m,i)=>{
       const {x,y,z,rx=0,ry=0,rz=0}=m.pose(t);
@@ -1016,7 +1041,7 @@ try {
       m.object.setMatrixAt(0,rigid);
       m.object.instanceMatrix.needsUpdate=true;
     });
-    dyn.dynCount.value=dynamicAO?movers.length:0;
+    dyn.dynCount.value=(activeScene==='archive'&&dynamicAO)?movers.length:0;
     fillCells();
   }
   updateMovers(0);
@@ -1046,16 +1071,17 @@ try {
   const scratch=new T.WebGLRenderTarget(W,H,{depthBuffer:false});
   const screenMaterial=new T.ShaderMaterial({
     glslVersion:T.GLSL3,vertexShader,fragmentShader,
-    defines:{TAPS:0,SCREEN_AO:1},uniforms:{aoMap:{value:null},showMask:mask,pbrMode,...dyn}
+    defines:{TAPS:0,SCREEN_AO:1},uniforms:{...sdfUniforms,aoMap:{value:null},showMask:mask,pbrMode,...dyn}
   });
   const controls=new OrbitControls(camera,renderer.domElement);
   controls.target.set(10.8,8.8,1.4);
   controls.minDistance=1.5;
   controls.maxDistance=45;
   controls.update();
-  renderer.domElement.setAttribute('aria-label','3D Archive test scene with stairs, shelves, walls and moving objects');
+  renderer.domElement.setAttribute('aria-label','3D AO test scene (Archive boxes or Curved Atrium rotunda)');
   function setMaterial(material){
     mesh.material=material;
+    if(atriumMesh)atriumMesh.material=material;
     for(const m of movers)m.object.material=material;
   }
   function render(taps){
@@ -1104,6 +1130,7 @@ try {
     renderer.render(scene,camera);
   }
   const buttons=[...document.querySelectorAll('button[data-taps]')];
+  const sceneButtons=[...document.querySelectorAll('button[data-scene]')];
   const fpsValue=document.querySelector('#fps-value');
   const frameMs=document.querySelector('#frame-ms');
   const bakeNote=` · baked ${meshMovers.length} mesh SDFs (${MESH_RES}³, ${totalTris.toLocaleString()} triangles) in ${bakeSyncMs.toFixed(0)} ms`;
@@ -1116,14 +1143,88 @@ try {
     fpsValue.textContent='— FPS';
     frameMs.textContent='Measuring…';
   }
+  function updateStatus(){
+    const label=buttons.find(button=>Number(button.dataset.taps)===selected).textContent;
+    if(activeScene==='atrium'&&atriumMeta){
+      status.value=`Atrium (Curved, ${atriumMeta.triangles.toLocaleString()} tris) · ${label} · 1280 × 720 · 1.12 m AO radius · BVH ${contactResources.buildMs.toFixed(1)} ms`;
+    }else{
+      status.value=label+' · 1280 × 720 · 1.12 m AO radius'+bakeNote;
+    }
+  }
   function select(mode){
     selected=mode;
     buttons.forEach(button=>button.setAttribute('aria-pressed',Number(button.dataset.taps)===mode));
-    const label=buttons.find(button=>Number(button.dataset.taps)===mode).textContent;
-    status.value=label+' · 1280 × 720 · 1.12 m AO radius'+bakeNote;
+    updateStatus();
+    resetFps();
+  }
+  async function loadAtrium(){
+    if(atriumMesh)return;
+    if(atriumLoading)return atriumLoading;
+    atriumLoading=(async()=>{
+      status.value='Loading Curved Atrium mesh & FP16 SDF…';
+      const [mod,resp]=await Promise.all([import('./assets/atrium-scene.js'),fetch('./assets/atrium.f16.gz')]);
+      if(!resp.ok)throw Error(`Failed to fetch atrium.f16.gz (${resp.status})`);
+      const decomp=resp.body.pipeThrough(new DecompressionStream('gzip'));
+      const buf=await new Response(decomp).arrayBuffer();
+      const [nx,ny,nz]=mod.ATRIUM_SDF_DIMS;
+      const halfArr=new Uint16Array(buf);
+      if(halfArr.length!==nx*ny*nz)throw Error('Unexpected Atrium SDF size');
+      atriumField=new T.Data3DTexture(halfArr,nx,ny,nz);
+      atriumField.format=T.RedFormat;atriumField.type=T.HalfFloatType;
+      atriumField.minFilter=atriumField.magFilter=T.LinearFilter;atriumField.needsUpdate=true;
+      const {geometry,data}=mod.buildAtriumThreeGeometry(T);
+      geometry.setAttribute('wall',new T.InstancedBufferAttribute(new Float32Array([0]),1));
+      geometry.setAttribute('selfSkip',new T.InstancedBufferAttribute(new Float32Array([-1]),1));
+      geometry.setAttribute('moving',new T.InstancedBufferAttribute(new Float32Array([0]),1));
+      geometry.setAttribute('boundsHalf',new T.InstancedBufferAttribute(new Float32Array([6,6,3]),3));
+      atriumMesh=new T.InstancedMesh(geometry,mesh.material,1);
+      atriumMesh.setMatrixAt(0,new T.Matrix4());
+      atriumMesh.instanceMatrix.needsUpdate=true;
+      atriumMesh.visible=false;
+      scene.add(atriumMesh);
+      atriumMeta={min:mod.ATRIUM_SDF_MIN,span:mod.ATRIUM_SDF_SPAN,dims:mod.ATRIUM_SDF_DIMS,camera:mod.ATRIUM_CAMERA,triangles:data.triangleCount};
+    })();
+    return atriumLoading;
+  }
+  async function setScene(name){
+    const target=name==='atrium'?'atrium':'archive';
+    if(target==='atrium')await loadAtrium();
+    activeScene=target;
+    sceneButtons.forEach(btn=>btn.setAttribute('aria-pressed',btn.dataset.scene===target));
+    if(target==='atrium'){
+      mesh.visible=false;
+      for(const m of movers)m.object.visible=false;
+      atriumMesh.visible=true;
+      dyn.dynCount.value=0;
+      sdfUniforms.field.value=atriumField;
+      sdfUniforms.sdfMin.value.set(...atriumMeta.min);
+      sdfUniforms.sdfInvSpan.value.set(1/atriumMeta.span[0],1/atriumMeta.span[1],1/atriumMeta.span[2]);
+      sdfUniforms.sceneId.value=1;
+      camera.position.set(...atriumMeta.camera.position);
+      controls.target.set(...atriumMeta.camera.target);
+      controls.update();
+      const range=Math.max(.24,.12+.5*Math.hypot(atriumMeta.span[0]/atriumMeta.dims[0],atriumMeta.span[1]/atriumMeta.dims[1],atriumMeta.span[2]/atriumMeta.dims[2]));
+      rebuildStaticContact([atriumMesh],{gridSize:1,range,bias:.0003});
+    }else{
+      if(atriumMesh)atriumMesh.visible=false;
+      mesh.visible=true;
+      for(const m of movers)m.object.visible=true;
+      dyn.dynCount.value=dynamicAO?movers.length:0;
+      sdfUniforms.field.value=field;
+      sdfUniforms.sdfMin.value.set(-1,-1,-1);
+      sdfUniforms.sdfInvSpan.value.set(1/26,1/18,1/8);
+      sdfUniforms.sceneId.value=0;
+      camera.position.set(18,-4,7.3);
+      controls.target.set(10.8,8.8,1.4);
+      controls.update();
+      rebuildStaticContact([mesh],{gridSize:1,range:contactRange,bias:.0003});
+    }
+    lastCamera.identity();
+    updateStatus();
     resetFps();
   }
   buttons.forEach(button=>button.onclick=()=>select(Number(button.dataset.taps)));
+  sceneButtons.forEach(button=>button.onclick=()=>setScene(button.dataset.scene));
   document.querySelector('#mask').onchange=event=>{mask.value=event.target.checked;resetFps();};
   document.querySelector('#animate').onchange=event=>{animate=event.target.checked;};
   document.querySelector('#dynao').onchange=event=>{dynamicAO=event.target.checked;updateMovers(simTime);resetFps();};
@@ -1132,13 +1233,14 @@ try {
   document.querySelector('#pbr').onchange=event=>{pbrMode.value=event.target.checked;traced.frame.value=0;aoDemo.resetHistory();resetFps();};
   document.querySelector('#smoothfalloff').onchange=event=>{traced.smoothFalloff.value=event.target.checked?1:0;traced.frame.value=0;aoDemo.resetHistory();resetFps();};
   // Debug hook for timing from the console.
-  window.aoDemo={scene,mesh,boxes,T,aoPass,aoPassBent,field,get contactResources(){return contactResources;},rebuildStaticContact,renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,bakeSyncMs,bakeGpuMs,totalTris,get atlas(){return baked.tex;},meshRes:MESH_RES,setMask:on=>{mask.value=on;},setPBR:on=>{pbrMode.value=on;traced.frame.value=0;aoDemo.resetHistory();},setSmoothFalloff:on=>{traced.smoothFalloff.value=on?1:0;traced.frame.value=0;aoDemo.resetHistory();},setMoverScale:(x,y=x,z=x,w=x)=>dyn.moverScale.value.set(x,y,z,w),select:mode=>select(mode),
+  window.aoDemo={scene,mesh,get atriumMesh(){return atriumMesh;},get sceneName(){return activeScene;},setScene,boxes,T,aoPass,aoPassBent,field,get activeField(){return sdfUniforms.field.value;},get contactResources(){return contactResources;},rebuildStaticContact,renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,bakeSyncMs,bakeGpuMs,totalTris,get atlas(){return baked.tex;},meshRes:MESH_RES,setMask:on=>{mask.value=on;},setPBR:on=>{pbrMode.value=on;traced.frame.value=0;aoDemo.resetHistory();},setSmoothFalloff:on=>{traced.smoothFalloff.value=on?1:0;traced.frame.value=0;aoDemo.resetHistory();},setMoverScale:(x,y=x,z=x,w=x)=>dyn.moverScale.value.set(x,y,z,w),select:mode=>select(mode),
     setDynamicAO:on=>{dynamicAO=on;updateMovers(simTime);},setContactMode:mode=>{traced.contactMode.value=mode?1:0;traced.frame.value=0;aoDemo.resetHistory();},traced,
     resetHistory:()=>{for(const rt of histories){renderer.setRenderTarget(rt);renderer.clear();}if(historiesBent)for(const rt of historiesBent){renderer.setRenderTarget(rt);renderer.clear();}renderer.setRenderTarget(null);},
     setAOScale:scale=>{aoScale=scale;makeTracedTargets(scale);},
     setForceMesh:on=>{forceMesh=on;if(on)ensureAllBaked();updateMovers(simTime);}};
   document.addEventListener('visibilitychange',resetFps);
   select(selected);
+  if(new URLSearchParams(location.search).get('scene')==='atrium')await setScene('atrium');
   renderer.setAnimationLoop(now=>{
     if(animate&&lastNow)simTime+=Math.min(now-lastNow,100)/1000;
     lastNow=now;
