@@ -538,22 +538,30 @@ fn sdfSunShadow(pos: vec3<f32>, nor: vec3<f32>, sDir: vec3<f32>, px: vec2<f32>, 
   return res * res * (3.0 - 2.0 * res);
 }
 
-fn sdfPointShadow(pos: vec3<f32>, nor: vec3<f32>, lp: vec3<f32>, rLim: f32) -> f32 {
-  let toL = lp - pos;
+fn sdfPointShadow(pos: vec3<f32>, nor: vec3<f32>, lp: vec3<f32>, rLim: f32, px: vec2<f32>, frame: u32) -> f32 {
+  // Stochastic spherical area-light jitter across the orb's disk + initial step phase jitter:
+  // produces true band-free soft spherical area shadows even when the orb is right next to a wall.
+  let u1 = fract(ign(px + vec2<f32>(31.0, 67.0)) + vdc2(frame + 5u));
+  let u2 = fract(ign(px + vec2<f32>(71.0, 29.0)) + vdc3(frame + 5u));
+  let zJ = 1.0 - 2.0 * u1;
+  let rJ = sqrt(max(0.0, 1.0 - zJ * zJ));
+  let phiJ = 6.2831853 * u2;
+  let jitteredLP = lp + vec3<f32>(rJ * cos(phiJ), rJ * sin(phiJ), zJ) * (rLim * 0.72);
+  let toL = jitteredLP - pos;
   let dist = length(toL);
   if (dist < rLim + 0.03 || dist > 7.5) { return 1.0; }
   let lDir = toL / dist;
   if (dot(nor, lDir) <= 0.001) { return 0.0; }
-  let ro = pos + nor * 0.025 + lDir * 0.015;
-  var t = 0.015;
-  let tMax = dist - rLim - 0.025;
+  let ro = pos + nor * 0.025 + lDir * 0.012;
+  var t = 0.012 + 0.025 * fract(ign(px + vec2<f32>(13.0, 47.0)) + vdc2(frame + 23u));
+  let tMax = dist - rLim * 0.35 - 0.02;
   var res = 1.0;
   for (var s = 0u; s < 32u; s++) {
     let d = sampleSDF(ro + lDir * t);
     if (d < 0.008) { return 0.0; }
-    res = min(res, 6.0 * d / t);
+    res = min(res, 7.0 * d / t);
     if (res < 0.005) { return 0.0; }
-    t += max(d * 0.75, 0.018);
+    t += max(d * 0.72, 0.016);
     if (t > tMax) { break; }
   }
   res = clamp(res, 0.0, 1.0);
@@ -888,7 +896,7 @@ fn main(
   if (useGI) {
     sunSh = sdfSunShadow(p, n, normalize(u.sunDirScale.xyz), px, frame);
     if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) > 1e-4) {
-      orbSh = sdfPointShadow(p, n, u.emissivePos.xyz, u.emissivePos.w);
+      orbSh = sdfPointShadow(p, n, u.emissivePos.xyz, u.emissivePos.w, px, frame);
     }
   }
 
