@@ -1547,7 +1547,7 @@ export class WebGPUFastSDFAO {
     this.relightUBuf = d.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.decayUBuf = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.traceUBuf = d.createBuffer({ size: 192, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    this.reflUBuf = d.createBuffer({ size: 176, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.reflUBuf = d.createBuffer({ size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.reflFiltUBuf = d.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.tempUBuf = d.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.denoiseUBuf1 = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -1772,7 +1772,9 @@ export class WebGPUFastSDFAO {
         { binding: 7, resource: { buffer: s.bvhNodes } },
         { binding: 8, resource: { buffer: s.bvhTris } },
         { binding: 9, resource: { buffer: s.bvhGrid } },
-        { binding: 10, resource: this.rawRefl.createView() },
+        { binding: 10, resource: this.histAOGI[pIdx].createView() },
+        { binding: 11, resource: this.metaTex.createView() },
+        { binding: 12, resource: this.rawRefl.createView() },
       ],
     });
     this.reflTraceBG1B = [makeReflTraceBG(this.radVolA.createView(), 0), makeReflTraceBG(this.radVolA.createView(), 1)];
@@ -1894,19 +1896,21 @@ export class WebGPUFastSDFAO {
     tf.set([s.rootSpan[0], s.rootSpan[1], s.rootSpan[2], 0], 44);
     d.queue.writeBuffer(this.traceUBuf, 0, tBuf);
 
-    const rBuf = new ArrayBuffer(176);
+    const rBuf = new ArrayBuffer(256);
     const rf = new Float32Array(rBuf), ru = new Uint32Array(rBuf);
-    rf.set([s.sdfMin[0], s.sdfMin[1], s.sdfMin[2], 0], 0);
-    rf.set([1 / s.sdfSpan[0], 1 / s.sdfSpan[1], 1 / s.sdfSpan[2], 0], 4);
-    rf.set([s.gridMin[0], s.gridMin[1], s.gridMin[2], s.gridSize], 8);
-    rf.set([s.gridDims[0], s.gridDims[1], s.gridDims[2], s.contactRange], 12);
-    rf.set([eye[0], eye[1], eye[2], this.frame], 16);
-    rf.set([this.emissivePos[0], this.emissivePos[1], this.emissivePos[2], this.emissiveRadius], 20);
-    rf.set([this.emissiveCol[0], this.emissiveCol[1], this.emissiveCol[2], RAD_SCALE], 24);
-    rf.set([this.aoW, this.aoH, 0.0005, 10.0], 28);
-    rf.set([s.rootMin[0], s.rootMin[1], s.rootMin[2], 0], 32);
-    rf.set([s.rootSpan[0], s.rootSpan[1], s.rootSpan[2], 0], 36);
-    ru.set([s.nodeCount, (this.useGI && this.useReflections) ? 1 : 0, 0, 0], 40);
+    rf.set(vp, 0);
+    rf.set([s.sdfMin[0], s.sdfMin[1], s.sdfMin[2], 0], 16);
+    rf.set([1 / s.sdfSpan[0], 1 / s.sdfSpan[1], 1 / s.sdfSpan[2], 0], 20);
+    rf.set([s.gridMin[0], s.gridMin[1], s.gridMin[2], s.gridSize], 24);
+    rf.set([s.gridDims[0], s.gridDims[1], s.gridDims[2], s.contactRange], 28);
+    rf.set([eye[0], eye[1], eye[2], this.frame], 32);
+    rf.set([this.sunDir[0], this.sunDir[1], this.sunDir[2], 0], 36);
+    rf.set([this.emissivePos[0], this.emissivePos[1], this.emissivePos[2], this.emissiveRadius], 40);
+    rf.set([this.emissiveCol[0], this.emissiveCol[1], this.emissiveCol[2], RAD_SCALE], 44);
+    rf.set([this.aoW, this.aoH, 0.0005, 10.0], 48);
+    rf.set([s.rootMin[0], s.rootMin[1], s.rootMin[2], 0], 52);
+    rf.set([s.rootSpan[0], s.rootSpan[1], s.rootSpan[2], 0], 56);
+    ru.set([s.nodeCount, (this.useGI && this.useReflections) ? 1 : 0, 0, 0], 60);
     d.queue.writeBuffer(this.reflUBuf, 0, rBuf);
 
     const rfData = new Float32Array(20);
