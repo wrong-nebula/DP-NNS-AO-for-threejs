@@ -190,18 +190,23 @@ vec3 tracedAtGI(vec3 pWorld,vec3 n,out vec3 giOutIrr){
   vec2 vnXY=vn.xy*invProjXY;
   float vpDotN=dot(vn,vp);
   vec3 acc=vec3(0.);vec3 gAcc=vec3(0.);float ws=0.;
+  float bestScore=1e9;vec3 bestGI=vec3(0.);
   float planeTol=.0015*viewDepth+.005;
   float depthTol=.08*viewDepth+.05;
   for(int k=0;k<4;k++){
     ivec2 o=ivec2(k&1,k>>1),q=clamp(i0+o,ivec2(0),ivec2(res)-1);
     float bw=(o.x==1?w.x:1.-w.x)*(o.y==1?w.y:1.-w.y);
-    if(bw<1e-4)continue;
     vec2 h=texelFetch(aoTex,q,0).xy;
     vec4 hn=texelFetch(aoNormalTex,q,0);
     float frames=hn.w*255.;
-    if(frames<.5||abs(h.y-viewDepth)>depthTol)continue;
+    if(frames<.5)continue;
     vec3 nv=octDecodeRaw(hn.xy);float dn=dot(nv,n);
-    if(dn<=0.||dn*dn<.81*dot(nv,nv))continue;
+    float nv2=dot(nv,nv);
+    float nCos=dn*inversesqrt(max(nv2,1e-6));
+    float sc=abs(h.y-viewDepth)/(viewDepth+.1)+(1.-max(0.,nCos))*.5;
+    if(sc<bestScore){bestScore=sc;bestGI=texelFetch(aoGITex,q,0).rgb;}
+    if(bw<1e-4||abs(h.y-viewDepth)>depthTol)continue;
+    if(dn<=0.||dn*dn<.81*nv2)continue;
     vec2 ndcQ=(vec2(q)+.5)*invRes2-1.;
     if(abs((dot(vnXY,ndcQ)-vn.z)*h.y-vpDotN)>planeTol)continue;
     float sig=hn.z*.25;
@@ -209,21 +214,19 @@ vec3 tracedAtGI(vec3 pWorld,vec3 n,out vec3 giOutIrr){
     gAcc+=bw*texelFetch(aoGITex,q,0).rgb;
     ws+=bw;
   }
-  if(ws<=.01)return vec3(0.);
+  if(ws<=.01){
+    // Silhouette fallback: pick best matching half-res neighbor so curved edges never drop to black
+    giOutIrr=bestScore<1e8?bestGI:texelFetch(aoGITex,clamp(ivec2(round(f)),ivec2(0),ivec2(res)-1),0).rgb;
+    return vec3(0.);
+  }
   vec3 resVal=acc/ws;
   giOutIrr=gAcc/ws;
-  // Edge-preserving tangent-plane spatial bilateral filter for diffuse GI irradiance
-  // (plus young-history prefilter for AO when frames < 10)
+  // Lightweight 4-tap axial edge-preserving polish (aoGITex is already denoised by 2-pass half-res a-trous)
   ivec2 c0=clamp(ivec2(round(f)),ivec2(0),ivec2(res)-1);
   float fSum=resVal.x*2.,fw=2.;
   vec3 gSum=giOutIrr*2.;float gw=2.;
-  const ivec2 offs[12]=ivec2[12](
-    ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1),
-    ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1),ivec2(1,1),
-    ivec2(-2,0),ivec2(2,0),ivec2(0,-2),ivec2(0,2)
-  );
-  const float wts[12]=float[12](1.,1.,1.,1.,.7,.7,.7,.7,.5,.5,.5,.5);
-  for(int k=0;k<12;k++){
+  const ivec2 offs[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
+  for(int k=0;k<4;k++){
     ivec2 q=clamp(c0+offs[k],ivec2(0),ivec2(res)-1);
     vec2 h=texelFetch(aoTex,q,0).xy;
     vec4 hn=texelFetch(aoNormalTex,q,0);
@@ -232,9 +235,8 @@ vec3 tracedAtGI(vec3 pWorld,vec3 n,out vec3 giOutIrr){
     if(dn<=0.||dn*dn<.81*dot(nv,nv))continue;
     vec2 ndcQ=(vec2(q)+.5)*invRes2-1.;
     if(abs((dot(vnXY,ndcQ)-vn.z)*h.y-vpDotN)>planeTol*1.5)continue;
-    float wt=wts[k];
-    gSum+=texelFetch(aoGITex,q,0).rgb*wt;gw+=wt;
-    if(k<4&&resVal.y<10.){fSum+=h.x;fw+=1.;}
+    gSum+=texelFetch(aoGITex,q,0).rgb;gw+=1.;
+    if(resVal.y<10.){fSum+=h.x;fw+=1.;}
   }
   if(resVal.y<10.)resVal.x=fSum/fw;
   giOutIrr=gSum/gw;
@@ -289,14 +291,16 @@ float staticDistance(vec3 pos){
   return d;
 }
 float sdfSunShadow(vec3 pos,vec3 nor,vec3 sDir){
-  vec3 ro=pos+nor*.045+sDir*.035;
-  float t=.04,res=1.;
-  for(int s=0;s<18;s++){
+  vec3 ro=pos+nor*.018+sDir*.012;
+  float ndl=max(dot(nor,sDir),.1);
+  float t=.012,res=1.;
+  for(int s=0;s<48;s++){
     float d=staticDistance(ro+sDir*t);
     if(d>100.)break;
-    if(d<.008)return 0.;
-    res=min(res,10.*d/t);
-    t+=max(d,.05);
+    float tol=min(.008,.15*t*ndl);
+    if(d<tol)return 0.;
+    res=min(res,10.*max(d-tol,0.)/t);
+    t+=max(d,.025);
     if(t>9.5)break;
   }
   return clamp(res,0.,1.);
@@ -631,7 +635,7 @@ void main(){
       if(length(bn)>.2)bentN=normalize(bn);
     }
     float sunSh=sun>.001?sdfSunShadow(p,normal,sDir):0.;
-    vec3 sunCol=vec3(3.10,2.90,2.55);
+    vec3 sunCol=vec3(2.25,2.10,1.85);
     vec3 skyCol=vec3(.22,.26,.34);
     float skyF=.16+.24*max(0.,bentN.z);
     vec3 direct=sunCol*(sun*sunSh);
@@ -649,14 +653,14 @@ void main(){
     float specOcc=specularOcclusion(NoV,ao,rough);
     vec3 diff=albedo*(direct+indirect);
     vec3 spec=sunCol*(D*F*.18*sun*sunSh*specOcc)+skyCol*(.025*specOcc*pow(1.-NoV,4.));
-    pixel=vec4(linearToSrgb(acesToneMap(diff+spec)),1.);
+    pixel=vec4(linearToSrgb(acesToneMap((diff+spec)*.88)),1.);
     return;
   }
   #endif
   if(sceneId==2){
     // Gallery AO-only (same sunlit + shadowed + sky-occluded shading, zero bounce GI)
     float sunSh=sun>.001?sdfSunShadow(p,normal,sDir):0.;
-    vec3 sunCol=vec3(3.10,2.90,2.55);
+    vec3 sunCol=vec3(2.25,2.10,1.85);
     vec3 skyCol=vec3(.22,.26,.34);
     float skyF=.16+.24*max(0.,normal.z);
     vec3 direct=sunCol*(sun*sunSh);
@@ -674,7 +678,7 @@ void main(){
     float specOcc=specularOcclusion(NoV,ao,rough);
     vec3 diff=albedo*(direct+indirect);
     vec3 spec=sunCol*(D*F*.18*sun*sunSh*specOcc)+skyCol*(.025*specOcc*pow(1.-NoV,4.));
-    pixel=vec4(linearToSrgb(acesToneMap(diff+spec)),1.);
+    pixel=vec4(linearToSrgb(acesToneMap((diff+spec)*.88)),1.);
     return;
   }
   if(pbrMode){
@@ -846,7 +850,7 @@ void main(){
   // Variance-guided early settling: open zero-variance surfaces settle after 24 frames
   // instead of tracing all 64 frames; noisy crevices keep tracing up to settleFrames.
   #ifdef DIFFUSE_GI
-  bool settled=settleFrames>0.&&h.y>=settleFrames;
+  bool settled=settleFrames>0.&&h.y>=max(settleFrames,histMax);
   #else
   bool settled=settleFrames>0.&&(h.y>=settleFrames||(h.y>=24.&&h.z<.00015));
   #endif
@@ -859,7 +863,11 @@ void main(){
   #endif
   if(turn&&!settled){
     frames=min(h.y+1.,histMax);
+    #ifdef DIFFUSE_GI
+    float nd=h.y<8.?4.:(h.y<16.?3.:2.);
+    #else
     float nd=h.y<8.?4.:(h.y<16.?3.:(h.y>=24.&&h.z<.0006?1.:2.));
+    #endif
     #ifdef DIFFUSE_GI
     vec3 sampleGI;
     vec4 resAO=tracedAOBentGI(p,normal,nd,sampleGI);
@@ -1087,7 +1095,7 @@ try {
   // - two history targets, ping-ponged: AO + view depth (float: half floats round away the small updates of a long
   //   history); normal + frames/255. The AO pass writes one while reading the other; the scene draw reads it.
   const nearest=t=>{t.minFilter=t.magFilter=T.NearestFilter;t.generateMipmaps=false;};
-  let aoScale=.5,gTarget,histories,historiesBent=null,historiesGI=null,hiz1,hiz2;let histIndex=0;
+  let aoScale=.5,gTarget,histories,historiesBent=null,historiesGI=null,giDenoiseTargets=null,hiz1,hiz2;let histIndex=0;
   function makeHistPair(w,h,count,giHalf=false){
     return [0,1].map(()=>{const rt=new T.WebGLRenderTarget(w,h,{count,depthBuffer:false});
       rt.textures[0].type=T.FloatType;rt.textures[0].format=T.RGFormat;
@@ -1106,11 +1114,16 @@ try {
     const w=Math.round(W*aoScale),h=Math.round(H*aoScale);
     historiesGI=makeHistPair(w,h,4,true);
     for(const rt of historiesGI){renderer.setRenderTarget(rt);renderer.clear();}
+    giDenoiseTargets=[0,1].map(()=>{
+      const rt=new T.WebGLRenderTarget(w,h,{depthBuffer:false});
+      rt.texture.type=T.HalfFloatType;nearest(rt.texture);return rt;
+    });
+    for(const rt of giDenoiseTargets){renderer.setRenderTarget(rt);renderer.clear();}
     renderer.setRenderTarget(null);
   }
   function makeTracedTargets(scale){
     const w=Math.round(W*scale),h=Math.round(H*scale);
-    gTarget?.dispose();histories?.forEach(rt=>rt.dispose());historiesBent?.forEach(rt=>rt.dispose());historiesBent=null;historiesGI?.forEach(rt=>rt.dispose());historiesGI=null;hiz1?.dispose();hiz2?.dispose();
+    gTarget?.dispose();histories?.forEach(rt=>rt.dispose());historiesBent?.forEach(rt=>rt.dispose());historiesBent=null;historiesGI?.forEach(rt=>rt.dispose());historiesGI=null;giDenoiseTargets?.forEach(rt=>rt.dispose());giDenoiseTargets=null;hiz1?.dispose();hiz2?.dispose();
     gTarget=new T.WebGLRenderTarget(w,h,{count:2});
     gTarget.textures[0].type=T.FloatType;gTarget.textures[1].type=T.HalfFloatType;gTarget.textures.forEach(nearest);
     // Standard traced path: 2 MRTs (RG32F + RGBA8 = 12 B/px). 3rd bentOut MRT is allocated only when PBR is active.
@@ -1153,12 +1166,74 @@ try {
   // Also restore clean cumulative Halton(2,3) indexing when nd=4/3/2, avoiding any low-bit aliasing
   // when nd drops to 1 ray on converged low-variance pixels.
   const makeAOPass=extraDefines=>new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,defines:{DIRS:2,...extraDefines},
-    uniforms:{field:sdfUniforms.field,sdfMin:sdfUniforms.sdfMin,sdfInvSpan:sdfUniforms.sdfInvSpan,gPos:{value:gTarget.textures[0]},gNormal:{value:gTarget.textures[1]},histTex:{value:histories[0].textures[0]},normalTex:{value:histories[0].textures[1]},bentTex:{value:null},giTex:{value:null},radianceVol:{value:null},radianceScale:{value:RADIANCE_SCALE},giMaxDist:{value:8.5},hizTex1:{value:hiz1.texture},hizTex2:{value:hiz2.texture},
+    uniforms:{field:sdfUniforms.field,sdfMin:sdfUniforms.sdfMin,sdfInvSpan:sdfUniforms.sdfInvSpan,gPos:{value:gTarget.textures[0]},gNormal:{value:gTarget.textures[1]},histTex:{value:histories[0].textures[0]},normalTex:{value:histories[0].textures[1]},bentTex:{value:null},giTex:{value:null},radianceVol:{value:null},radianceScale:{value:RADIANCE_SCALE},giMaxDist:{value:8.5},giSunDir:sdfUniforms.sunDir,hizTex1:{value:hiz1.texture},hizTex2:{value:hiz2.texture},
       prevViewProj:traced.prevViewProj,prevView:traced.prevView,curViewProj:traced.curViewProj,curView:traced.curView,invProjXY:traced.invProjXY,frame:traced.frame,contactMode:traced.contactMode,smoothFalloff:traced.smoothFalloff,histMax:traced.histMax,settleFrames:traced.settleFrames,tileRate:traced.tileRate},
     vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',fragmentShader:aoPassFragment}));
   const aoPass=makeAOPass({});
   const aoPassBent=makeAOPass({BENT_NORMALS:1});
   const aoPassGI=makeAOPass({BENT_NORMALS:1,DIFFUSE_GI:1});
+  // Lazily-used 2-pass half-res edge-preserving a-trous wavelet denoiser for 1-Bounce GI (zero cost when #gi is off).
+  const giDenoisePass=new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,
+    uniforms:{giSrc:{value:null},aoTex:{value:null},aoNormalTex:{value:null},curView:traced.curView,invProjXY:traced.invProjXY,stepSize:{value:1}},
+    vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',
+    fragmentShader:`precision highp float;
+    uniform sampler2D giSrc;
+    uniform sampler2D aoTex;
+    uniform sampler2D aoNormalTex;
+    uniform mat4 curView;
+    uniform vec2 invProjXY;
+    uniform int stepSize;
+    out vec4 o;
+    vec3 octDecodeRaw(vec2 e){
+      e=e*2.-1.;
+      vec3 v=vec3(e.xy,1.-abs(e.x)-abs(e.y));
+      if(v.z<0.)v.xy=(1.-abs(v.yx))*vec2(v.x>=0.?1.:-1.,v.y>=0.?1.:-1.);
+      return v;
+    }
+    void main(){
+      ivec2 q=ivec2(gl_FragCoord.xy);
+      ivec2 resI=textureSize(giSrc,0);
+      vec2 invRes2=2./vec2(resI);
+      vec2 hC=texelFetch(aoTex,q,0).xy;
+      vec4 hnC=texelFetch(aoNormalTex,q,0);
+      vec3 cC=texelFetch(giSrc,q,0).rgb;
+      if(hC.y<=0.||hnC.w*255.<.5){o=vec4(cC,1.);return;}
+      vec3 nC=normalize(octDecodeRaw(hnC.xy));
+      vec3 vn=mat3(curView)*nC;
+      vec2 ndcC=(vec2(q)+.5)*invRes2-1.;
+      vec3 vpC=vec3(ndcC*invProjXY*hC.y,-hC.y);
+      vec2 vnXY=vn.xy*invProjXY;
+      float vpDotN=dot(vn,vpC);
+      float depthTol=.06*hC.y+.04;
+      float planeTol=(.0022*hC.y+.008)*float(stepSize);
+      float lumaC=dot(cC,vec3(.2126,.7152,.0722));
+      float lumaSigma=.22+.45*lumaC;
+      vec3 sum=cC;
+      float wSum=1.;
+      for(int dy=-1;dy<=1;dy++){
+        for(int dx=-1;dx<=1;dx++){
+          if(dx==0&&dy==0)continue;
+          ivec2 p=q+ivec2(dx,dy)*stepSize;
+          if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,resI)))continue;
+          vec2 hP=texelFetch(aoTex,p,0).xy;
+          vec4 hnP=texelFetch(aoNormalTex,p,0);
+          if(hnP.w*255.<.5||abs(hP.y-hC.y)>depthTol)continue;
+          vec3 nv=octDecodeRaw(hnP.xy);
+          float dn=dot(nv,nC);
+          if(dn<=0.||dn*dn<.81*dot(nv,nv))continue;
+          vec2 ndcP=(vec2(p)+.5)*invRes2-1.;
+          if(abs((dot(vnXY,ndcP)-vn.z)*hP.y-vpDotN)>planeTol)continue;
+          vec3 cP=texelFetch(giSrc,p,0).rgb;
+          float lumaP=dot(cP,vec3(.2126,.7152,.0722));
+          float wK=(dx==0||dy==0)?.5:.25;
+          float wL=exp(-abs(lumaP-lumaC)/lumaSigma);
+          float w=wK*wL;
+          sum+=cP*w;
+          wSum+=w;
+        }
+      }
+      o=vec4(sum/wSum,1.);
+    }`}));
   const lastCamera=new T.Matrix4();
   // Two compiled variants per mode: with mover code, and without it (NO_DYN) for when no mover
   // is in the AO, so the static path carries none of the mover loops.
@@ -1366,7 +1441,15 @@ try {
       renderer.setRenderTarget(cur);activePass.render(renderer);
       traced.aoTex.value=cur.textures[0];traced.aoNormalTex.value=cur.textures[1];
       if(useBent)traced.aoBentTex.value=cur.textures[2];
-      if(useGI)traced.aoGITex.value=cur.textures[3];
+      if(useGI){
+        const du=giDenoisePass.material.uniforms;
+        du.aoTex.value=cur.textures[0];du.aoNormalTex.value=cur.textures[1];
+        du.giSrc.value=cur.textures[3];du.stepSize.value=1;
+        renderer.setRenderTarget(giDenoiseTargets[0]);giDenoisePass.render(renderer);
+        du.giSrc.value=giDenoiseTargets[0].texture;du.stepSize.value=3;
+        renderer.setRenderTarget(giDenoiseTargets[1]);giDenoisePass.render(renderer);
+        traced.aoGITex.value=giDenoiseTargets[1].texture;
+      }
       renderer.setRenderTarget(null);renderer.render(scene,camera);
       traced.prevViewProj.value.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
       traced.prevView.value.copy(camera.matrixWorldInverse);

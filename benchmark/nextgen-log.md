@@ -226,3 +226,20 @@ Implemented a standalone WebGPU Compute (WGSL) prototype (`benchmark/webgpu-hash
 | **Archive Regression** (`judge_v2.py --tag post-gi`) | Fit@64 **0.00585** / Held@64 **0.00497** | **Bit-exact**, Wall early/settled 2.65 / 1.23 ms |
 | **Atrium Regression** (`bench_atrium.py`) | MAE@64 **0.01050** / Settled **1.70 ms** | Zero regressions |
 | **Errors** (all 3 scenes × 7 modes × all toggles) | **0 GL / 0 console / 0 page** | `npm test` + `webgl2-smoke.py` Pass |
+
+---
+
+## Visual Defect Audit & Polish Pass (`post-gi-polish`)
+
+Fixed 5 verified visual defects on the Sunlit Gallery 1-Bounce GI renderer without affecting Archive or Atrium:
+1. **Crease Light-Leak Elimination (`contact-bvh.js`, `radiance-grid.js`)**: `contactTestLeafHit` / `contactHitCell` now return the exact hit triangle normal `hitN`, reject back-facing hits (`dot(hitN, -w) <= 0`), and apply a near-contact crease shadow & same-voxel self-hit guard (`tHit < 0.15 m`) alongside normal-aware 1-voxel dilation in `radiance-grid.js`.
+2. **Silhouette Hairline Fix (`index.html`, `tracedAtGI`)**: when `ws <= 0.01` on curved silhouette edges (amphora rim, monolith, spheres, pedestal rims), falls back to the best depth/normal-matching half-res neighbor instead of dropping to `vec3(0.)`.
+3. **2-Pass Half-Res Edge-Preserving À-Trous GI Denoiser (`index.html`, `giDenoisePass`)**: lazily allocated only when `#gi` is enabled (`stride = 1` then `stride = 3`, tangent-plane + normal + luma-aware); `aoPassGI` accumulates full 128 frames on still cameras without early-settling or dropping to 1 ray/frame on low AO variance.
+4. **Crisp Contact & Arch Shadows (`index.html`, `sdfSunShadow`)**: tightened start offset (`nor * 0.018 + sDir * 0.012`, `t = 0.012`) with tangent-plane clearance and increased step budget (`18 -> 48` steps, `max(d, 0.025)`), eliminating detached contact-shadow halos and the step-exhausted back-wall arch ribbon.
+5. **Balanced Sun Exposure (`index.html`, `tools/trace_gi.cpp`)**: direct sun intensity (`2.25, 2.10, 1.85`) and `0.88` tone-map exposure preserve crisp 3D form shading on sunlit white sculptures while keeping crimson/teal/gold color bleeding rich.
+
+### Verified Apple M1 Chrome WebGL2 Results (`post-gi-polish`)
+- **Gallery 1-Bounce GI vs 512-ray GI Ref**: PSNR **25.36 dB** (up from 25.31 dB, +17.51 dB vs AO-only 7.85 dB), RGB MAE **0.03600** (10.0× lower than AO-only 0.36114), AO MAE@64 **0.01152**, Bounce-only MAE **0.05734**, Relight **2.00 ms**, 0 GL/console/page errors.
+- **Archive Regression (`judge_v2.py --tag post-gi-polish`)**: Fit@64 **0.00585**, Held@64 **0.00497** (**bit-exact**), Wall early/orbit/settled 3.125 / 2.594 / 1.337 ms, 0 errors.
+- **Atrium Regression (`bench_atrium.py`)**: MAE@64 **0.01050** (**bit-exact**), Wall settled **1.80 ms**, 0 errors.
+- **Tests**: `npm test` + `python3 test/webgl2-smoke.py` pass with 0 errors.

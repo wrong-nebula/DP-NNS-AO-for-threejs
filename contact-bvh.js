@@ -237,7 +237,8 @@ float candidateAO(vec3 p,vec3 n){
 uniform sampler3D radianceVol;
 uniform float radianceScale;
 uniform float giMaxDist;
-bool contactTestLeafHit(uint meta,vec3 origin,vec3 w,inout float bestT){
+uniform vec3 giSunDir;
+bool contactTestLeafHit(uint meta,vec3 origin,vec3 w,inout float bestT,inout vec3 bestN){
  int first=int((meta&0x7FFFFFFFu)>>3u);
  int count=int(meta&7u);
  bool hit=false;
@@ -258,12 +259,13 @@ bool contactTestLeafHit(uint meta,vec3 origin,vec3 w,inout float bestT){
   float v=dot(w,q)*invDet;
   if(v<0.||u+v>1.)continue;
   float distance=dot(e2,q)*invDet;
-  if(distance>0.&&distance<bestT){bestT=distance;hit=true;}
+  if(distance>0.&&distance<bestT){bestT=distance;bestN=cross(e1,e2);hit=true;}
  }
  return hit;
 }
-bool contactHitCell(vec3 origin,vec3 w,int root,int treeCount,vec3 qMin,vec3 qScale,out float tHit){
+bool contactHitCell(vec3 origin,vec3 w,int root,int treeCount,vec3 qMin,vec3 qScale,out float tHit,out vec3 hitN){
  tHit=contactRange;
+ hitN=vec3(0.);
  if(treeCount<=0)return false;
  vec3 inv=1./vec3(abs(w.x)<1e-12?1e-12:w.x,abs(w.y)<1e-12?1e-12:w.y,abs(w.z)<1e-12?1e-12:w.z);
  vec3 qInv=qScale*inv;
@@ -271,7 +273,7 @@ bool contactHitCell(vec3 origin,vec3 w,int root,int treeCount,vec3 qMin,vec3 qSc
  if(treeCount==1){
   uvec4 nd=contactFetchNode(root);
   if(contactBoxHit(nd,qInv,qOff)<0.)return false;
-  return contactTestLeafHit(nd.w,origin,w,tHit);
+  return contactTestLeafHit(nd.w,origin,w,tHit,hitN);
  }
  bool anyHit=false;
  int stack[16];
@@ -285,11 +287,11 @@ bool contactHitCell(vec3 origin,vec3 w,int root,int treeCount,vec3 qMin,vec3 qSc
   bool hitL=tL>=0.&&tL<tHit;
   bool hitR=tR>=0.&&tR<tHit;
   if(hitL&&(ndL.w&0x80000000u)!=0u){
-   if(contactTestLeafHit(ndL.w,origin,w,tHit))anyHit=true;
+   if(contactTestLeafHit(ndL.w,origin,w,tHit,hitN))anyHit=true;
    hitL=false;
   }
   if(hitR&&(ndR.w&0x80000000u)!=0u){
-   if(contactTestLeafHit(ndR.w,origin,w,tHit))anyHit=true;
+   if(contactTestLeafHit(ndR.w,origin,w,tHit,hitN))anyHit=true;
    hitR=false;
   }
   if(hitL&&hitR){
@@ -359,13 +361,38 @@ vec4 tracedAOBentGI(vec3 p,vec3 n,float nd,out vec3 giOutIrr){
   vec3 w=t*(sqrt(u)*cos(phi))+b*(sqrt(u)*sin(phi))+n*cosn;
   bool skipBvh=cosn>=minCosClear;
   float tHit=contactRange*.5;
+  vec3 hitN=vec3(0.);
   bool blocked=false;
   if(!skipBvh){
    if(contactMode==1)blocked=contactBlockedHiZ(p,n,w);
-   else blocked=contactHitCell(origin,w,cellRoot,cellCount,cellQMin,cellQScale,tHit);
+   else blocked=contactHitCell(origin,w,cellRoot,cellCount,cellQMin,cellQScale,tHit,hitN);
   }
   if(blocked){
-   giSum+=sampleRadianceVol(p+w*tHit);
+   if(contactMode==1){
+    giSum+=sampleRadianceVol(p+w*tHit);
+   }else{
+    float nl=length(hitN);
+    if(nl>1e-8){
+     hitN/=nl;
+     // Reject back-facing radiance hits (inside overlapping geometry / embedded trims)
+     if(dot(hitN,-w)>0.){
+      vec3 hitP=origin+w*tHit;
+      vec3 rad=sampleRadianceVol(hitP);
+      vec3 sDir=normalize(giSunDir);
+      float hitNdl=max(0.,dot(hitN,sDir));
+      float hitSkyF=.42+.32*max(0.,hitN.z);
+      // Crease shadow & same-voxel self-hit guard: prevent coarse-voxel sunlit tops from
+      // creating glowing rings inside tight creases (pedestal tiers, torus trims, contacts)
+      if(hitNdl>.01&&tHit<.15){
+       float sdSh=staticDistance(hitP+hitN*.035+sDir*.11);
+       if(sdSh<.05)hitNdl*=smoothstep(.005,.05,sdSh);
+       hitNdl*=smoothstep(.008,.095,tHit);
+      }
+      vec3 maxRad=vec3(3.10,2.90,2.55)*hitNdl+vec3(.56,.64,.76)*hitSkyF;
+      giSum+=min(rad,maxRad);
+     }
+    }
+   }
    continue;
   }
   float s=contactRange,v=1.;

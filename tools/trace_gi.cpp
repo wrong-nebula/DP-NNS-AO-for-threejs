@@ -167,7 +167,8 @@ int main(int argc, char** argv) {
     auto samples = load<float>(argv[2]);
     const size_t n = samples.size() / 9;
     V sunDir = norm({std::stof(argv[4]), std::stof(argv[5]), std::stof(argv[6])});
-    const V sunCol{3.10f, 2.90f, 2.55f};
+    const V sunCol{2.25f, 2.10f, 1.85f};
+    const V bounceSunCol{3.10f, 2.90f, 2.55f};
     const V skyCol{0.22f, 0.26f, 0.34f};
     const V bounceSkyCol{0.56f, 0.64f, 0.76f};
     const float AO_R = 1.12f;
@@ -217,7 +218,7 @@ int main(int argc, char** argv) {
                                 sh = bvh.any(shO, sunDir, 12.f) ? 0.f : 1.f;
                             }
                             float skyF = 0.42f + 0.32f * std::max(0.f, hn.z);
-                            V irr = add(mul(sunCol, ndl * sh), mul(bounceSkyCol, skyF));
+                            V irr = add(mul(bounceSunCol, ndl * sh), mul(bounceSkyCol, skyF));
                             giSum = add(giSum, mul3(ht.alb, irr));
                         }
                     }
@@ -231,8 +232,8 @@ int main(int argc, char** argv) {
                 float pSkyF = 0.16f + 0.24f * std::max(0.f, nor.z);
                 V direct = mul(sunCol, pNdl * pSh);
                 V skyInd = mul(skyCol, pSkyF * ao);
-                V colAO = toneSrgb(mul3(alb, add(direct, skyInd)));
-                V colGI = toneSrgb(mul3(alb, add(add(direct, skyInd), giIrr)));
+                V colAO = toneSrgb(mul(mul3(alb, add(direct, skyInd)), 0.88f));
+                V colGI = toneSrgb(mul(mul3(alb, add(add(direct, skyInd), giIrr)), 0.88f));
 
                 float* o = &out[i * 10];
                 o[0] = ao;
