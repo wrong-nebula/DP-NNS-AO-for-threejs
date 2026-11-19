@@ -14,10 +14,10 @@ struct ReflU {
   sunDir: vec4<f32>,        // xyz=sunDir, w=0
   emissivePos: vec4<f32>,   // xyz=pos, w=radius
   emissiveCol: vec4<f32>,   // rgb=col, w=radScale
-  params: vec4<f32>,        // x=W, y=H, z=contactBias, w=maxDist
+  params: vec4<f32>,        // x=W, y=H, z=reflRoughCut, w=maxDist
   rootMin: vec4<f32>,
   rootSpan: vec4<f32>,
-  extra: vec4<u32>,         // x=nodeCount, y=enabled(0/1), z=0, w=0
+  extra: vec4<u32>,         // x=nodeCount, y=enabled(0/1), z=flags(bit0=checker,bit1=useBvh), w=maxSteps
 };
 
 @group(0) @binding(0) var<uniform> u: ReflU;
@@ -221,16 +221,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ar = textureLoad(gAlbedoRough, q, 0);
   let isMetal = gn.w > 1.5;
   let rough = clamp(ar.a, 0.03, 1.0);
-  // Skip semi-matte dielectrics (rough > 0.45) where Fresnel reflection is negligible (~40% fewer reflection pixels!)
-  if (pd.w <= 0.0 || gn.w < 0.5 || (!isMetal && rough > 0.45)) {
+  let roughCut = u.params.z;
+  if (pd.w <= 0.0 || gn.w < 0.5 || (!isMetal && rough > roughCut)) {
     textureStore(outRefl, q, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+    return;
+  }
+
+  let frame = u32(u.eyeFrame.w);
+  // Checkerboard skip for rough surfaces (rough > 0.12): 50% fewer reflection rays with identical denoised look,
+  // while mirror chrome (rough <= 0.12) always traces every pixel at full rate!
+  let useChecker = (u.extra.z & 1u) != 0u;
+  if (useChecker && rough > 0.12 && (((gid.x ^ gid.y) & 1u) != (frame & 1u))) {
+    // Negative .w signals REFL_FILTER_WGSL to reuse temporal/spatial neighbors directly
+    textureStore(outRefl, q, vec4<f32>(0.0, 0.0, 0.0, -1.0));
     return;
   }
 
   let p = pd.xyz;
   let n = normalize(gn.xyz);
   let V = normalize(u.eyeFrame.xyz - p);
-  let frame = u32(u.eyeFrame.w);
   let px = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
 
   // GGX importance-sampled half vector (exact mirror ray when rough <= 0.05 for razor-sharp chrome)
@@ -272,31 +281,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
-  // 1) Fast 1-Lipschitz midpoint empty-ball skip before BVH2 (skips ~75% of open-floor/open-sphere BVH traversals!)
+  // 1) Fast 1-Lipschitz midpoint empty-ball skip before BVH2 (disabled on Low/Very Low tiers)
   var hitBvh = false;
   var tBvh = cRange;
-  let dMid = sampleSDF(origin + R * (0.5 * cRange));
-  if (dMid < 0.5 * cRange + 0.09) {
-    var cellRoot = 0u;
-    var cellCnt = 0u;
-    var cellQMin = u.rootMin.xyz;
-    var cellQScale = u.rootSpan.xyz * (1.0 / 65535.0);
-    let gSize = u.gridMinSize.w;
-    if (gSize > 0.0) {
-      let gDims = vec3<i32>(u.gridDimsRange.xyz);
-      let cell = vec3<i32>(floor((p - u.gridMinSize.xyz) / gSize));
-      if (all(cell >= vec3<i32>(0)) && all(cell < gDims)) {
-        let cid = u32((cell.z * gDims.y + cell.y) * gDims.x + cell.x);
-        let bnd = bvhGrid[cid];
-        cellRoot = bnd.x;
-        cellCnt = bnd.y;
-        cellQMin = u.gridMinSize.xyz + vec3<f32>(cell) * gSize - vec3<f32>(cRange + 0.002);
-        cellQScale = vec3<f32>((gSize + 2.0 * (cRange + 0.002)) * (1.0 / 65535.0));
+  let useBvh = (u.extra.z & 2u) != 0u;
+  if (useBvh) {
+    let dMid = sampleSDF(origin + R * (0.5 * cRange));
+    if (dMid < 0.5 * cRange + 0.09) {
+      var cellRoot = 0u;
+      var cellCnt = 0u;
+      var cellQMin = u.rootMin.xyz;
+      var cellQScale = u.rootSpan.xyz * (1.0 / 65535.0);
+      let gSize = u.gridMinSize.w;
+      if (gSize > 0.0) {
+        let gDims = vec3<i32>(u.gridDimsRange.xyz);
+        let cell = vec3<i32>(floor((p - u.gridMinSize.xyz) / gSize));
+        if (all(cell >= vec3<i32>(0)) && all(cell < gDims)) {
+          let cid = u32((cell.z * gDims.y + cell.y) * gDims.x + cell.x);
+          let bnd = bvhGrid[cid];
+          cellRoot = bnd.x;
+          cellCnt = bnd.y;
+          cellQMin = u.gridMinSize.xyz + vec3<f32>(cell) * gSize - vec3<f32>(cRange + 0.002);
+          cellQScale = vec3<f32>((gSize + 2.0 * (cRange + 0.002)) * (1.0 / 65535.0));
+        }
+      } else {
+        cellCnt = u.extra.x;
       }
-    } else {
-      cellCnt = u.extra.x;
+      hitBvh = bvhContactHit(origin, R, cellRoot, cellCnt, cellQMin, cellQScale, &tBvh);
     }
-    hitBvh = bvhContactHit(origin, R, cellRoot, cellCnt, cellQMin, cellQScale, &tBvh);
   }
 
   if (hitBvh && tBvh < orbT) {
@@ -304,9 +316,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     hitDist = tBvh;
     rad = evalHitRadiance(origin + R * tBvh, R);
   } else {
-    // 2) Relaxed far SDF sphere trace + 1-step hit refinement
-    var s = cRange;
-    for (var k = 0u; k < 22u; k++) {
+    // 2) Relaxed far SDF sphere trace + 1-step hit refinement (tier-controlled step budget)
+    var s = select(0.06, cRange, useBvh);
+    let maxSteps = max(u.extra.w, 12u);
+    for (var k = 0u; k < maxSteps; k++) {
       if (s >= orbT) { break; }
       let d = sampleSDF(origin + R * s);
       if (d > 100.0) { break; }
@@ -377,13 +390,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = normalize(gn.xyz);
   let planeTol = 0.0025 * pd.w + 0.012;
 
-  // Roughness-guided spatial pre-filter: zero blur on mirror chrome (rough <= 0.06),
-  // smooth wide 2-ring bilateral kernel on brushed/rough chrome (rough >= 0.25)
-  var spSum = c0;
-  var spW = 1.0;
+  let isSkipped = c0.w < -0.5;
+  var spSum = select(c0, vec4<f32>(0.0), isSkipped);
+  var spW = select(1.0, 0.0, isSkipped);
   let spGain = smoothstep(0.06, 0.30, rough);
-  if (spGain > 0.02) {
-    let stepS = select(1, 2, rough > 0.26);
+  if (spGain > 0.02 || isSkipped) {
+    let stepS = select(1, 2, rough > 0.26 && !isSkipped);
     for (var dy = -1; dy <= 1; dy++) {
       for (var dx = -1; dx <= 1; dx++) {
         if (dx == 0 && dy == 0) { continue; }
@@ -394,17 +406,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (npd.w <= 0.0 || ngn.w < 0.5) { continue; }
         if (dot(normalize(ngn.xyz), n) < 0.88) { continue; }
         if (abs(dot(n, npd.xyz - p)) > planeTol * f32(stepS)) { continue; }
-        let w = select(0.35, 0.65, dx == 0 || dy == 0) * spGain;
-        spSum += textureLoad(curRefl, nq, 0) * w;
+        let nr = textureLoad(curRefl, nq, 0);
+        if (nr.w < -0.5) { continue; }
+        let w = select(0.35, 0.65, dx == 0 || dy == 0) * max(spGain, select(0.0, 1.0, isSkipped));
+        spSum += nr * w;
         spW += w;
       }
     }
   }
-  let filtered = spSum / spW;
+  let filtered = select(c0, spSum / spW, spW > 1e-4);
 
-  // Mirror chrome uses faster temporal alpha (0.35) so reflections never smear when orbiting;
-  // rough chrome uses tighter EMA (0.08) for silky-smooth GGX integration!
-  let effAlpha = mix(max(u.params.z, 0.35), min(u.params.z, 0.08), spGain);
+  // Mirror chrome uses faster temporal alpha (0.35); rough chrome uses tighter EMA (0.08);
+  // checkerboard-skipped pixels keep 95% temporal history for rock-solid zero-flicker stability!
+  let effAlpha = select(mix(max(u.params.z, 0.35), min(u.params.z, 0.08), spGain), 0.05, isSkipped);
 
   if (u.params.w < 0.5) {
     textureStore(outRefl, q, filtered);

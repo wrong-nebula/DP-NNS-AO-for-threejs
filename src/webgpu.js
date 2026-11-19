@@ -12,10 +12,12 @@ import { REFL_TRACE_WGSL, REFL_FILTER_WGSL } from './webgpu-refl.js';
 export { bakeSDFOnGPU };
 
 export const WEBGPU_QUALITY_PRESETS = {
-  low:    { label: 'Performance (Low)', rays: 1, maxSamples: 48,  denoisePasses: 2, giMaxDist: 6.5, shadowSteps: 32, multiBounce: false },
-  medium: { label: 'Balanced (Medium)', rays: 1, maxSamples: 64,  denoisePasses: 2, giMaxDist: 7.5, shadowSteps: 44, multiBounce: true },
-  high:   { label: 'High (Default)',    rays: 2, maxSamples: 128, denoisePasses: 3, giMaxDist: 8.5, shadowSteps: 56, multiBounce: true },
-  ultra:  { label: 'Ultra',             rays: 4, maxSamples: 192, denoisePasses: 3, giMaxDist: 9.5, shadowSteps: 68, multiBounce: true },
+  very_low:  { label: 'Very Low (Mobile)',  rays: 1, maxSamples: 32,  denoisePasses: 1, giSteps: 8,  giMaxDist: 6.0,  shadowSteps: 24, multiBounce: false, reflEnabled: false, reflChecker: true,  reflUseBvh: false, reflSteps: 12, reflRoughCut: 0.24 },
+  low:       { label: 'Low (Performance)',  rays: 1, maxSamples: 48,  denoisePasses: 2, giSteps: 10, giMaxDist: 6.8,  shadowSteps: 32, multiBounce: false, reflEnabled: true,  reflChecker: true,  reflUseBvh: false, reflSteps: 14, reflRoughCut: 0.28 },
+  medium:    { label: 'Medium (Balanced)',  rays: 1, maxSamples: 64,  denoisePasses: 2, giSteps: 12, giMaxDist: 7.5,  shadowSteps: 40, multiBounce: true,  reflEnabled: true,  reflChecker: true,  reflUseBvh: true,  reflSteps: 18, reflRoughCut: 0.38 },
+  high:      { label: 'High (Default)',     rays: 2, maxSamples: 128, denoisePasses: 3, giSteps: 14, giMaxDist: 8.5,  shadowSteps: 48, multiBounce: true,  reflEnabled: true,  reflChecker: true,  reflUseBvh: true,  reflSteps: 22, reflRoughCut: 0.45 },
+  very_high: { label: 'Very High',          rays: 3, maxSamples: 160, denoisePasses: 3, giSteps: 16, giMaxDist: 9.2,  shadowSteps: 56, multiBounce: true,  reflEnabled: true,  reflChecker: false, reflUseBvh: true,  reflSteps: 26, reflRoughCut: 0.55 },
+  ultra:     { label: 'Ultra (Reference)',  rays: 4, maxSamples: 224, denoisePasses: 3, giSteps: 20, giMaxDist: 10.0, shadowSteps: 64, multiBounce: true,  reflEnabled: true,  reflChecker: false, reflUseBvh: true,  reflSteps: 32, reflRoughCut: 0.65 },
 };
 
 const HASH_SLOTS = 262144; // 2^18 entries x 28 B = 7.0 MiB
@@ -523,7 +525,8 @@ fn sdfSunShadow(pos: vec3<f32>, nor: vec3<f32>, sDir: vec3<f32>, px: vec2<f32>, 
   let ro = pos + nor * 0.028 + dir * 0.015;
   var t = 0.012 + 0.035 * fract(ign(px + vec2<f32>(7.0, 41.0)) + vdc2(frame + 17u));
   var res = 1.0;
-  for (var s = 0u; s < 48u; s++) {
+  let steps = max(u.extra.x, 24u);
+  for (var s = 0u; s < steps; s++) {
     let d = sampleSDF(ro + dir * t);
     if (d > 100.0) { break; }
     let tol = min(0.010, 0.20 * t * max(ndl, 0.15));
@@ -785,7 +788,8 @@ fn main(
           } else {
             var sg = max(s, 1.12);
             var hitFar = false;
-            for (var k = 0u; k < 14u; k++) {
+            let giMaxSteps = max(u.extra.z >> 8u, 8u);
+            for (var k = 0u; k < giMaxSteps; k++) {
               let d = sampleSDF(p + w * sg);
               if (d > 100.0) { break; }
               if (d < 0.045) {
@@ -823,7 +827,7 @@ fn main(
   // 3) Workgroup Shared-Memory 2x2 Occlusion-Point Reuse (Jin et al. 2026)
   workgroupBarrier();
 
-  if (needTrace && u.extra.z != 0u) {
+  if (needTrace && (u.extra.z & 1u) != 0u) {
     let peerX = lidx ^ 1u;
     let peerY = lidx ^ 8u;
     var reuseVis = 0.0;
@@ -890,13 +894,16 @@ fn main(
     }
   }
 
-  // Half-res direct sun + orb shadows (stochastically jittered for band-free temporal penumbra)
-  var sunSh = 1.0;
-  var orbSh = 1.0;
-  if (useGI) {
+  // Half-res direct sun + orb shadows (skipped completely once static shadows have converged!)
+  var sunSh = -1.0;
+  var orbSh = -1.0;
+  let traceShadows = (u.extra.z & 2u) != 0u;
+  if (useGI && traceShadows) {
     sunSh = sdfSunShadow(p, n, normalize(u.sunDirScale.xyz), px, frame);
     if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) > 1e-4) {
       orbSh = sdfPointShadow(p, n, u.emissivePos.xyz, u.emissivePos.w, px, frame);
+    } else {
+      orbSh = 1.0;
     }
   }
 
@@ -980,13 +987,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let prev = acc / wSum;
     let prevSh = mAcc / wSum;
     textureStore(outAOGI, q, mix(prev, cur, u.params.z));
-    // Temporally accumulate stochastic sun & orb shadows (faster alpha=0.14 for responsive sun drag!)
+    // Reuse converged static shadow directly when curM.x < 0 (shadow trace skipped!)
     let shAlpha = max(u.params.z, 0.14);
-    let smoothSh = mix(prevSh, curM.xy, shAlpha);
+    let smoothSh = select(mix(prevSh, curM.xy, shAlpha), prevSh, curM.x < -0.5);
     textureStore(outMeta, q, vec4<f32>(smoothSh, curM.zw));
   } else {
     textureStore(outAOGI, q, cur);
-    textureStore(outMeta, q, curM);
+    textureStore(outMeta, q, vec4<f32>(max(curM.xy, vec2<f32>(0.0)), curM.zw));
   }
 }
 `;
@@ -1570,6 +1577,7 @@ export class WebGPUFastSDFAO {
     this.pingIdx   = 0;
     this.hasPrev   = false;
     this.prevVP    = new Float32Array(16);
+    this.stillFrames = 0;
 
     this.hashBuf = d.createBuffer({ size: HASH_SLOTS * 28, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     this.statsBuf = d.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
@@ -1853,6 +1861,7 @@ export class WebGPUFastSDFAO {
   clearHash() {
     this.frame = 0;
     this.hasPrev = false;
+    this.stillFrames = 0;
     const d = this.device;
     d.queue.writeBuffer(this.decayUBuf, 0, new Uint32Array([HASH_SLOTS, 0, 0, 1]));
     const enc = d.createCommandEncoder();
@@ -1866,6 +1875,7 @@ export class WebGPUFastSDFAO {
 
   relight(softDecayHash = true) {
     if (!this.sceneRes) return;
+    this.stillFrames = 0;
     const d = this.device, s = this.sceneRes, q = WEBGPU_QUALITY_PRESETS[this.quality];
     const uBuf = new ArrayBuffer(96);
     const f = new Float32Array(uBuf), u = new Uint32Array(uBuf);
@@ -1900,6 +1910,8 @@ export class WebGPUFastSDFAO {
   setQuality(tier) {
     if (!WEBGPU_QUALITY_PRESETS[tier]) return;
     this.quality = tier;
+    this.useReflections = WEBGPU_QUALITY_PRESETS[tier].reflEnabled;
+    this.stillFrames = 0;
     this.relight(false);
   }
 
@@ -1909,6 +1921,16 @@ export class WebGPUFastSDFAO {
     const view = lookAtMat4(eye, target, up);
     const proj = perspectiveMat4(fovDeg, this.width / this.height, 0.1, 100);
     const vp = mulMat4(proj, view);
+
+    let camSame = this.hasPrev;
+    if (camSame) {
+      for (let i = 0; i < 16; i++) {
+        if (Math.abs(vp[i] - this.prevVP[i]) > 1e-5) { camSame = false; break; }
+      }
+    }
+    this.stillFrames = camSame ? (this.stillFrames + 1) : 0;
+    const traceShadows = !camSame || this.stillFrames < 28;
+    const traceRefl = this.useGI && this.useReflections && (!camSame || this.stillFrames < 44);
 
     const camData = new Float32Array(32);
     camData.set(vp, 0);
@@ -1926,7 +1948,8 @@ export class WebGPUFastSDFAO {
     tf.set([this.emissiveCol[0], this.emissiveCol[1], this.emissiveCol[2], q.giMaxDist], 24);
     tf.set([this.aoW, this.aoH, this.frame, 0.0005], 28);
     tu.set([q.rays, q.maxSamples, this.useGI ? 1 : 0, this.useHash ? 1 : 0], 32);
-    tu.set([q.shadowSteps, HASH_MASK, this.reuseEnabled ? 1 : 0, s.nodeCount], 36);
+    const extraFlags = (this.reuseEnabled ? 1 : 0) | (traceShadows ? 2 : 0) | ((q.giSteps & 0xFF) << 8);
+    tu.set([q.shadowSteps, HASH_MASK, extraFlags, s.nodeCount], 36);
     tf.set([s.rootMin[0], s.rootMin[1], s.rootMin[2], 0], 40);
     tf.set([s.rootSpan[0], s.rootSpan[1], s.rootSpan[2], 0], 44);
     d.queue.writeBuffer(this.traceUBuf, 0, tBuf);
@@ -1942,10 +1965,11 @@ export class WebGPUFastSDFAO {
     rf.set([this.sunDir[0], this.sunDir[1], this.sunDir[2], 0], 36);
     rf.set([this.emissivePos[0], this.emissivePos[1], this.emissivePos[2], this.emissiveRadius], 40);
     rf.set([this.emissiveCol[0], this.emissiveCol[1], this.emissiveCol[2], RAD_SCALE], 44);
-    rf.set([this.aoW, this.aoH, 0.0005, 10.0], 48);
+    rf.set([this.aoW, this.aoH, q.reflRoughCut, 10.0], 48);
     rf.set([s.rootMin[0], s.rootMin[1], s.rootMin[2], 0], 52);
     rf.set([s.rootSpan[0], s.rootSpan[1], s.rootSpan[2], 0], 56);
-    ru.set([s.nodeCount, (this.useGI && this.useReflections) ? 1 : 0, 0, 0], 60);
+    const reflFlags = (q.reflChecker ? 1 : 0) | (q.reflUseBvh ? 2 : 0);
+    ru.set([s.nodeCount, (this.useGI && this.useReflections) ? 1 : 0, reflFlags, q.reflSteps], 60);
     d.queue.writeBuffer(this.reflUBuf, 0, rBuf);
 
     const rfData = new Float32Array(20);
@@ -2006,7 +2030,7 @@ export class WebGPUFastSDFAO {
     cp.setBindGroup(0, this.tempBG[curIdx]);
     cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
 
-    if (this.useGI) {
+    if (traceRefl || (this.useGI && !this.useReflections && this.stillFrames < 2)) {
       cp.setPipeline(this.reflTracePipe);
       cp.setBindGroup(0, (q.multiBounce ? this.reflTraceBG2B : this.reflTraceBG1B)[curIdx]);
       cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));

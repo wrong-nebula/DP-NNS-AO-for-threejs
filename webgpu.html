@@ -38,10 +38,12 @@ canvas{display:block;width:100%;height:auto}
     <button id="load-btn" style="border-color:#38bdf8;color:#bae6fd">Load .glb / .obj</button>
     <input id="file-in" type="file" accept=".glb,.gltf,.obj" style="display:none">
     <select id="quality" aria-label="Quality">
-      <option value="low">Quality: Low</option>
-      <option value="medium">Quality: Medium</option>
-      <option value="high" selected>Quality: High</option>
-      <option value="ultra">Quality: Ultra</option>
+      <option value="very_low">Quality: Very Low (Mobile)</option>
+      <option value="low">Quality: Low (Performance)</option>
+      <option value="medium">Quality: Medium (Balanced)</option>
+      <option value="high" selected>Quality: High (Default)</option>
+      <option value="very_high">Quality: Very High</option>
+      <option value="ultra">Quality: Ultra (Reference)</option>
     </select>
     <select id="viewmode" aria-label="View mode">
       <option value="0" selected>View: Shaded PBR + GI</option>
@@ -235,9 +237,12 @@ try {
   }
 
   document.querySelectorAll('button[data-scene]').forEach(b => { b.onclick = () => selectScene(b.dataset.scene); });
-  document.querySelector('#quality').onchange = e => { gpu.setQuality(e.target.value); };
+  document.querySelector('#quality').onchange = e => {
+    gpu.setQuality(e.target.value);
+    document.querySelector('#refl').checked = gpu.useReflections;
+  };
   document.querySelector('#viewmode').onchange = e => { gpu.viewMode = Number(e.target.value); };
-  document.querySelector('#refl').onchange = e => { gpu.useReflections = e.target.checked; };
+  document.querySelector('#refl').onchange = e => { gpu.useReflections = e.target.checked; gpu.stillFrames = 0; };
   document.querySelector('#hash').onchange = e => { gpu.useHash = e.target.checked; };
   document.querySelector('#reuse').onchange = e => { gpu.reuseEnabled = e.target.checked; };
   document.querySelector('#emissive').onchange = e => {
