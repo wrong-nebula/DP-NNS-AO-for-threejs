@@ -108,6 +108,8 @@ uniform sampler2D aoNormalTex;
 uniform sampler2D aoBentTex;
 #ifdef DIFFUSE_GI
 uniform sampler2D aoGITex;
+uniform sampler2D sunShadowTex;
+uniform sampler2D orbShadowTex;
 #endif
 uniform vec2 invProjXY;
 // The shown AO blends the four-tap formula with the traced mean, the traced weight frames/(frames+blendK):
@@ -177,9 +179,8 @@ vec3 tracedAt(vec3 pWorld,vec3 n){
   return resVal;
 }
 #ifdef DIFFUSE_GI
-vec3 tracedAtGI(vec3 pWorld,vec3 n,out vec3 giOutIrr,out float cachedSunSh){
+vec3 tracedAtGI(vec3 pWorld,vec3 n,out vec3 giOutIrr){
   giOutIrr=vec3(0.);
-  cachedSunSh=-1.;
   vec2 res=vec2(textureSize(aoTex,0));
   vec2 invRes2=2./res;
   vec2 f=gl_FragCoord.xy*res/vec2(${W}.,${H}.)-.5;
@@ -190,7 +191,7 @@ vec3 tracedAtGI(vec3 pWorld,vec3 n,out vec3 giOutIrr,out float cachedSunSh){
   float viewDepth=-vp.z;
   vec2 vnXY=vn.xy*invProjXY;
   float vpDotN=dot(vn,vp);
-  vec3 acc=vec3(0.);vec3 gAcc=vec3(0.);float shAcc=0.;float ws=0.;
+  vec3 acc=vec3(0.);vec3 gAcc=vec3(0.);float ws=0.;
   float bestScore=1e9;vec3 bestGI=vec3(0.);
   float planeTol=.0015*viewDepth+.005;
   float depthTol=.08*viewDepth+.05;
@@ -214,7 +215,6 @@ vec3 tracedAtGI(vec3 pWorld,vec3 n,out vec3 giOutIrr,out float cachedSunSh){
     float sig=hn.z*.25;
     acc+=bw*vec3(h.x,frames,sig*sig);
     gAcc+=bw*gTap.rgb;
-    shAcc+=bw*gTap.a;
     ws+=bw;
   }
   if(ws<=.01){
@@ -224,7 +224,6 @@ vec3 tracedAtGI(vec3 pWorld,vec3 n,out vec3 giOutIrr,out float cachedSunSh){
   }
   vec3 resVal=acc/ws;
   giOutIrr=gAcc/ws;
-  cachedSunSh=shAcc/ws;
   // Lightweight 4-tap axial edge-preserving polish (aoGITex is already denoised by 2/3-pass half-res a-trous)
   ivec2 c0=clamp(ivec2(round(f)),ivec2(0),ivec2(res)-1);
   float fSum=resVal.x*2.,fw=2.;
@@ -587,7 +586,7 @@ void main(){
     float shown;
     #ifdef DIFFUSE_GI
     vec3 giIrr=vec3(0.);
-    float cachedSunSh=-1.;
+    bool giSil=true;
     #endif
     if(movingFace>.5){
       // Moving surfaces: the four-tap static formula every frame (their history would be another surface's).
@@ -598,7 +597,8 @@ void main(){
       // Shown: formula and traced mean blended (see blendK). Only the traced mean is accumulated (AO pass), so
       // the blend never feeds back into the history. Settled pixels skip the 4 full-res SDF reads completely.
       #ifdef DIFFUSE_GI
-      vec3 tr=tracedAtGI(p,normal,giIrr,cachedSunSh);
+      vec3 tr=tracedAtGI(p,normal,giIrr);
+      giSil=tr.y<.5;
       #else
       vec3 tr=tracedAt(p,normal);
       #endif
@@ -670,9 +670,11 @@ void main(){
       vec3 bn=texelFetch(aoBentTex,bq,0).xyz*2.-1.;
       if(length(bn)>.2)bentN=normalize(bn);
     }
+    vec2 shUV=gl_FragCoord.xy/vec2(${W}.,${H}.);
+    float cSunSh=texture(sunShadowTex,shUV).r;
     float sunSh=0.;
     if(sun>.001){
-      if(cachedSunSh>=0.&&(cachedSunSh<=.005||cachedSunSh>=.995))sunSh=cachedSunSh>.5?1.:0.;
+      if(!giSil&&(cSunSh<=.005||cSunSh>=.995))sunSh=cSunSh>.5?1.:0.;
       else sunSh=sdfSunShadow(p,normal,sDir);
     }
     vec3 sunCol=vec3(2.25,2.10,1.85);
@@ -693,12 +695,15 @@ void main(){
     float specOcc=specularOcclusion(NoV,ao,rough);
     vec3 spec=sunCol*(D*F*.18*sun*sunSh*specOcc)+skyCol*(.025*specOcc*pow(1.-NoV,4.));
     if(dot(emissiveColor,emissiveColor)>1e-5){
+      float cOrbSh=texture(orbShadowTex,shUV).r;
+      float cOrbGrad=fwidth(cOrbSh);
       vec3 toOrb=emissivePos-p;
       float orbDist=length(toOrb);
       vec3 oDir=toOrb/max(orbDist,1e-4);
       float oNdl=max(0.,dot(normal,oDir));
       if(oNdl>.001){
-        float orbSh=sdfPointShadow(p,normal,oDir,max(0.,orbDist-emissiveRadius-.04));
+        float orbSh=(!giSil&&(cOrbSh<=.005||cOrbSh>=.995||cOrbGrad<.06))
+          ?cOrbSh:sdfPointShadow(p,normal,oDir,max(0.,orbDist-emissiveRadius-.04));
         float atten=1./(orbDist*orbDist+.25);
         direct+=emissiveColor*(oNdl*atten*orbSh);
         vec3 Ho=normalize(V+oDir);
@@ -825,29 +830,6 @@ float staticDistance(vec3 pos){
   if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return 1e4;
   return texture(field,uv).r;
 }
-#ifdef DIFFUSE_GI
-float sdfSunShadowGI(vec3 pos,vec3 nor,vec3 sDir){
-  float ndl=dot(nor,sDir);
-  if(ndl<=.001)return 0.;
-  vec3 ro=pos+nor*.03+sDir*.02;
-  float ndlC=max(ndl,.15);
-  float t=.02,res=1.;
-  for(int s=0;s<68;s++){
-    float d=staticDistance(ro+sDir*t);
-    if(d>100.)break;
-    float tol=min(.012,.22*t*ndlC);
-    float dc=d-tol;
-    if(dc<=0.)return 0.;
-    res=min(res,8.*dc/t);
-    if(res<.005)return 0.;
-    float stepMul=mix(.4,.8,smoothstep(.40,.85,d));
-    t+=max(d*stepMul,.012);
-    if(t>10.5)break;
-  }
-  res=clamp(res,0.,1.);
-  return res*res*(3.-2.*res);
-}
-#endif
 // Front-loaded champion directions and its far SDF march, with exact triangle
 // visibility over the skipped near segment plus half a field-cell diagonal.
 float ign(vec2 q){return fract(52.9829189*fract(dot(q,vec2(.06711056,.00583715))));}
@@ -947,7 +929,6 @@ void main(){
   #endif
   #ifdef DIFFUSE_GI
   vec3 giIrr;
-  float sunShOut=prevGI.a;
   #endif
   if(turn&&!settled){
     #ifdef DIFFUSE_GI
@@ -973,10 +954,6 @@ void main(){
     }
     float giAlpha=h.y<.5?1.:(giAlphaFloor>.001?giAlphaFloor:1./max(giFrames,1.));
     giIrr=mix(prevGI.rgb,sampleGI,giAlpha);
-    // Cache half-res sun shadow in giOut.a when sun moves, camera moves, or first frame
-    if(sunShOut<-.5||giAlphaFloor>.01||giFrames<2.5){
-      sunShOut=sdfSunShadowGI(p,normal,normalize(giSunDir));
-    }
     #else
     frames=min(h.y+1.,histMax);
     float nd=h.y<8.?4.:(h.y<16.?3.:(h.y>=24.&&h.z<.0006?1.:2.));
@@ -1007,7 +984,7 @@ void main(){
   bentOut=vec4(bentN*.5+.5,1.);
   #endif
   #ifdef DIFFUSE_GI
-  giOut=vec4(giIrr,sunShOut);
+  giOut=vec4(giIrr,1.);
   #endif
 }`;
 // GPU bake of a signed distance field for an arbitrary triangle mesh, one z-layer
@@ -1218,8 +1195,9 @@ try {
   // - two history targets, ping-ponged: AO + view depth (float: half floats round away the small updates of a long
   //   history); normal + frames/255. The AO pass writes one while reading the other; the scene draw reads it.
   const nearest=t=>{t.minFilter=t.magFilter=T.NearestFilter;t.generateMipmaps=false;};
-  let aoScale=.5,gTarget,histories,historiesBent=null,historiesGI=null,giDenoiseTargets=null,hiz1,hiz2;let histIndex=0;
-  let giAccumFrames=0,giSunCooldown=0,giDenoiseCached=false,giDenoiseLastIdx=1,giGTargetValid=false,giHasRecurrent=false;
+  let aoScale=.5,gTarget,histories,historiesBent=null,historiesGI=null,giDenoiseTargets=null,sunShadowTarget=null,orbShadowTarget=null,hiz1,hiz2;let histIndex=0;
+  let giAccumFrames=0,giSunCooldown=0,giDenoiseCached=false,giDenoiseLastIdx=0,giGTargetValid=false,giHasRecurrent=false;
+  let sunShadowDirty=true,orbShadowDirty=true;
   function makeHistPair(w,h,count,giHalf=false){
     return [0,1].map(()=>{const rt=new T.WebGLRenderTarget(w,h,{count,depthBuffer:false});
       rt.textures[0].type=T.FloatType;rt.textures[0].format=T.RGFormat;
@@ -1238,17 +1216,27 @@ try {
     const w=Math.round(W*aoScale),h=Math.round(H*aoScale);
     historiesGI=makeHistPair(w,h,4,true);
     for(const rt of historiesGI){renderer.setRenderTarget(rt);renderer.clear();}
-    giDenoiseTargets=[0,1].map(()=>{
+    // [1] holds true Pass-1 (stride=1) denoised GI for REBLUR recurrent feedback; [0] holds Pass-2; [2] holds Pass-3.
+    giDenoiseTargets=[0,1,2].map(()=>{
       const rt=new T.WebGLRenderTarget(w,h,{depthBuffer:false});
       rt.texture.type=T.HalfFloatType;nearest(rt.texture);return rt;
     });
     for(const rt of giDenoiseTargets){renderer.setRenderTarget(rt);renderer.clear();}
+    const makeShadowRT=()=>{
+      const rt=new T.WebGLRenderTarget(w,h,{depthBuffer:false});
+      rt.texture.format=T.RedFormat;rt.texture.type=T.UnsignedByteType;
+      rt.texture.minFilter=rt.texture.magFilter=T.LinearFilter;rt.texture.generateMipmaps=false;
+      return rt;
+    };
+    sunShadowTarget=makeShadowRT();
+    orbShadowTarget=makeShadowRT();
+    for(const rt of [sunShadowTarget,orbShadowTarget]){renderer.setRenderTarget(rt);renderer.clear();}
     renderer.setRenderTarget(null);
   }
   function makeTracedTargets(scale){
     const w=Math.round(W*scale),h=Math.round(H*scale);
-    gTarget?.dispose();histories?.forEach(rt=>rt.dispose());historiesBent?.forEach(rt=>rt.dispose());historiesBent=null;historiesGI?.forEach(rt=>rt.dispose());historiesGI=null;giDenoiseTargets?.forEach(rt=>rt.dispose());giDenoiseTargets=null;hiz1?.dispose();hiz2?.dispose();
-    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;giGTargetValid=false;
+    gTarget?.dispose();histories?.forEach(rt=>rt.dispose());historiesBent?.forEach(rt=>rt.dispose());historiesBent=null;historiesGI?.forEach(rt=>rt.dispose());historiesGI=null;giDenoiseTargets?.forEach(rt=>rt.dispose());giDenoiseTargets=null;sunShadowTarget?.dispose();sunShadowTarget=null;orbShadowTarget?.dispose();orbShadowTarget=null;hiz1?.dispose();hiz2?.dispose();
+    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;giGTargetValid=false;giHasRecurrent=false;sunShadowDirty=true;orbShadowDirty=true;
     gTarget=new T.WebGLRenderTarget(w,h,{count:2});
     gTarget.textures[0].type=T.FloatType;gTarget.textures[1].type=T.HalfFloatType;gTarget.textures.forEach(nearest);
     // Standard traced path: 2 MRTs (RG32F + RGBA8 = 12 B/px). 3rd bentOut MRT is allocated only when PBR is active.
@@ -1280,7 +1268,7 @@ try {
     // 64: on a still camera, settled pixels stop tracing (about 1 s at 60 fps), with the same error as tracing
     // on (0.0175 at 256 frames; 32 settles at 0.0188).
     settleFrames:{value:64},smoothFalloff:{value:0},
-    aoTex:{value:null},aoNormalTex:{value:null},aoBentTex:{value:null},aoGITex:{value:null}};
+    aoTex:{value:null},aoNormalTex:{value:null},aoBentTex:{value:null},aoGITex:{value:null},sunShadowTex:{value:null},orbShadowTex:{value:null}};
   const sdfUniforms={
     field:{value:field},
     sdfMin:{value:new T.Vector3(-1,-1,-1)},
@@ -1363,6 +1351,51 @@ try {
         }
       }
       o=vec4(sum/wSum,cFull.a);
+    }`}));
+  // Dedicated low-register half-res R8 shadow passes (peak Metal SIMD occupancy; run ONLY when sun/orb/camera moves).
+  const sunShadowPass=new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,
+    uniforms:{gPos:{value:null},gNormal:{value:null},field:sdfUniforms.field,sdfMin:sdfUniforms.sdfMin,sdfInvSpan:sdfUniforms.sdfInvSpan,sunDir:sdfUniforms.sunDir},
+    vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',
+    fragmentShader:`precision highp float;precision highp sampler3D;
+    uniform sampler2D gPos;uniform sampler2D gNormal;uniform sampler3D field;
+    uniform vec3 sdfMin;uniform vec3 sdfInvSpan;uniform vec3 sunDir;out vec4 o;
+    float sDist(vec3 pos){vec3 uv=(pos-sdfMin)*sdfInvSpan;if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return 1e4;return texture(field,uv).r;}
+    void main(){
+      ivec2 q=ivec2(gl_FragCoord.xy);vec4 g=texelFetch(gPos,q,0);
+      if(g.w<=0.){o=vec4(1.);return;}
+      vec3 nor=normalize(texelFetch(gNormal,q,0).xyz),sDir=normalize(sunDir);
+      float ndl=dot(nor,sDir);if(ndl<=.001){o=vec4(0.);return;}
+      vec3 ro=g.xyz+nor*.03+sDir*.02;float ndlC=max(ndl,.15),t=.02,res=1.;
+      for(int s=0;s<68;s++){
+        float d=sDist(ro+sDir*t);if(d>100.)break;
+        float dc=d-min(.012,.22*t*ndlC);if(dc<=0.){res=0.;break;}
+        res=min(res,8.*dc/t);if(res<.005){res=0.;break;}
+        t+=max(d*mix(.4,.8,smoothstep(.40,.85,d)),.012);if(t>10.5)break;
+      }
+      res=clamp(res,0.,1.);o=vec4(res*res*(3.-2.*res));
+    }`}));
+  const orbShadowPass=new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,
+    uniforms:{gPos:{value:null},gNormal:{value:null},field:sdfUniforms.field,sdfMin:sdfUniforms.sdfMin,sdfInvSpan:sdfUniforms.sdfInvSpan,emissivePos:sdfUniforms.emissivePos,emissiveRadius:sdfUniforms.emissiveRadius},
+    vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',
+    fragmentShader:`precision highp float;precision highp sampler3D;
+    uniform sampler2D gPos;uniform sampler2D gNormal;uniform sampler3D field;
+    uniform vec3 sdfMin;uniform vec3 sdfInvSpan;uniform vec3 emissivePos;uniform float emissiveRadius;out vec4 o;
+    float sDist(vec3 pos){vec3 uv=(pos-sdfMin)*sdfInvSpan;if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return 1e4;return texture(field,uv).r;}
+    void main(){
+      ivec2 q=ivec2(gl_FragCoord.xy);vec4 g=texelFetch(gPos,q,0);
+      if(g.w<=0.){o=vec4(1.);return;}
+      vec3 nor=normalize(texelFetch(gNormal,q,0).xyz);
+      vec3 toOrb=emissivePos-g.xyz;float orbDist=length(toOrb);vec3 lDir=toOrb/max(orbDist,1e-4);
+      float ndl=dot(nor,lDir);if(ndl<=.001){o=vec4(0.);return;}
+      float maxDist=max(0.,orbDist-emissiveRadius-.04);if(maxDist<=.05){o=vec4(1.);return;}
+      vec3 ro=g.xyz+nor*.03+lDir*.02;float ndlC=max(ndl,.15),t=.02,res=1.;
+      for(int s=0;s<36;s++){
+        float d=sDist(ro+lDir*t);if(d>100.)break;
+        float dc=d-min(.012,.20*t*ndlC);if(dc<=0.){res=0.;break;}
+        res=min(res,7.*dc/t);if(res<.005){res=0.;break;}
+        t+=max(d*mix(.45,.8,smoothstep(.35,.80,d)),.014);if(t>=maxDist)break;
+      }
+      res=clamp(res,0.,1.);o=vec4(res*res*(3.-2.*res));
     }`}));
   const lastCamera=new T.Matrix4();
   // Two compiled variants per mode: with mover code, and without it (NO_DYN) for when no mover
@@ -1589,12 +1622,14 @@ try {
       camera.updateMatrixWorld();
       const stillCamera=camera.matrixWorld.equals(lastCamera);
       traced.histMax.value=stillCamera?128:32;lastCamera.copy(camera.matrixWorld);
-      if(useGI&&stillCamera&&giSunCooldown===0&&dyn.dynCount.value===0&&traced.settleFrames.value>0&&giAccumFrames>=128&&giDenoiseCached){
-        // Fully settled static GI frame: reuse cached AO, bent-normal & denoised GI targets directly.
+      if(useGI&&stillCamera&&giSunCooldown===0&&!sunShadowDirty&&!orbShadowDirty&&dyn.dynCount.value===0&&traced.settleFrames.value>0&&giAccumFrames>=128&&giDenoiseCached){
+        // Fully settled static GI frame: reuse cached AO, bent-normal, half-res shadows & denoised GI targets directly.
         const lastWritten=histPair[1-histIndex];
         traced.aoTex.value=lastWritten.textures[0];traced.aoNormalTex.value=lastWritten.textures[1];
         traced.aoBentTex.value=lastWritten.textures[2];
         traced.aoGITex.value=giDenoiseTargets[giDenoiseLastIdx].texture;
+        traced.sunShadowTex.value=sunShadowTarget.texture;
+        traced.orbShadowTex.value=orbShadowTarget.texture;
         emissiveOrbMesh.visible=emissiveMode.value&&activeScene==='gallery'&&!mask.value&&!giMask.value;
         renderer.setRenderTarget(null);renderer.render(scene,camera);
         traced.frame.value++;
@@ -1609,15 +1644,31 @@ try {
         scene.background=bg;renderer.setClearColor(cc,ca);setMaterial(material);
         giGTargetValid=useGI&&dyn.dynCount.value===0;
       }
+      if(useGI){
+        const orbOn=emissiveMode.value&&activeScene==='gallery';
+        if(!stillCamera||sunShadowDirty){
+          sunShadowPass.material.uniforms.gPos.value=gTarget.textures[0];
+          sunShadowPass.material.uniforms.gNormal.value=gTarget.textures[1];
+          renderer.setRenderTarget(sunShadowTarget);sunShadowPass.render(renderer);
+          sunShadowDirty=false;
+        }
+        if(orbOn&&(!stillCamera||orbShadowDirty)){
+          orbShadowPass.material.uniforms.gPos.value=gTarget.textures[0];
+          orbShadowPass.material.uniforms.gNormal.value=gTarget.textures[1];
+          renderer.setRenderTarget(orbShadowTarget);orbShadowPass.render(renderer);
+          orbShadowDirty=false;
+        }
+        traced.sunShadowTex.value=sunShadowTarget.texture;
+        traced.orbShadowTex.value=orbShadowTarget.texture;
+      }
       m.gPos.value=gTarget.textures[0];m.gNormal.value=gTarget.textures[1];
       m.histTex.value=prev.textures[0];m.normalTex.value=prev.textures[1];
       if(useBent)m.bentTex.value=prev.textures[2];
       let sunMoving=false,giSmooth=0,giFullySettled=false;
       if(useGI){
         sunMoving=giSunCooldown>0;
-        // REBLUR-style recurrent feedback during motion: feed back the previous frame's stride-1
-        // tangent-plane-filtered GI (stored in giDenoiseTargets[1]) so spatial variance collapses
-        // exponentially across frames instead of drifting as low-frequency color blobs.
+        // True REBLUR-style stride-1 recurrent feedback during motion: giDenoiseTargets[1] holds Pass 1
+        // (stride=1, untouched by Pass 2/3) so spatial variance collapses without stride-3 over-blurring.
         const useRecurrent=(!stillCamera||sunMoving)&&giHasRecurrent;
         m.giTex.value=useRecurrent?giDenoiseTargets[1].texture:prev.textures[3];
         if(!stillCamera){
@@ -1654,25 +1705,20 @@ try {
           const du=giDenoisePass.material.uniforms;
           du.aoTex.value=cur.textures[0];du.aoNormalTex.value=cur.textures[1];
           du.giSmoothFactor.value=giSmooth;
+          // Pass 1 (stride=1) -> [1] (always preserved as true stride-1 REBLUR recurrent feedback),
+          // Pass 2 (stride=3) -> [0], Pass 3 (stride=6, while moving/young) -> [2].
+          du.giSrc.value=cur.textures[3];du.stepSize.value=1;
+          renderer.setRenderTarget(giDenoiseTargets[1]);giDenoisePass.render(renderer);
+          du.giSrc.value=giDenoiseTargets[1].texture;du.stepSize.value=3;
+          renderer.setRenderTarget(giDenoiseTargets[0]);giDenoisePass.render(renderer);
           if(!stillCamera||sunMoving||giAccumFrames<16){
-            // Pass 1 (stride=1) -> [0], Pass 2 (stride=3) -> [1] (reused as recurrent feedback while moving),
-            // Pass 3 (stride=6) -> [0] (displayed). Tangent-plane + normal weights keep geometric corners sharp.
-            du.giSrc.value=cur.textures[3];du.stepSize.value=1;
-            renderer.setRenderTarget(giDenoiseTargets[0]);giDenoisePass.render(renderer);
-            du.giSrc.value=giDenoiseTargets[0].texture;du.stepSize.value=3;
-            renderer.setRenderTarget(giDenoiseTargets[1]);giDenoisePass.render(renderer);
-            du.giSrc.value=giDenoiseTargets[1].texture;du.stepSize.value=6;
-            renderer.setRenderTarget(giDenoiseTargets[0]);giDenoisePass.render(renderer);
-            giDenoiseLastIdx=0;
-            giHasRecurrent=true;
+            du.giSrc.value=giDenoiseTargets[0].texture;du.stepSize.value=6;
+            renderer.setRenderTarget(giDenoiseTargets[2]);giDenoisePass.render(renderer);
+            giDenoiseLastIdx=2;
           }else{
-            du.giSrc.value=cur.textures[3];du.stepSize.value=1;
-            renderer.setRenderTarget(giDenoiseTargets[0]);giDenoisePass.render(renderer);
-            du.giSrc.value=giDenoiseTargets[0].texture;du.stepSize.value=3;
-            renderer.setRenderTarget(giDenoiseTargets[1]);giDenoisePass.render(renderer);
-            giDenoiseLastIdx=1;
-            giHasRecurrent=true;
+            giDenoiseLastIdx=0;
           }
+          giHasRecurrent=true;
           traced.aoGITex.value=giDenoiseTargets[giDenoiseLastIdx].texture;
           if(giFullySettled)giDenoiseCached=true;
         }
@@ -1734,7 +1780,7 @@ try {
     if(historiesBent)for(const rt of historiesBent){renderer.setRenderTarget(rt);renderer.clear();}
     if(historiesGI)for(const rt of historiesGI){renderer.setRenderTarget(rt);renderer.clear();}
     renderer.setRenderTarget(null);
-    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;giGTargetValid=false;giHasRecurrent=false;
+    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;giGTargetValid=false;giHasRecurrent=false;sunShadowDirty=true;orbShadowDirty=true;
   }
   function setGI(on){
     giMode.value=!!on;
@@ -1773,6 +1819,7 @@ try {
       return;
     }
     currentEmissiveSpec();
+    orbShadowDirty=true;
     if(relight&&giMode.value&&radianceGrids[activeScene]){
       relightActiveRadianceGrid();
       giSunCooldown=2;
@@ -1791,6 +1838,7 @@ try {
       sdfUniforms.emissiveColor.value.set(0,0,0);
       emissiveOrbMesh.visible=false;
     }
+    orbShadowDirty=true;
     if(giMode.value&&radianceGrids[activeScene]){
       relightActiveRadianceGrid();
       giSunCooldown=2;
@@ -1813,7 +1861,8 @@ try {
     if(giMode.value&&radianceGrids[activeScene]){
       relightActiveRadianceGrid();
     }
-    // Keep static AO & bent-normal history intact; only mark GI responsive & invalidate GI denoise cache.
+    // Keep static AO & bent-normal history intact; only mark sun shadow & GI responsive.
+    sunShadowDirty=true;
     giSunCooldown=2;
     giAccumFrames=1;
     giDenoiseCached=false;
