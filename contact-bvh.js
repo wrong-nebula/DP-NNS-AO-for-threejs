@@ -1,10 +1,9 @@
 // Exact near-contact visibility for static triangle meshes.
-// Phase 3A: O(T) AABB-to-cell binning + binned SAH + cell-clipped quantized RGBA32UI
-// single-fetch nodes (16 B/node) + ray-sign-ordered short-stack traversal.
+// O(T) AABB-to-cell binning + binned SAH + cell-clipped quantized RGBA32UI
+// sibling-pair dual-child BVH2 (16 B/node) + FMA slab test + inline leaf traversal.
 // Bounds come from mesh world transforms, never camera position or reference data.
 export const CONTACT_GLSL=`
 uniform highp usampler2D contactNodes;
-uniform highp usampler2D contactTriIdx;
 uniform sampler2D contactTriangles;
 uniform highp usampler3D contactGrid;
 uniform vec3 contactGridMin;
@@ -14,9 +13,8 @@ uniform vec3 contactRootSpan;
 uniform int contactNodeCount;
 uniform float contactRange;
 uniform float contactBias;
-vec4 contactFetch(sampler2D tex,int i){int width=textureSize(tex,0).x;return texelFetch(tex,ivec2(i%width,i/width),0);}
-uvec4 contactFetchNode(int i){int width=textureSize(contactNodes,0).x;return texelFetch(contactNodes,ivec2(i%width,i/width),0);}
-int contactFetchTriId(int i){int width=textureSize(contactTriIdx,0).x;return int(texelFetch(contactTriIdx,ivec2(i%width,i/width),0).r);}
+vec4 contactFetch(sampler2D tex,int i){return texelFetch(tex,ivec2(i&1023,i>>10),0);}
+uvec4 contactFetchNode(int i){return texelFetch(contactNodes,ivec2(i&1023,i>>10),0);}
 uniform int contactMode;
 uniform mat4 curViewProj;
 uniform mat4 curView;
@@ -47,69 +45,98 @@ bool contactBlockedHiZ(vec3 p,vec3 n,vec3 w){
  }
  return false;
 }
+float contactBoxHit(uvec4 nd,vec3 qInv,vec3 qOff){
+ vec3 a=vec3(float(nd.x&0xFFFFu),float(nd.x>>16u),float(nd.y&0xFFFFu))*qInv+qOff;
+ vec3 b=vec3(float(nd.y>>16u),float(nd.z&0xFFFFu),float(nd.z>>16u))*qInv+qOff;
+ vec3 nearT=min(a,b),farT=max(a,b);
+ float t0=max(0.,max(nearT.x,max(nearT.y,nearT.z)));
+ float t1=min(contactRange,min(farT.x,min(farT.y,farT.z)));
+ return t1>=t0?t0:-1.;
+}
+bool contactTestLeaf(uint meta,vec3 origin,vec3 w){
+ int first=int((meta&0x7FFFFFFFu)>>3u);
+ int count=int(meta&7u);
+ for(int j=0;j<7;j++){
+  if(j>=count)break;
+  int tri=(first+j)*3;
+  vec3 v0=contactFetch(contactTriangles,tri).xyz;
+  vec3 e1=contactFetch(contactTriangles,tri+1).xyz;
+  vec3 e2=contactFetch(contactTriangles,tri+2).xyz;
+  vec3 h=cross(w,e2);
+  float det=dot(e1,h);
+  if(abs(det)<1e-10)continue;
+  float invDet=1./det;
+  vec3 s=origin-v0;
+  float u=dot(s,h)*invDet;
+  if(u<0.||u>1.)continue;
+  vec3 q=cross(s,e1);
+  float v=dot(w,q)*invDet;
+  if(v<0.||u+v>1.)continue;
+  float distance=dot(e2,q)*invDet;
+  if(distance>0.&&distance<=contactRange)return true;
+ }
+ return false;
+}
+bool contactBlockedCell(vec3 origin,vec3 w,int root,int treeCount,vec3 qMin,vec3 qScale){
+ if(treeCount<=0)return false;
+ vec3 inv=1./vec3(abs(w.x)<1e-12?1e-12:w.x,abs(w.y)<1e-12?1e-12:w.y,abs(w.z)<1e-12?1e-12:w.z);
+ vec3 qInv=qScale*inv;
+ vec3 qOff=(qMin-origin)*inv;
+ if(treeCount==1){
+  uvec4 nd=contactFetchNode(root);
+  if(contactBoxHit(nd,qInv,qOff)<0.)return false;
+  return contactTestLeaf(nd.w,origin,w);
+ }
+ int stack[16];
+ int sp=0;
+ int pair=root;
+ for(int visit=0;visit<1024;visit++){
+  uvec4 ndL=contactFetchNode(pair);
+  uvec4 ndR=contactFetchNode(pair+1);
+  float tL=contactBoxHit(ndL,qInv,qOff);
+  float tR=contactBoxHit(ndR,qInv,qOff);
+  bool hitL=tL>=0.;
+  bool hitR=tR>=0.;
+  if(hitL&&(ndL.w&0x80000000u)!=0u){
+   if(contactTestLeaf(ndL.w,origin,w))return true;
+   hitL=false;
+  }
+  if(hitR&&(ndR.w&0x80000000u)!=0u){
+   if(contactTestLeaf(ndR.w,origin,w))return true;
+   hitR=false;
+  }
+  if(hitL&&hitR){
+   if(tL<=tR){
+    if(sp<16)stack[sp++]=int(ndR.w);
+    pair=int(ndL.w);
+   }else{
+    if(sp<16)stack[sp++]=int(ndL.w);
+    pair=int(ndR.w);
+   }
+   continue;
+  }
+  if(hitL){pair=int(ndL.w);continue;}
+  if(hitR){pair=int(ndR.w);continue;}
+  if(sp==0)break;
+  pair=stack[--sp];
+ }
+ return false;
+}
 bool contactBlocked(vec3 p,vec3 n,vec3 w){
  if(contactMode==1)return contactBlockedHiZ(p,n,w);
- vec3 origin=p+n*contactBias,inv=1./(w+vec3(1e-20));
- int root=0,end=contactNodeCount;
+ vec3 origin=p+n*contactBias;
+ int root=0,treeCount=contactNodeCount;
  vec3 qMin=contactRootMin,qSpan=contactRootSpan;
  if(contactGridSize>0.){
   ivec3 cell=ivec3(floor((p-contactGridMin)/contactGridSize));
   ivec3 dims=textureSize(contactGrid,0);
   if(any(lessThan(cell,ivec3(0)))||any(greaterThanEqual(cell,dims)))return false;
   uvec2 bounds=texelFetch(contactGrid,cell,0).xy;
-  root=int(bounds.x);end=int(bounds.y);
-  if(root>=end)return false;
+  root=int(bounds.x);treeCount=int(bounds.y);
   qMin=contactGridMin+vec3(cell)*contactGridSize-vec3(contactRange+abs(contactBias));
   qSpan=vec3(contactGridSize+2.*(contactRange+abs(contactBias)));
- }else if(end<=0){return false;}
- vec3 qScale=qSpan*(1./65535.);
- int stack[24];
- int sp=0;
- int node=root;
- for(int visit=0;visit<2048;visit++){
-  uvec4 nd=contactFetchNode(node);
-  vec3 lo=qMin+vec3(float(nd.x&0xFFFFu),float(nd.x>>16u),float(nd.y&0xFFFFu))*qScale;
-  vec3 hi=qMin+vec3(float(nd.y>>16u),float(nd.z&0xFFFFu),float(nd.z>>16u))*qScale;
-  vec3 a=(lo-origin)*inv,b=(hi-origin)*inv;
-  vec3 nearT=min(a,b),farT=max(a,b);
-  float t0=max(0.,max(nearT.x,max(nearT.y,nearT.z)));
-  float t1=min(contactRange,min(farT.x,min(farT.y,farT.z)));
-  if(t1>=t0){
-   uint meta=nd.w;
-   if((meta&0x80000000u)!=0u){
-    int first=int((meta&0x7FFFFFFFu)>>3u);
-    int count=int(meta&7u);
-    for(int j=0;j<4;j++){
-     if(j>=count)break;
-     int tri=contactFetchTriId(first+j)*3;
-     vec3 v0=contactFetch(contactTriangles,tri).xyz;
-     vec3 e1=contactFetch(contactTriangles,tri+1).xyz;
-     vec3 e2=contactFetch(contactTriangles,tri+2).xyz;
-     vec3 h=cross(w,e2);float det=dot(e1,h);
-     if(abs(det)<1e-10)continue;
-     vec3 s=origin-v0;float u=dot(s,h)/det;
-     if(u<0.||u>1.)continue;
-     vec3 q=cross(s,e1);float v=dot(w,q)/det;
-     if(v<0.||u+v>1.)continue;
-     float distance=dot(e2,q)/det;
-     if(distance>0.&&distance<=contactRange)return true;
-    }
-   }else{
-    int axis=int(meta>>29u);
-    int right=int(meta&0x1FFFFFFFu);
-    int left=node+1;
-    bool neg=(axis==0?w.x:(axis==1?w.y:w.z))<0.;
-    int firstChild=neg?right:left;
-    int secondChild=neg?left:right;
-    if(sp<24)stack[sp++]=secondChild;
-    node=firstChild;
-    continue;
-   }
-  }
-  if(sp==0)break;
-  node=stack[--sp];
  }
- return false;
+ return contactBlockedCell(origin,w,root,treeCount,qMin,qSpan*(1./65535.));
 }
 float vdc2(uint bits){
  bits=(bits<<16u)|(bits>>16u);
@@ -138,13 +165,46 @@ vec4 candidateAOBent(vec3 p,vec3 n,float nd){
  #endif
  float fu=fract(su+vdc2(uint(frame)));
  uint base=uint(frame)*4u;
+ // 1-Lipschitz SDF empty-sphere contact skip: if d(p + n*k*R) >= k*R, every ray segment [0, R]
+ // with cos(theta) >= 1/(2*k) lies strictly inside the empty ball B(p + n*k*R, k*R).
+ float minCosClear=2.;
+ if(contactMode==0){
+  float dClear2=staticDistance(p+n*(2.*contactRange));
+  if(dClear2>=2.*contactRange-.004&&dClear2<1e3){
+   minCosClear=.25;
+  }else{
+   float dClear1=staticDistance(p+n*contactRange);
+   if(dClear1>=contactRange-.003&&dClear1<1e3)minCosClear=.5;
+  }
+ }
+ // Hoist 3D contact grid cell lookup once per pixel across all rays.
+ vec3 origin=p+n*contactBias;
+ int cellRoot=0,cellCount=0;
+ vec3 cellQMin=contactRootMin,cellQScale=contactRootSpan*(1./65535.);
+ if(contactMode!=1){
+  if(contactGridSize>0.){
+   ivec3 cell=ivec3(floor((p-contactGridMin)/contactGridSize));
+   ivec3 dims=textureSize(contactGrid,0);
+   if(!any(lessThan(cell,ivec3(0)))&&!any(greaterThanEqual(cell,dims))){
+    uvec2 bounds=texelFetch(contactGrid,cell,0).xy;
+    cellRoot=int(bounds.x);cellCount=int(bounds.y);
+    cellQMin=contactGridMin+vec3(cell)*contactGridSize-vec3(contactRange+abs(contactBias));
+    cellQScale=vec3((contactGridSize+2.*(contactRange+abs(contactBias)))*(1./65535.));
+   }
+  }else{
+   cellCount=contactNodeCount;
+  }
+ }
  for(int i=0;i<4;i++){
   if(float(i)>=nd)break;
   float u=clamp((float(i)+fu)/nd,1e-4,.9999);
   float phi=6.2831853*fract(sp+vdc3(base+uint(i)));
-  vec3 w=t*(sqrt(u)*cos(phi))+b*(sqrt(u)*sin(phi))+n*sqrt(1.-u);
-  if(contactBlocked(p,n,w))continue;
-  float cosn=dot(w,n),s=contactRange,v=1.;
+  float cosn=sqrt(1.-u);
+  vec3 w=t*(sqrt(u)*cos(phi))+b*(sqrt(u)*sin(phi))+n*cosn;
+  bool skipBvh=cosn>=minCosClear;
+  bool blocked=!skipBvh&&(contactMode==1?contactBlockedHiZ(p,n,w):contactBlockedCell(origin,w,cellRoot,cellCount,cellQMin,cellQScale));
+  if(blocked)continue;
+  float s=contactRange,v=1.;
   for(int k=0;k<16;k++){
    float d=staticDistance(p+w*s),e=max(min(.025,.1*s*cosn),1e-6);
    float stepVis=clamp((d+e)/(4.*e),0.,1.);
@@ -181,8 +241,10 @@ const bHiX=new Float32Array(SAH_BINS),bHiY=new Float32Array(SAH_BINS),bHiZ=new F
 const bCnt=new Int32Array(SAH_BINS);
 const rArea=new Float32Array(SAH_BINS),rCnt=new Int32Array(SAH_BINS);
 
-export function buildContactBVH(objects,T,{gridSize=0,range=.25,maxTextureSize=4096,max3DTextureSize=256}={}){
- if(!Number.isFinite(range)||range<0||!Number.isFinite(gridSize)||gridSize<0)throw Error('Invalid contact BVH range/grid size');
+export function buildContactBVH(objects,T,{gridSize=0,range=.25,maxLeaf=7,maxTextureSize=4096,max3DTextureSize=256}={}){
+ const autoGrid=gridSize==='auto';
+ if(!Number.isFinite(range)||range<0||(!autoGrid&&(!Number.isFinite(gridSize)||gridSize<0)))throw Error('Invalid contact BVH range/grid size');
+ const leafMax=Math.max(1,Math.min(7,maxLeaf|0));
 
  // Pass 1: count triangles so we allocate exact flat typed arrays once.
  let triCount=0;
@@ -280,30 +342,7 @@ export function buildContactBVH(objects,T,{gridSize=0,range=.25,maxTextureSize=4
   nodeData[o+3]=meta>>>0;
  }
 
- function buildSubtree(s,e){
-  ensureNodes(1);
-  const at=nodeLen++;
-  let lx=Infinity,ly=Infinity,lz=Infinity,hx=-Infinity,hy=-Infinity,hz=-Infinity;
-  let clx=Infinity,cly=Infinity,clz=Infinity,chx=-Infinity,chy=-Infinity,chz=-Infinity;
-  for(let i=s;i<e;i++){
-   const k=wIdx[i];
-   const a=wLoX[k],b=wLoY[k],c=wLoZ[k],d=wHiX[k],f=wHiY[k],g=wHiZ[k];
-   if(a<lx)lx=a;if(b<ly)ly=b;if(c<lz)lz=c;
-   if(d>hx)hx=d;if(f>hy)hy=f;if(g>hz)hz=g;
-   const cx=wCX[k],cy=wCY[k],cz=wCZ[k];
-   if(cx<clx)clx=cx;if(cy<cly)cly=cy;if(cz<clz)clz=cz;
-   if(cx>chx)chx=cx;if(cy>chy)chy=cy;if(cz>chz)chz=cz;
-  }
-  const n=e-s;
-  if(n<=4){
-   ensureOrd(n);
-   const first=ordLen;
-   for(let i=s;i<e;i++)ordIdx[ordLen++]=wIdx[i];
-   packBox(at,lx,ly,lz,hx,hy,hz,(0x80000000|((first<<3)|n))>>>0);
-   return at;
-  }
-
-  // Binned SAH over all 3 axes.
+ function partitionSAH(s,e,clx,cly,clz,chx,chy,chz){
   const extX=chx-clx,extY=chy-cly,extZ=chz-clz;
   let bestCost=Infinity,bestAx=-1,bestBin=0;
   for(let ax=0;ax<3;ax++){
@@ -340,11 +379,8 @@ export function buildContactBVH(objects,T,{gridSize=0,range=.25,maxTextureSize=4
     if(cost<bestCost){bestCost=cost;bestAx=ax;bestBin=b+1;}
    }
   }
-
   let m=s;
-  let splitAx=0;
   if(bestAx>=0){
-   splitAx=bestAx;
    const cLo=bestAx===0?clx:(bestAx===1?cly:clz);
    const ext=bestAx===0?extX:(bestAx===1?extY:extZ);
    const sc=SAH_BINS/ext;
@@ -356,29 +392,92 @@ export function buildContactBVH(objects,T,{gridSize=0,range=.25,maxTextureSize=4
    }
    m=i;
   }
-  if(m<=s||m>=e){
-   const spX=hx-lx,spY=hy-ly,spZ=hz-lz;
-   splitAx=spX>=spY&&spX>=spZ?0:(spY>=spZ?1:2);
-   m=(s+e)>>1;
-  }
+  if(m<=s||m>=e)m=(s+e)>>1;
+  return m;
+ }
 
-  buildSubtree(s,m);
-  const right=buildSubtree(m,e);
-  packBox(at,lx,ly,lz,hx,hy,hz,(((splitAx&3)<<29)|(right&0x1FFFFFFF))>>>0);
-  return at;
+ function buildChild(slot,s,e){
+  let lx=Infinity,ly=Infinity,lz=Infinity,hx=-Infinity,hy=-Infinity,hz=-Infinity;
+  let clx=Infinity,cly=Infinity,clz=Infinity,chx=-Infinity,chy=-Infinity,chz=-Infinity;
+  for(let i=s;i<e;i++){
+   const k=wIdx[i];
+   const a=wLoX[k],b=wLoY[k],c=wLoZ[k],d=wHiX[k],f=wHiY[k],g=wHiZ[k];
+   if(a<lx)lx=a;if(b<ly)ly=b;if(c<lz)lz=c;
+   if(d>hx)hx=d;if(f>hy)hy=f;if(g>hz)hz=g;
+   const cx=wCX[k],cy=wCY[k],cz=wCZ[k];
+   if(cx<clx)clx=cx;if(cy<cly)cly=cy;if(cz<clz)clz=cz;
+   if(cx>chx)chx=cx;if(cy>chy)chy=cy;if(cz>chz)chz=cz;
+  }
+  const n=e-s;
+  if(n<=leafMax){
+   ensureOrd(n);
+   const first=ordLen;
+   for(let i=s;i<e;i++)ordIdx[ordLen++]=wIdx[i];
+   packBox(slot,lx,ly,lz,hx,hy,hz,(0x80000000|((first<<3)|n))>>>0);
+   return;
+  }
+  const m=partitionSAH(s,e,clx,cly,clz,chx,chy,chz);
+  ensureNodes(2);
+  const pair=nodeLen;
+  nodeLen+=2;
+  packBox(slot,lx,ly,lz,hx,hy,hz,pair>>>0);
+  buildChild(pair,s,m);
+  buildChild(pair+1,m,e);
+ }
+
+ function buildTreeRoot(s,e){
+  const n=e-s;
+  if(n<=leafMax){
+   ensureNodes(1);
+   const at=nodeLen++;
+   buildChild(at,s,e);
+   return at;
+  }
+  let clx=Infinity,cly=Infinity,clz=Infinity,chx=-Infinity,chy=-Infinity,chz=-Infinity;
+  for(let i=s;i<e;i++){
+   const k=wIdx[i];
+   const cx=wCX[k],cy=wCY[k],cz=wCZ[k];
+   if(cx<clx)clx=cx;if(cy<cly)cly=cy;if(cz<clz)clz=cz;
+   if(cx>chx)chx=cx;if(cy>chy)chy=cy;if(cz>chz)chz=cz;
+  }
+  const m=partitionSAH(s,e,clx,cly,clz,chx,chy,chz);
+  ensureNodes(2);
+  const pair=nodeLen;
+  nodeLen+=2;
+  buildChild(pair,s,m);
+  buildChild(pair+1,m,e);
+  return pair;
+ }
+
+ // Density-adaptive gridSize when gridSize === 'auto':
+ // Keeps sparse scenes (e.g., Archive) and medium curved scenes (Atrium) at 1.0 m so flat leaf-ordered
+ // triangles stay L2/SLC-resident, while gently refining ultra-dense 50k+ meshes down to >= 0.75 m.
+ let resolvedGridSize=autoGrid?0:gridSize;
+ if(autoGrid&&triCount>0){
+  const dx=Math.max(gHiX-gLoX,1e-3),dy=Math.max(gHiY-gLoY,1e-3),dz=Math.max(gHiZ-gLoZ,1e-3);
+  const vol=dx*dy*dz;
+  const density=triCount/vol;
+  let g=Math.cbrt(40.0/Math.max(density,1e-6));
+  const minG=Math.max(0.75,range*2.5);
+  g=Math.max(minG,Math.min(1.0,g));
+  const maxDim=Math.max(dx,dy,dz);
+  if(maxDim/g>max3DTextureSize-2)g=maxDim/(max3DTextureSize-2);
+  if((dx/g)*(dy/g)*(dz/g)>65536)g=Math.cbrt(vol/65536);
+  resolvedGridSize=Math.round(g*20)/20;
  }
 
  let gridData=new Uint32Array(2),gridMin=[0,0,0],gridDims=[1,1,1],maxTreeNodes=0;
  let rootMin=[0,0,0],rootSpan=[1,1,1];
 
- if(gridSize>0&&triCount>0){
-  gridMin=[Math.floor(gLoX/gridSize)*gridSize,Math.floor(gLoY/gridSize)*gridSize,Math.floor(gLoZ/gridSize)*gridSize];
-  gridDims=[Math.floor((gHiX-gridMin[0])/gridSize)+1,Math.floor((gHiY-gridMin[1])/gridSize)+1,Math.floor((gHiZ-gridMin[2])/gridSize)+1];
+ if(resolvedGridSize>0&&triCount>0){
+  gridMin=[Math.floor(gLoX/resolvedGridSize)*resolvedGridSize,Math.floor(gLoY/resolvedGridSize)*resolvedGridSize,Math.floor(gLoZ/resolvedGridSize)*resolvedGridSize];
+  gridDims=[Math.floor((gHiX-gridMin[0])/resolvedGridSize)+1,Math.floor((gHiY-gridMin[1])/resolvedGridSize)+1,Math.floor((gHiZ-gridMin[2])/resolvedGridSize)+1];
   if(gridDims[0]>max3DTextureSize||gridDims[1]>max3DTextureSize||gridDims[2]>max3DTextureSize)throw Error(`Contact grid exceeds device 3D texture limit ${max3DTextureSize}`);
   const gx=gridDims[0],gy=gridDims[1],gz=gridDims[2],nCells=gx*gy*gz;
-  const invG=1/gridSize;
+  const invG=1/resolvedGridSize;
 
-  // O(T) direct AABB-to-cell binning (2-pass CSR).
+  // O(T) direct AABB-to-cell binning with exact triangle-plane vs expanded-cell separating-axis culling.
+  const halfCell=0.5*resolvedGridSize+range;
   const counts=new Int32Array(nCells);
   for(let i=0;i<triCount;i++){
    const x0=Math.max(0,Math.floor((tLoX[i]-range-gridMin[0])*invG));
@@ -387,9 +486,21 @@ export function buildContactBVH(objects,T,{gridSize=0,range=.25,maxTextureSize=4
    const y1=Math.min(gy-1,Math.floor((tHiY[i]+range-gridMin[1])*invG));
    const z0=Math.max(0,Math.floor((tLoZ[i]-range-gridMin[2])*invG));
    const z1=Math.min(gz-1,Math.floor((tHiZ[i]+range-gridMin[2])*invG));
-   for(let z=z0;z<=z1;z++)for(let y=y0;y<=y1;y++){
-    let off=(z*gy+y)*gx+x0;
-    for(let x=x0;x<=x1;x++,off++)counts[off]++;
+   const ax=e1x[i],ay=e1y[i],az=e1z[i],bx=e2x[i],by=e2y[i],bz=e2z[i];
+   const nx=ay*bz-az*by,ny=az*bx-ax*bz,nz=ax*by-ay*bx;
+   const rPlane=halfCell*(Math.abs(nx)+Math.abs(ny)+Math.abs(nz))+1e-5;
+   const vx=v0x[i],vy=v0y[i],vz=v0z[i];
+   for(let z=z0;z<=z1;z++){
+    const cz=gridMin[2]+(z+0.5)*resolvedGridSize-vz;
+    for(let y=y0;y<=y1;y++){
+     const cy=gridMin[1]+(y+0.5)*resolvedGridSize-vy;
+     const yzDot=ny*cy+nz*cz;
+     let off=(z*gy+y)*gx+x0;
+     for(let x=x0;x<=x1;x++,off++){
+      const cx=gridMin[0]+(x+0.5)*resolvedGridSize-vx;
+      if(Math.abs(nx*cx+yzDot)<=rPlane)counts[off]++;
+     }
+    }
    }
   }
   const offsets=new Int32Array(nCells+1);
@@ -403,21 +514,33 @@ export function buildContactBVH(objects,T,{gridSize=0,range=.25,maxTextureSize=4
    const y1=Math.min(gy-1,Math.floor((tHiY[i]+range-gridMin[1])*invG));
    const z0=Math.max(0,Math.floor((tLoZ[i]-range-gridMin[2])*invG));
    const z1=Math.min(gz-1,Math.floor((tHiZ[i]+range-gridMin[2])*invG));
-   for(let z=z0;z<=z1;z++)for(let y=y0;y<=y1;y++){
-    let off=(z*gy+y)*gx+x0;
-    for(let x=x0;x<=x1;x++,off++)cellTris[cursor[off]++]=i;
+   const ax=e1x[i],ay=e1y[i],az=e1z[i],bx=e2x[i],by=e2y[i],bz=e2z[i];
+   const nx=ay*bz-az*by,ny=az*bx-ax*bz,nz=ax*by-ay*bx;
+   const rPlane=halfCell*(Math.abs(nx)+Math.abs(ny)+Math.abs(nz))+1e-5;
+   const vx=v0x[i],vy=v0y[i],vz=v0z[i];
+   for(let z=z0;z<=z1;z++){
+    const cz=gridMin[2]+(z+0.5)*resolvedGridSize-vz;
+    for(let y=y0;y<=y1;y++){
+     const cy=gridMin[1]+(y+0.5)*resolvedGridSize-vy;
+     const yzDot=ny*cy+nz*cz;
+     let off=(z*gy+y)*gx+x0;
+     for(let x=x0;x<=x1;x++,off++){
+      const cx=gridMin[0]+(x+0.5)*resolvedGridSize-vx;
+      if(Math.abs(nx*cx+yzDot)<=rPlane)cellTris[cursor[off]++]=i;
+     }
+    }
    }
   }
 
   gridData=new Uint32Array(nCells*2);
-  const cellSpan=gridSize+2*range;
+  const cellSpan=resolvedGridSize+2*range;
   const invSpan=65535/cellSpan;
   for(let z=0;z<gz;z++)for(let y=0;y<gy;y++)for(let x=0;x<gx;x++){
    const cid=(z*gy+y)*gx+x;
    const cStart=offsets[cid],cEnd=offsets[cid+1],cLen=cEnd-cStart;
    const first=nodeLen;
    if(cLen>0){
-    const clx=gridMin[0]+x*gridSize-range,cly=gridMin[1]+y*gridSize-range,clz=gridMin[2]+z*gridSize-range;
+    const clx=gridMin[0]+x*resolvedGridSize-range,cly=gridMin[1]+y*resolvedGridSize-range,clz=gridMin[2]+z*resolvedGridSize-range;
     const chx=clx+cellSpan,chy=cly+cellSpan,chz=clz+cellSpan;
     qMinX=clx;qMinY=cly;qMinZ=clz;qInvX=invSpan;qInvY=invSpan;qInvZ=invSpan;
     for(let i=0;i<cLen;i++){
@@ -429,10 +552,11 @@ export function buildContactBVH(objects,T,{gridSize=0,range=.25,maxTextureSize=4
      wLoX[k]=lx;wLoY[k]=ly;wLoZ[k]=lz;wHiX[k]=hx;wHiY[k]=hy;wHiZ[k]=hz;
      wCX[k]=(lx+hx)*0.5;wCY[k]=(ly+hy)*0.5;wCZ[k]=(lz+hz)*0.5;
     }
-    buildSubtree(0,cLen);
-    if(nodeLen-first>maxTreeNodes)maxTreeNodes=nodeLen-first;
+    const root=buildTreeRoot(0,cLen);
+    const cnt=nodeLen-first;
+    if(cnt>maxTreeNodes)maxTreeNodes=cnt;
+    gridData[cid*2]=root;gridData[cid*2+1]=cnt;
    }
-   gridData[cid*2]=first;gridData[cid*2+1]=nodeLen;
   }
  }else if(triCount>0){
   const pad=1e-4;
@@ -445,14 +569,15 @@ export function buildContactBVH(objects,T,{gridSize=0,range=.25,maxTextureSize=4
    wHiX[i]=tHiX[i];wHiY[i]=tHiY[i];wHiZ[i]=tHiZ[i];
    wCX[i]=tCenX[i];wCY[i]=tCenY[i];wCZ[i]=tCenZ[i];
   }
-  buildSubtree(0,triCount);
+  buildTreeRoot(0,triCount);
   maxTreeNodes=nodeLen;
  }
 
  if(ordLen*8>=0x7FFFFFFF)throw Error('BVH triangle addressing exceeds 28-bit leaf range');
 
- // Pack RGBA32UI node texture (16 B/node, 1 texel per node!)
- const nWidth=Math.min(1024,maxTextureSize,Math.max(1,nodeLen));
+ // Pack RGBA32UI node texture with fixed power-of-2 width (1024) for zero-div bit-shift addressing.
+ const TEX_W=1024;
+ const nWidth=TEX_W;
  const nHeight=Math.ceil(Math.max(1,nodeLen)/nWidth);
  if(nHeight>maxTextureSize)throw Error(`Contact BVH node texture exceeds device limit ${maxTextureSize}`);
  const nBuf=new Uint32Array(nWidth*nHeight*4);
@@ -462,24 +587,15 @@ export function buildContactBVH(objects,T,{gridSize=0,range=.25,maxTextureSize=4
  nodeTexture.minFilter=nodeTexture.magFilter=T.NearestFilter;
  nodeTexture.generateMipmaps=false;nodeTexture.needsUpdate=true;
 
- // Pack R32UI ordered triangle index indirection (4 B/ref) + deduplicated RGBA32F unique triangles (L1/L2 resident!)
- const idxTexels=Math.max(1,ordLen);
- const idxW=Math.min(1024,maxTextureSize,idxTexels);
- const idxH=Math.ceil(idxTexels/idxW);
- const idxBuf=new Uint32Array(idxW*idxH);
- for(let i=0;i<ordLen;i++)idxBuf[i]=ordIdx[i]>>>0;
- const triIdxTexture=new T.DataTexture(idxBuf,idxW,idxH,T.RedIntegerFormat,T.UnsignedIntType);
- triIdxTexture.internalFormat='R32UI';
- triIdxTexture.minFilter=triIdxTexture.magFilter=T.NearestFilter;
- triIdxTexture.generateMipmaps=false;triIdxTexture.needsUpdate=true;
-
- const tTexels=Math.max(1,triCount*3);
- const tWidth=Math.min(1024,maxTextureSize,tTexels);
+ // Pack flat leaf-ordered RGBA32F triangles directly (zero contactTriIdx dependent texture fetch!).
+ const tTexels=Math.max(1,ordLen*3);
+ const tWidth=TEX_W;
  const tHeight=Math.ceil(tTexels/tWidth);
  if(tHeight>maxTextureSize)throw Error(`Contact BVH triangle texture exceeds device limit ${maxTextureSize}`);
  const tBuf=new Float32Array(tWidth*tHeight*4);
- for(let k=0;k<triCount;k++){
-  const o=k*12;
+ for(let r=0;r<ordLen;r++){
+  const k=ordIdx[r];
+  const o=r*12;
   tBuf[o]=v0x[k];tBuf[o+1]=v0y[k];tBuf[o+2]=v0z[k];
   tBuf[o+4]=e1x[k];tBuf[o+5]=e1y[k];tBuf[o+6]=e1z[k];
   tBuf[o+8]=e2x[k];tBuf[o+9]=e2y[k];tBuf[o+10]=e2z[k];
@@ -496,17 +612,16 @@ export function buildContactBVH(objects,T,{gridSize=0,range=.25,maxTextureSize=4
  return {
   uniforms:{
    contactNodes:{value:nodeTexture},
-   contactTriIdx:{value:triIdxTexture},
    contactTriangles:{value:triangleTexture},
    contactNodeCount:{value:nodeLen},
    contactGrid:{value:gridTexture},
    contactGridMin:{value:new T.Vector3(...gridMin)},
-   contactGridSize:{value:gridSize},
+   contactGridSize:{value:resolvedGridSize},
    contactRootMin:{value:new T.Vector3(...rootMin)},
    contactRootSpan:{value:new T.Vector3(...rootSpan)},
   },
-  gridDims,maxTreeNodes,triangles:triCount,nodes:nodeLen,
-  bytes:nBuf.byteLength+idxBuf.byteLength+tBuf.byteLength+gridData.byteLength,
-  dispose(){nodeTexture.dispose();triIdxTexture.dispose();triangleTexture.dispose();gridTexture.dispose();}
+  gridDims,gridSize:resolvedGridSize,maxTreeNodes,triangles:triCount,nodes:nodeLen,
+  bytes:nBuf.byteLength+tBuf.byteLength+gridData.byteLength,
+  dispose(){nodeTexture.dispose();triangleTexture.dispose();gridTexture.dispose();}
  };
 }

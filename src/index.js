@@ -509,7 +509,7 @@ export class TracedSDFAO {
     return new TracedSDFAO(renderer, scene, camera, { ...opts, THREE });
   }
 
-  rebuildContactBVH(staticMeshes, { gridSize = 1.0, range, bias = 0.0003 } = {}) {
+  rebuildContactBVH(staticMeshes, { gridSize = 'auto', range, bias = 0.0003 } = {}) {
     const img = this.field.image;
     const autoRange = Math.max(
       0.24,

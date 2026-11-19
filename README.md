@@ -66,7 +66,7 @@ The **Traced SDF (temporal)** mode estimates the unblocked share of cosine-weigh
 
 - **Sampling and tracing:** each AO pixel traces 4 directions on frames 0–7, 3 on frames 8–15, and 2 afterward (dropping to 1 on low-variance pixels after frame 24), using Cranley-Patterson IGN spatial shifts with exact 2D Halton(2, 3) sequences (`vdc2` elevation, `vdc3` azimuth) for spatial anti-correlation and wrap-free temporal stratification. Every direction first checks exact triangle intersections from a 0.3 mm normal-offset origin over the near segment (`max(0.24 m, 0.12 m + half voxel diagonal)`).
 - **Far visibility:** unblocked directions hand off directly at `s = contactRange` to the SDF march (up to 16 steps of at least 7.2 cm, early exit at `v < 0.01`). Soft visibility is `min over steps of clamp((d + e) / (4e), 0, 1)`, where `e = max(1e-6, min(0.025, 0.1 * t * (w·n)))`. An opt-in **Smooth falloff** toggle fades occlusion smoothly over `[0.72, 1.12] m`.
-- **Quantized SAH contact BVH:** a 1 m world grid selects a local 8-bin SAH triangle BVH built via O(T) 2-pass CSR cell binning with cell-clipped triangle AABBs. Nodes pack into single-fetch `RGBA32UI` (16 B/node, 16-bit local-cell quantization, ~23 µm precision) with split-axis-ordered short-stack traversal and deduplicated triangle storage. For the Archive this takes **~16.5 ms** CPU startup and **398.6 KiB** VRAM (5.8× faster build and 3.6× smaller than the initial float32 contact BVH). An opt-in **Hi-Z contact** toggle (`aoDemo.setContactMode(1)`) replaces the BVH with a 2-level Hi-Z min-depth screen-space contact trace (zero BVH memory/build).
+- **Quantized SAH contact BVH:** a density-adaptive world grid (`gridSize: 'auto'`, 1.0 m on Archive/Atrium, refining down to 0.75–0.80 m on 50k+ meshes) selects a local 8-bin SAH triangle BVH built via O(T) 2-pass CSR cell binning with exact triangle-plane vs expanded-cell separating-axis culling and cell-clipped AABBs. Nodes pack into single-fetch `RGBA32UI` (16 B/node, 16-bit local-cell quantization, ~23 µm precision) laid out as **sibling-pair dual-child BVH2** with power-of-2 bit-shift texture addressing, FMA-hoisted slab tests, inline leaf testing (`maxLeaf = 7`), flat leaf-ordered `RGBA32F` triangles (zero dependent indirection fetch), hoisted per-pixel 3D grid lookup, and a **1-Lipschitz SDF empty-sphere contact skip** (`d(p + n·kR) >= kR` skips BVH on open flat/convex hemispheres for `cos θ >= 1/(2k)`). An opt-in **Hi-Z contact** toggle (`aoDemo.setContactMode(1)`) replaces the BVH with a screen-space HZB contact trace (zero BVH memory/build).
 - **Accumulation, upsampling, and variance filtering:** both temporal reprojection and full-resolution upsampling validate neighbors with **view-space tangent-plane distance** reconstructed from `viewDepth` (zero extra render targets or fetches), eliminating offset-plane shadow bleeding. History stays at **12 B/px** (`RG32F` AO + depth; `RGBA8` octahedral normal + Welford online `sqrt(var)*4` + `frames/255`), enabling variance-guided early settling (`frames >= 24 && var < 0.00015`), a variance-weighted formula blend, a 4-neighbor cross-bilateral prefilter on young noisy histories (`frames < 6`), and zero full-res SDF reads on settled pixels (`frames >= 32 && var < 0.0006`).
 - **Moving objects and PBR showcase:** in Traced mode, nearby movers use closed-form analytic sphere occlusion (`sphOcclusion`) plus 24-ray stratified cosine-weighted exact ray-box/SDF visibility per frame (zero temporal lag, cutting near-mover error by 46.7%). Enabling **PBR + Multi-Bounce** (`aoDemo.setPBR(true)`) lazily enables a 3rd `bentOut` MRT for temporally accumulated **bent normals**, driving Jimenez multi-bounce colored AO, directional sky/ground ambient, GGX sun specular with GTSO specular occlusion, and ACES tone mapping + sRGB transfer (`AO mask` always outputs pure linear `[0, 1]` AO).
 - **WebGPU world-space hash cache prototype:** [benchmark/webgpu-hash-ao.html](benchmark/webgpu-hash-ao.html) implements a native WebGPU compute world-space spatial hash AO cache (distance-LOD cells, tangent-plane jitter, LRU eviction, 100% converged-cell skip): `0.01126` frame-1 camera-cut revisit MAE (2× lower disocclusion error than screen-space) at `0.619 ms/f` settled on Apple M1 Metal-3.
@@ -80,22 +80,31 @@ Validated on Apple M1 GPU (`benchmark/judge_v2.py`) across 6 views, 5 cm contact
 | 5 cm contact MAE@64 (underOcc / overOcc) | 0.02542 (0.00601 / 0.01940) | **0.01877 (0.00470 / 0.01407)** | **-26.2%** |
 | Perceptual@64: FLIP / GMSD / CVaR-5% | 0.02772 / 0.02093 / 0.05175 | **0.02193 / 0.01051 / 0.03340** | **-20.9% / -49.8% / -35.5%** |
 | Orbit 3°/f / Movers near (continuous) | 0.01150 / 0.03784 | **0.00975 / 0.02024** | **-15.2% / -46.5%** |
-| Wall ms/f (early / orbit / settled) | 3.106 / 2.200 / 0.912 | **2.988** / 2.450 / 1.100 | **-3.8% early** |
-| Contact BVH build / VRAM | 96.0 ms / 1,429.1 KiB | **16.5 ms / 398.6 KiB** | **5.8× faster / 3.6× smaller** |
+| Wall ms/f (early / orbit / settled) | 3.106 / 2.200 / 0.912 | **2.512 / 2.181** / 1.137 | **-19.1% early / -0.9% orbit** |
+| GPU ms/f (early / orbit / settled) | 5.863 / 4.006 / 1.478 | **4.700 / 3.882** / 1.797 | **-19.8% early / -3.1% orbit** |
+| Contact BVH build / VRAM | 96.0 ms / 1,429.1 KiB | **19.4 ms / 1,146.6 KiB** | **4.9× faster / -20% VRAM** |
 
-### Curved Atrium Scene (Non-Box Generalization)
+### Curved Atrium Scene & High-Poly Scaling (Non-Box Generalization)
 
-To validate Fast-SDF-AO on curved, non-axis-aligned triangle geometry with **zero** `wallFace` metadata, `index.html` includes a second selectable **Atrium (Curved)** rotunda scene ([`assets/atrium-scene.js`](assets/atrium-scene.js), 13,704 triangles: 8 fluted columns with torus bases/capitals, curved vaulted arches, curved apse wall & cornice, thin curved balustrades, 4 non-90° angled stone benches, tiered circular pedestal, bronze torus knot, lathed teapot & amphorae, and alabaster spheres). Its isotropic `112 × 112 × 56` FP16 SDF (`assets/atrium.f16.gz`, 368 KB gz, 11.6 cm voxels) bakes in 60.5 ms with 0 mismatches / 0 sign errors on 2,000 brute-force voxels.
+To validate Fast-SDF-AO on curved, non-axis-aligned triangle geometry with **zero** `wallFace` metadata, `index.html` includes a second selectable **Atrium (Curved)** rotunda scene ([`assets/atrium-scene.js`](assets/atrium-scene.js), 13,704 outward-wound triangles: 8 fluted columns with torus bases/capitals, curved vaulted arches, curved apse wall & cornice, thin curved balustrades, 4 non-90° angled stone benches, tiered circular pedestal, bronze torus knot, lathed teapot & amphorae, and alabaster spheres). Its isotropic `112 × 112 × 56` FP16 SDF (`assets/atrium.f16.gz`, 368 KB gz, 11.6 cm voxels) bakes in ~60 ms with 0 mismatches / 0 sign errors on 2,000 brute-force voxels.
 
 Scored on Apple M1 Chrome WebGL2 (`benchmark/bench_atrium.py`) against an independent **512-ray exact triangle reference** (`tools/trace_tris.cpp`, 57,371 sampled pixels, 1.12 m radius, 0 GL errors):
 
 | Curved Atrium (1280 × 720, 13,704 curved tris) | MAE vs 512-ray ref | RMSE | Wall ms/f |
 |---|---:|---:|---:|
-| **Traced SDF + SAH BVH (frame 1 / 4 / 16 / 64)** | 0.03723 / 0.02265 / 0.01503 / **0.01164** | **0.02471** | 12.0 early / **2.50** settled |
-| 4-Tap Wall-Correction SDF (`wallFace = 0`) | 0.05147 | 0.08102 | **1.20** |
-| 4-Tap Original SDF (generic) | 0.07400 | 0.10364 | **1.20** |
-| SSAO (Three.js 0.170) | 0.10597 | 0.15853 | 3.30 |
-| GTAO (Three.js 0.170) | 0.15127 | 0.24576 | 6.20 |
+| **Traced SDF + Dual-Child SAH BVH (frame 1 / 4 / 16 / 64)** | 0.03510 / 0.02103 / 0.01382 / **0.01049** | **0.01906** | **7.00** early / **1.60** settled |
+| 4-Tap Wall-Correction SDF (`wallFace = 0`) | 0.04893 | 0.07277 | **0.60** |
+| 4-Tap Original SDF (generic) | 0.07172 | 0.09859 | **0.60** |
+| SSAO (Three.js 0.170) | 0.09537 | 0.14238 | 2.50 |
+| GTAO (Three.js 0.170) | 0.11264 | 0.16393 | 5.70 |
+
+**High-poly scaling stress test** (Apple M1 Chrome WebGL2, 1280 × 720, `gridSize: 'auto'`):
+
+| Scene | Triangles | Grid | BVH Nodes | VRAM (MiB) | Warm Build (ms) | Early (ms/f) | Settled (ms/f) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Archive (Boxes) | 1,908 | 1.00 m | 7,642 | 1.12 | 19.4 | **2.51** | **1.14** |
+| Atrium (Curved) | 13,704 (7.2×) | 1.00 m | 21,425 | 2.88 | 51.1 | **7.00** | **1.60** |
+| Atrium-55k (1× subdivided) | 54,816 (28.7×) | 0.80 m | 115,920 | 14.88 | 296.7 | **8.60** | **1.70** |
 
 Inspect `aoDemo.contactResources` for textures, memory, and build metadata. After changing static triangles or instance transforms, call `aoDemo.rebuildStaticContact()` (or supply a mesh array and `{gridSize, range, bias}`). This disposes the previous accelerator and resets temporal history. It does **not** rebake the far SDF, which must also be updated when static geometry changes.
 

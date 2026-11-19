@@ -395,7 +395,67 @@ def main():
                 const ssaoMs = measure(() => aoDemo.render(32), 15);
                 aoDemo.select(36);
                 const gtaoMs = measure(() => aoDemo.render(36), 15);
-                return { tracedEarly, tracedSettled, sdf4, ssaoMs, gtaoMs };
+
+                // 6. High-poly scaling stress test: 1.9k (Archive) -> 13.7k (Atrium) -> 54.8k (Subdivided Atrium)
+                const scaling = [];
+                scaling.push({
+                    scene: 'Atrium (13.7k)',
+                    triangles: aoDemo.contactResources.triangles,
+                    gridSize: aoDemo.contactResources.gridSize,
+                    nodes: aoDemo.contactResources.nodes,
+                    vramKiB: +(aoDemo.contactResources.bytes / 1024).toFixed(1),
+                    buildMs: +aoDemo.contactResources.buildMs.toFixed(1),
+                    earlyMs: +tracedEarly.toFixed(2),
+                    settledMs: +tracedSettled.toFixed(2),
+                });
+                const T = aoDemo.T;
+                const srcGeo = aoDemo.atriumMesh.geometry;
+                const pos = srcGeo.attributes.position.array;
+                const idx = srcGeo.index.array;
+                const subPos = new Float32Array((idx.length / 3) * 4 * 9);
+                let o = 0;
+                const pushTri = (ax,ay,az, bx,by,bz, cx,cy,cz) => {
+                    subPos[o++]=ax; subPos[o++]=ay; subPos[o++]=az;
+                    subPos[o++]=bx; subPos[o++]=by; subPos[o++]=bz;
+                    subPos[o++]=cx; subPos[o++]=cy; subPos[o++]=cz;
+                };
+                for (let i = 0; i < idx.length; i += 3) {
+                    const a = idx[i]*3, b = idx[i+1]*3, c = idx[i+2]*3;
+                    const ax=pos[a], ay=pos[a+1], az=pos[a+2];
+                    const bx=pos[b], by=pos[b+1], bz=pos[b+2];
+                    const cx=pos[c], cy=pos[c+1], cz=pos[c+2];
+                    const abx=.5*(ax+bx), aby=.5*(ay+by), abz=.5*(az+bz);
+                    const bcx=.5*(bx+cx), bcy=.5*(by+cy), bcz=.5*(bz+cz);
+                    const cax=.5*(cx+ax), cay=.5*(cy+ay), caz=.5*(cz+az);
+                    pushTri(ax,ay,az, abx,aby,abz, cax,cay,caz);
+                    pushTri(abx,aby,abz, bx,by,bz, bcx,bcy,bcz);
+                    pushTri(cax,cay,caz, bcx,bcy,bcz, cx,cy,cz);
+                    pushTri(abx,aby,abz, bcx,bcy,bcz, cax,cay,caz);
+                }
+                const hiGeo = new T.BufferGeometry();
+                hiGeo.setAttribute('position', new T.BufferAttribute(subPos, 3));
+                const hiMesh = new T.Mesh(hiGeo);
+                hiMesh.updateMatrixWorld(true);
+                const range = aoDemo.contactResources.range;
+                const hiMeta = aoDemo.rebuildStaticContact([hiMesh], { gridSize: 'auto', range, bias: 0.0003 });
+                aoDemo.select(64); aoDemo.traced.frame.value = 0; aoDemo.resetHistory();
+                for (let i = 0; i < 70; i++) aoDemo.render(64);
+                const hiSettled = measure(() => aoDemo.render(64), 20);
+                const hiEarly = measure(() => { aoDemo.traced.frame.value = 0; aoDemo.resetHistory(); aoDemo.render(64); }, 15);
+                scaling.push({
+                    scene: 'Atrium-55k (subdiv)',
+                    triangles: hiMeta.triangles,
+                    gridSize: hiMeta.gridSize,
+                    nodes: hiMeta.nodes,
+                    vramKiB: +(hiMeta.bytes / 1024).toFixed(1),
+                    buildMs: +hiMeta.buildMs.toFixed(1),
+                    earlyMs: +hiEarly.toFixed(2),
+                    settledMs: +hiSettled.toFixed(2),
+                });
+                hiGeo.dispose();
+                aoDemo.rebuildStaticContact([aoDemo.atriumMesh], { gridSize: 'auto', range, bias: 0.0003 });
+
+                return { tracedEarly, tracedSettled, sdf4, ssaoMs, gtaoMs, scaling };
             }""")
 
             browser.close()
@@ -424,6 +484,11 @@ def main():
     print(f"| 4-Tap Wall-Correction (wallFace=0) | {results['sdf_4tap_wallcorr']['mae']:.5f} | {results['sdf_4tap_wallcorr']['rmse']:.5f} | {timings['sdf4']:.2f} |")
     print(f"| SSAO (Three.js 0.170) | {results['ssao']['mae']:.5f} | {results['ssao']['rmse']:.5f} | {timings['ssaoMs']:.2f} |")
     print(f"| GTAO (Three.js 0.170) | {results['gtao']['mae']:.5f} | {results['gtao']['rmse']:.5f} | {timings['gtaoMs']:.2f} |")
+    print("\n=== High-Poly Scaling Stress Test ===")
+    print("| Scene | Triangles | Grid | Nodes | VRAM (MiB) | Build (ms) | Early (ms/f) | Settled (ms/f) |")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|")
+    for s in timings.get("scaling", []):
+        print(f"| {s['scene']} | {s['triangles']:,} | {s['gridSize']:.2f} m | {s['nodes']:,} | {s['vramKiB']/1024:.2f} | {s['buildMs']:.1f} | {s['earlyMs']:.2f} | {s['settledMs']:.2f} |")
     print(f"\nGL errors: {len(gl_errors)} | Console errors: {len(console_errors)} | Page errors: {len(page_errors)}")
     if gl_errors or console_errors or page_errors:
         raise SystemExit(1)

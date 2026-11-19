@@ -974,18 +974,18 @@ try {
   // static geometry beyond the contact range.
   let contactResources;
   const contactRange=Math.max(.24,.12+.5*Math.hypot(26/field.image.width,18/field.image.height,8/field.image.depth));
-  function rebuildStaticContact(objects=[mesh],{gridSize=1,range=contactRange,bias=.0003}={}){
-    const start=performance.now(),next=buildContactBVH(objects,T,{gridSize,range:range+Math.abs(bias),maxTextureSize:renderer.capabilities.maxTextureSize,max3DTextureSize:renderer.getContext().getParameter(renderer.getContext().MAX_3D_TEXTURE_SIZE)});
+  function rebuildStaticContact(objects=[mesh],{gridSize='auto',range=contactRange,bias=.0003,maxLeaf=7}={}){
+    const start=performance.now(),next=buildContactBVH(objects,T,{gridSize,range:range+Math.abs(bias),maxLeaf,maxTextureSize:renderer.capabilities.maxTextureSize,max3DTextureSize:renderer.getContext().getParameter(renderer.getContext().MAX_3D_TEXTURE_SIZE)});
     Object.assign(aoPass.material.uniforms,next.uniforms,{contactRange:{value:range},contactBias:{value:bias}});
     Object.assign(aoPassBent.material.uniforms,next.uniforms,{contactRange:{value:range},contactBias:{value:bias}});
     const previous=contactResources;
-    contactResources={...next,range,bias,gridSize,buildMs:performance.now()-start};
+    contactResources={...next,range,bias,gridSize:next.gridSize,buildMs:performance.now()-start};
     previous?.dispose();
     traced.frame.value=0;
     for(const rt of histories){renderer.setRenderTarget(rt);renderer.clear();}
     if(historiesBent)for(const rt of historiesBent){renderer.setRenderTarget(rt);renderer.clear();}
     renderer.setRenderTarget(null);
-    return {triangles:next.triangles,nodes:next.nodes,bytes:next.bytes,gridDims:next.gridDims,maxTreeNodes:next.maxTreeNodes,range,bias,gridSize,buildMs:contactResources.buildMs};
+    return {triangles:next.triangles,nodes:next.nodes,bytes:next.bytes,gridDims:next.gridDims,maxTreeNodes:next.maxTreeNodes,range,bias,gridSize:next.gridSize,buildMs:contactResources.buildMs};
   }
   rebuildStaticContact();
   // Each mover is drawn as a one-instance InstancedMesh so it shares the scene shader.
@@ -1110,12 +1110,10 @@ try {
       traced.curViewProj.value.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
       traced.curView.value.copy(camera.matrixWorldInverse);
       traced.invProjXY.value.set(1/camera.projectionMatrix.elements[0],1/camera.projectionMatrix.elements[5]);
-      if(traced.contactMode.value===1){
+      if(traced.contactMode.value>=1){
         hizDownPass.material.uniforms.src.value=gTarget.textures[0];hizDownPass.material.uniforms.useAlpha.value=1;
         renderer.setRenderTarget(hiz1);hizDownPass.render(renderer);
-        hizDownPass.material.uniforms.src.value=hiz1.texture;hizDownPass.material.uniforms.useAlpha.value=0;
-        renderer.setRenderTarget(hiz2);hizDownPass.render(renderer);
-        m.hizTex1.value=hiz1.texture;m.hizTex2.value=hiz2.texture;
+        m.hizTex1.value=hiz1.texture;
       }
       renderer.setRenderTarget(cur);activePass.render(renderer);
       traced.aoTex.value=cur.textures[0];traced.aoNormalTex.value=cur.textures[1];
@@ -1203,8 +1201,8 @@ try {
       camera.position.set(...atriumMeta.camera.position);
       controls.target.set(...atriumMeta.camera.target);
       controls.update();
-      const range=Math.max(.24,.12+.5*Math.hypot(atriumMeta.span[0]/atriumMeta.dims[0],atriumMeta.span[1]/atriumMeta.dims[1],atriumMeta.span[2]/atriumMeta.dims[2]));
-      rebuildStaticContact([atriumMesh],{gridSize:1,range,bias:.0003});
+      const range=Math.max(.18,.12+.5*Math.hypot(atriumMeta.span[0]/atriumMeta.dims[0],atriumMeta.span[1]/atriumMeta.dims[1],atriumMeta.span[2]/atriumMeta.dims[2]));
+      rebuildStaticContact([atriumMesh],{gridSize:'auto',range,bias:.0003});
     }else{
       if(atriumMesh)atriumMesh.visible=false;
       mesh.visible=true;
@@ -1217,7 +1215,7 @@ try {
       camera.position.set(18,-4,7.3);
       controls.target.set(10.8,8.8,1.4);
       controls.update();
-      rebuildStaticContact([mesh],{gridSize:1,range:contactRange,bias:.0003});
+      rebuildStaticContact([mesh],{gridSize:'auto',range:contactRange,bias:.0003});
     }
     lastCamera.identity();
     updateStatus();
@@ -1234,7 +1232,7 @@ try {
   document.querySelector('#smoothfalloff').onchange=event=>{traced.smoothFalloff.value=event.target.checked?1:0;traced.frame.value=0;aoDemo.resetHistory();resetFps();};
   // Debug hook for timing from the console.
   window.aoDemo={scene,mesh,get atriumMesh(){return atriumMesh;},get sceneName(){return activeScene;},setScene,boxes,T,aoPass,aoPassBent,field,get activeField(){return sdfUniforms.field.value;},get contactResources(){return contactResources;},rebuildStaticContact,renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,bakeSyncMs,bakeGpuMs,totalTris,get atlas(){return baked.tex;},meshRes:MESH_RES,setMask:on=>{mask.value=on;},setPBR:on=>{pbrMode.value=on;traced.frame.value=0;aoDemo.resetHistory();},setSmoothFalloff:on=>{traced.smoothFalloff.value=on?1:0;traced.frame.value=0;aoDemo.resetHistory();},setMoverScale:(x,y=x,z=x,w=x)=>dyn.moverScale.value.set(x,y,z,w),select:mode=>select(mode),
-    setDynamicAO:on=>{dynamicAO=on;updateMovers(simTime);},setContactMode:mode=>{traced.contactMode.value=mode?1:0;traced.frame.value=0;aoDemo.resetHistory();},traced,
+    setDynamicAO:on=>{dynamicAO=on;updateMovers(simTime);},setContactMode:mode=>{traced.contactMode.value=Number(mode)||0;traced.frame.value=0;aoDemo.resetHistory();},traced,
     resetHistory:()=>{for(const rt of histories){renderer.setRenderTarget(rt);renderer.clear();}if(historiesBent)for(const rt of historiesBent){renderer.setRenderTarget(rt);renderer.clear();}renderer.setRenderTarget(null);},
     setAOScale:scale=>{aoScale=scale;makeTracedTargets(scale);},
     setForceMesh:on=>{forceMesh=on;if(on)ensureAllBaked();updateMovers(simTime);}};

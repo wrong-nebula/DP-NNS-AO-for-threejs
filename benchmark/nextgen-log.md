@@ -161,3 +161,38 @@ Implemented a standalone WebGPU Compute (WGSL) prototype (`benchmark/webgpu-hash
 | Contact BVH Build / VRAM | 96.0 ms / 1429.1 KiB | **16.5 ms / 398.6 KiB** | **5.8× faster / 3.6× smaller** |
 | `index.html` SDF Payload | 924 KB (128³ f32.gz) | **715 KB (256×176×80 f16.gz)** | **-204.5 KB, 0 JS f16 loop** |
 | Exhaustive GL & Console Errors | 0 / 0 | **0 / 0** (all 7 modes × all toggles) | Pass |
+
+---
+
+## High-Poly Curved-Mesh Scaling Pass (`Atrium` 13.7k & 55k Stress Test)
+
+### Changes Implemented (`contact-bvh.js`, `index.html`, `src/index.js`, `assets/atrium-scene.js`)
+1. **Outward-Wound Atrium Fix (`d7730d3`)**:
+   - Fixed inverted `addTube()` quad winding (3,032 triangles across arches, torus knot, balustrades) and re-baked `assets/atrium.f16.gz` (0 / 13,704 flipped triangles), dropping Atrium MAE@64 from `0.01164 → 0.01038`.
+2. **Sibling-Pair Dual-Child Quantized BVH2 + Bit-Shift Fetch + FMA Slab Test (`contact-bvh.js`)**:
+   - Placed left/right children adjacently (`pair`, `pair + 1`) in `RGBA32UI` (16 B/node) with fixed power-of-2 texture width (`1024`, eliminating `textureSize()` + integer `/` `%`), hoisted `qInv = qScale * inv` / `qOff = (qMin - origin) * inv` for 1-FMA AABB tests, tested leaves inline without pushing to the stack (`int stack[16]`), ordered internal children by true `tNear`, and increased `maxLeaf = 7` (matching the existing 3-bit leaf count).
+   - Replaced `contactTriIdx` dependent indirection with flat leaf-ordered `RGBA32F` triangles (`invDet = 1.0 / det`), hoisted per-pixel 3D `contactGrid` cell lookup outside the 4-ray loop, and added exact triangle-plane vs expanded-cell separating-axis culling during binning.
+3. **1-Lipschitz SDF Empty-Sphere Contact Skip (`contact-bvh.js`)**:
+   - Uses the already-bound 3D SDF to query `dClear2 = staticDistance(p + n * 2R)` (falling back to `dClear1 = staticDistance(p + n * R)`): when `d(p + n·kR) >= kR`, any ray with `cos(θ) >= 1/(2k)` (`0.25` for `k=2`, `0.50` for `k=1`) lies strictly inside the empty ball `B(p + n·kR, kR)` and skips BVH traversal completely.
+   - Tuned Atrium `contactRange` to its natural voxel bound `max(0.18, 0.12 + 0.5 * voxelDiag)` (`~0.191 m`) while keeping Archive at `>= 0.24 m` for the 20 cm ThinPlate guard.
+4. **Density-Adaptive Contact Grid (`gridSize = 'auto'`)**:
+   - Automatically selects `1.00 m` on Archive (1.9k tris) and Atrium (13.7k tris) so flat leaf-ordered triangles stay L2/SLC-resident on Apple M1, and gently refines ultra-dense 50k+ meshes down to `0.75–0.80 m` within `max3DTextureSize` and a 65,536-cell cap.
+
+### Ablated & Rejected on Apple M1 GPU
+- **Hi-Z-first → Contact-BVH fallback (`contactMode = 2`)**: diagnostic profiling showed 94% of rays on Atrium *miss* within `[0, contactRange]`, so running a 5-step Hi-Z pre-pass paid Hi-Z cost on 100% of rays while skipping BVH on <6% (`8.0 → 9.1 ms` Atrium, `3.9 → 4.6 ms` Archive). Rejected as default; pure Hi-Z (`contactMode = 1`, `3.9 ms` early) remains opt-in.
+- **4-Wide Quantized BVH (BVH4)**: reduced node count by 25% (`22.7k → 17.1k`), but 4 unrolled child tests + 4 leaf call sites increased register pressure on Apple M1 (`7.4 → 8.2 ms` Atrium, `3.7 → 4.5 ms` Archive). Rejected in favor of Dual-Child BVH2.
+- **Fine `gridSize <= 0.60 m` with flat triangles**: doubled triangle duplication across expanded cells (`18.95 MiB` vs `9.27 MiB` on 55k Atrium), overflowing Apple M1's 8 MB SLC and slowing traversal (`8.8 → 9.9 ms`).
+- **Grazing `d0` SDF skip & back-face culling (`det < 1e-10`)**: grazing `d0` regressed Atrium MAE@64 (`0.01042 → 0.01136`); back-face culling gave 0.0 ms speedup while risking single-sided meshes. Both rejected.
+
+### Final High-Poly & Archive Results (`highpoly-final`, Apple M1 Chrome WebGL2)
+
+| Scene / Metric | Before (Milestone A / `e2caa96`) | **After (`highpoly-final`)** | Change |
+|---|---:|---:|---:|
+| **Atrium (13.7k tris)** MAE@64 / RMSE | 0.01164 / 0.02471 | **0.01049 / 0.01906** | **-9.9% MAE / -22.9% RMSE** |
+| **Atrium (13.7k tris)** Wall ms/f (early / settled) | 12.00 / 2.50 (11.90 / 1.90 fixed) | **7.00 / 1.60** | **-41.7% early / -36.0% settled** |
+| **Atrium-55k (54.8k tris, 28.7×)** Wall ms/f (early / settled) | — | **8.60 / 1.70** | **+1.6 ms for 4× tris** |
+| **Archive (1.9k tris)** Fit@64 / Held@64 / Contact@64 | 0.00585 / 0.00497 / 0.01877 | **0.00585 / 0.00497 / 0.01877** | **Bit-exact (0.0%)** |
+| **Archive (1.9k tris)** ThinPlate / Curved MAE | 0.00776 / 0.04030 | **0.00776 / 0.04030** | **Bit-exact (0.0%)** |
+| **Archive (1.9k tris)** Wall ms/f (early / orbit / settled) | 2.988 / 2.450 / 1.100 | **2.512 / 2.181 / 1.137** | **-15.9% early / -11.0% orbit** |
+| **Archive (1.9k tris)** GPU ms/f (early / orbit / settled) | 5.742 / 4.545 / 1.899 | **4.700 / 3.882 / 1.797** | **-18.1% early / -14.6% orbit / -5.4% settled** |
+| GL errors / console errors / tests | 0 / 0 | **0 / 0** (`npm test` + `webgl2-smoke.py`) | Pass |
