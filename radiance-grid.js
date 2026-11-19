@@ -396,11 +396,22 @@ export function buildRadianceGrid(objects, T, sdfInfo, {
     normalTex.unpackAlignment = 1;
     normalTex.needsUpdate = true;
 
-    const target = new T.WebGL3DRenderTarget(nx, ny, nz, { depthBuffer: false, stencilBuffer: false });
-    target.texture.format = T.RGBAFormat;
-    target.texture.type = T.UnsignedByteType;
-    target.texture.minFilter = target.texture.magFilter = T.LinearFilter;
-    target.texture.generateMipmaps = false;
+    const targetA = new T.WebGL3DRenderTarget(nx, ny, nz, { depthBuffer: false, stencilBuffer: false });
+    targetA.texture.format = T.RGBAFormat;
+    targetA.texture.type = T.UnsignedByteType;
+    targetA.texture.minFilter = targetA.texture.magFilter = T.LinearFilter;
+    targetA.texture.generateMipmaps = false;
+
+    let targetB = null;
+    function ensureTargetB() {
+      if (targetB) return targetB;
+      targetB = new T.WebGL3DRenderTarget(nx, ny, nz, { depthBuffer: false, stencilBuffer: false });
+      targetB.texture.format = T.RGBAFormat;
+      targetB.texture.type = T.UnsignedByteType;
+      targetB.texture.minFilter = targetB.texture.magFilter = T.LinearFilter;
+      targetB.texture.generateMipmaps = false;
+      return targetB;
+    }
 
     const relightMat = new T.ShaderMaterial({
       glslVersion: T.GLSL3,
@@ -416,8 +427,12 @@ export function buildRadianceGrid(objects, T, sdfInfo, {
         sunDir: { value: new T.Vector3(0, 0, 1) },
         sunColor: { value: new T.Vector3(3.10, 2.90, 2.55) },
         skyColor: { value: new T.Vector3(0.56, 0.64, 0.76) },
+        emissivePos: { value: new T.Vector3(0, 0, -100) },
+        emissiveColor: { value: new T.Vector3(0, 0, 0) },
+        emissiveRadius: { value: 0.18 },
         invScale: { value: 1 / scale },
         voxOff: { value: Math.max(0.11, voxDiag * 0.72) },
+        voxDiag: { value: voxDiag },
         layer: { value: 0 },
       },
       vertexShader: 'void main(){gl_Position=vec4(position.xy,0.,1.);}',
@@ -432,24 +447,43 @@ export function buildRadianceGrid(objects, T, sdfInfo, {
       uniform vec3 sunDir;
       uniform vec3 sunColor;
       uniform vec3 skyColor;
+      uniform vec3 emissivePos;
+      uniform vec3 emissiveColor;
+      uniform float emissiveRadius;
       uniform float invScale;
       uniform float voxOff;
+      uniform float voxDiag;
       uniform int layer;
       out vec4 o;
       void main(){
         ivec3 v = ivec3(gl_FragCoord.xy, layer);
+        vec3 voxPos = sdfMin + vec3(gl_FragCoord.xy, float(layer) + 0.5) * voxSize;
+        bool hasEmissive = dot(emissiveColor, emissiveColor) > 1e-5;
         vec4 alb = texelFetch(albedoTex, v, 0);
-        if(alb.a < 0.5){ o = vec4(0.); return; }
+        if(alb.a < 0.5){
+          // Inject floating emissive orb directly into open-air radiance voxels so GI rays pick up its glow
+          if(hasEmissive){
+            float dOrb = length(voxPos - emissivePos);
+            float rInfl = emissiveRadius + voxDiag * 1.05;
+            if(dOrb < rInfl){
+              float glow = smoothstep(rInfl, emissiveRadius * 0.45, dOrb);
+              o = vec4(clamp(emissiveColor * (glow * 1.35) * invScale, 0.0, 1.0), 1.0);
+              return;
+            }
+          }
+          o = vec4(0.);
+          return;
+        }
         vec4 nSample = texelFetch(normalTex, v, 0);
         vec3 nor = normalize(nSample.rgb * 2.0 - 1.0);
+        int code = int(floor(nSample.a * 255.0 + 0.5));
+        int dxi = (code % 3) - 1;
+        int dyi = ((code / 3) % 3) - 1;
+        int dzi = (code / 9) - 1;
+        vec3 srcPos = voxPos + vec3(float(dxi), float(dyi), float(dzi)) * voxSize;
         float ndotl = dot(nor, sunDir);
         float sh = 0.0;
         if(ndotl > 0.001){
-          int code = int(floor(nSample.a * 255.0 + 0.5));
-          int dxi = (code % 3) - 1;
-          int dyi = ((code / 3) % 3) - 1;
-          int dzi = (code / 9) - 1;
-          vec3 srcPos = sdfMin + (vec3(gl_FragCoord.xy, float(layer) + 0.5) + vec3(float(dxi), float(dyi), float(dzi))) * voxSize;
           vec3 ro = srcPos + nor * voxOff + sunDir * 0.05;
           float t = 0.04;
           float res = 1.0;
@@ -468,26 +502,178 @@ export function buildRadianceGrid(objects, T, sdfInfo, {
         float dSun = max(0.0, ndotl) * sh;
         float skyF = 0.42 + 0.32 * max(0.0, nor.z);
         vec3 irr = sunColor * dSun + skyColor * skyF;
+        if(hasEmissive){
+          vec3 toOrb = emissivePos - srcPos;
+          float orbDist = length(toOrb);
+          vec3 lDir = toOrb / max(orbDist, 1e-4);
+          float ndlOrb = max(0.0, dot(nor, lDir));
+          if(ndlOrb > 0.001){
+            float maxT = max(0.0, orbDist - emissiveRadius - 0.05);
+            float orbSh = 1.0;
+            if(maxT > 0.06){
+              vec3 ro = srcPos + nor * voxOff;
+              float t = 0.05;
+              for(int s = 0; s < 12; s++){
+                vec3 uv = (ro + lDir * t - sdfMin) * sdfInvSpan;
+                if(any(lessThan(uv, vec3(0.))) || any(greaterThan(uv, vec3(1.)))) break;
+                float d = texture(sdfField, uv).r;
+                if(d < 0.015){ orbSh = 0.0; break; }
+                orbSh = min(orbSh, (6.0 * d) / t);
+                if(orbSh < 0.005){ orbSh = 0.0; break; }
+                t += max(d, 0.08);
+                if(t >= maxT) break;
+              }
+            }
+            float atten = 1.0 / (orbDist * orbDist + 0.25);
+            irr += emissiveColor * (ndlOrb * atten * clamp(orbSh, 0.0, 1.0));
+          }
+        }
         o = vec4(clamp(alb.rgb * irr * invScale, 0.0, 1.0), 1.0);
       }`,
     });
     const relightQuad = new FullScreenQuad(relightMat);
+
+    // Pass 2: Lumen-style GPU multi-bounce propagation (targetA -> targetB).
+    // Gathers 6 hemisphere-aligned short SDF rays per occupied/dilated voxel and adds
+    // physically bounded indirect bounce (bounceWeight < 0.85) to direct radiance.
+    // Runs ONLY during relight() -> 0.00 ms per-frame cost when lighting is static!
+    const bounceMat = new T.ShaderMaterial({
+      glslVersion: T.GLSL3,
+      depthTest: false,
+      depthWrite: false,
+      uniforms: {
+        albedoTex: { value: albedoTex },
+        normalTex: { value: normalTex },
+        srcVol: { value: targetA.texture },
+        sdfField: { value: sdfInfo.field },
+        sdfMin: { value: new T.Vector3(minX, minY, minZ) },
+        sdfInvSpan: { value: new T.Vector3(invSpanX, invSpanY, invSpanZ) },
+        voxSize: { value: new T.Vector3(voxX, voxY, voxZ) },
+        scale: { value: scale },
+        invScale: { value: 1 / scale },
+        voxOff: { value: Math.max(0.11, voxDiag * 0.72) },
+        bounceWeight: { value: 0.72 },
+        layer: { value: 0 },
+      },
+      vertexShader: 'void main(){gl_Position=vec4(position.xy,0.,1.);}',
+      fragmentShader: `precision highp float;
+      precision highp sampler3D;
+      uniform sampler3D albedoTex;
+      uniform sampler3D normalTex;
+      uniform sampler3D srcVol;
+      uniform sampler3D sdfField;
+      uniform vec3 sdfMin;
+      uniform vec3 sdfInvSpan;
+      uniform vec3 voxSize;
+      uniform float scale;
+      uniform float invScale;
+      uniform float voxOff;
+      uniform float bounceWeight;
+      uniform int layer;
+      out vec4 o;
+      // 6 cosine-weighted hemisphere directions (1 zenith + 5 equiangular ring)
+      const vec3 HDIRS[6] = vec3[6](
+        vec3( 0.0000,  0.0000, 1.0000),
+        vec3( 0.7800,  0.0000, 0.6258),
+        vec3( 0.2410,  0.7418, 0.6258),
+        vec3(-0.6310,  0.4585, 0.6258),
+        vec3(-0.6310, -0.4585, 0.6258),
+        vec3( 0.2410, -0.7418, 0.6258)
+      );
+      void main(){
+        ivec3 v = ivec3(gl_FragCoord.xy, layer);
+        vec4 directTap = texelFetch(srcVol, v, 0);
+        vec4 alb = texelFetch(albedoTex, v, 0);
+        if(alb.a < 0.5){
+          // Preserve emissive open-air voxels verbatim
+          o = directTap;
+          return;
+        }
+        vec4 nSample = texelFetch(normalTex, v, 0);
+        vec3 nor = normalize(nSample.rgb * 2.0 - 1.0);
+        int code = int(floor(nSample.a * 255.0 + 0.5));
+        int dxi = (code % 3) - 1;
+        int dyi = ((code / 3) % 3) - 1;
+        int dzi = (code / 9) - 1;
+        vec3 voxPos = sdfMin + vec3(gl_FragCoord.xy, float(layer) + 0.5) * voxSize;
+        vec3 srcPos = voxPos + vec3(float(dxi), float(dyi), float(dzi)) * voxSize;
+        vec3 a = abs(nor.x) < 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+        vec3 tanX = normalize(cross(nor, a));
+        vec3 tanY = cross(nor, tanX);
+        vec3 ro = srcPos + nor * voxOff;
+        vec3 indirect = vec3(0.0);
+        for(int i = 0; i < 6; i++){
+          vec3 hd = HDIRS[i];
+          vec3 w = tanX * hd.x + tanY * hd.y + nor * hd.z;
+          float t = voxOff * 1.15;
+          for(int s = 0; s < 5; s++){
+            vec3 p = ro + w * t;
+            vec3 uv = (p - sdfMin) * sdfInvSpan;
+            if(any(lessThan(uv, vec3(0.))) || any(greaterThan(uv, vec3(1.)))) break;
+            float d = texture(sdfField, uv).r;
+            if(d < 0.065){
+              vec3 hitUV = (p + w * max(d, 0.0) - sdfMin) * sdfInvSpan;
+              indirect += texture(srcVol, clamp(hitUV, vec3(0.0), vec3(1.0))).rgb * scale;
+              break;
+            }
+            t += max(d, 0.24);
+            if(t > 6.0) break;
+          }
+        }
+        indirect *= (1.0 / 6.0);
+        vec3 directRad = directTap.rgb * scale;
+        vec3 totalRad = directRad + bounceWeight * alb.rgb * indirect;
+        o = vec4(clamp(totalRad * invScale, 0.0, 1.0), 1.0);
+      }`,
+    });
+    const bounceQuad = new FullScreenQuad(bounceMat);
+
     const buildMs = performance.now() - t0;
+    let activeTarget = targetA;
+    let lastMultiBounce = false;
 
     function relight(sunDir, {
       sunColor = [3.10, 2.90, 2.55],
       skyColor = [0.56, 0.64, 0.76],
+      multiBounce = false,
+      bounceWeight = 0.72,
+      emissive = null,
     } = {}) {
       const rt0 = performance.now();
       const u = relightMat.uniforms;
       u.sunDir.value.set(sunDir[0], sunDir[1], sunDir[2]);
       u.sunColor.value.set(sunColor[0], sunColor[1], sunColor[2]);
       u.skyColor.value.set(skyColor[0], skyColor[1], skyColor[2]);
+      if (emissive && emissive.color && (emissive.color[0] > 0 || emissive.color[1] > 0 || emissive.color[2] > 0)) {
+        u.emissivePos.value.set(emissive.pos[0], emissive.pos[1], emissive.pos[2]);
+        u.emissiveColor.value.set(emissive.color[0], emissive.color[1], emissive.color[2]);
+        u.emissiveRadius.value = emissive.radius || 0.18;
+      } else {
+        u.emissivePos.value.set(0, 0, -100);
+        u.emissiveColor.value.set(0, 0, 0);
+      }
       const prevRT = renderer.getRenderTarget();
       for (let z = 0; z < nz; z++) {
         u.layer.value = z;
-        renderer.setRenderTarget(target, z);
+        renderer.setRenderTarget(targetA, z);
         relightQuad.render(renderer);
+      }
+      if (multiBounce) {
+        const dst = ensureTargetB();
+        const bu = bounceMat.uniforms;
+        bu.srcVol.value = targetA.texture;
+        // Physically bound bounceWeight < 0.85 so recursive energy never explodes
+        bu.bounceWeight.value = Math.max(0, Math.min(0.84, bounceWeight));
+        for (let z = 0; z < nz; z++) {
+          bu.layer.value = z;
+          renderer.setRenderTarget(dst, z);
+          bounceQuad.render(renderer);
+        }
+        activeTarget = dst;
+        lastMultiBounce = true;
+      } else {
+        activeTarget = targetA;
+        lastMultiBounce = false;
       }
       renderer.setRenderTarget(prevRT);
       lastRelightMs = performance.now() - rt0;
@@ -495,22 +681,26 @@ export function buildRadianceGrid(objects, T, sdfInfo, {
     }
 
     return {
-      texture: target.texture,
+      get texture() { return activeTarget.texture; },
       dims,
       scale,
-      bytes: totalVoxels * 4,
+      get bytes() { return totalVoxels * 4 * (targetB ? 2 : 1); },
       occupiedVoxels: surfCount,
       dilatedVoxels: dilCount,
       buildMs,
       gpu: true,
+      get multiBounce() { return lastMultiBounce; },
       get relightMs() { return lastRelightMs; },
       relight,
       dispose() {
-        target.dispose();
+        targetA.dispose();
+        targetB?.dispose();
         albedoTex.dispose();
         normalTex.dispose();
         relightMat.dispose();
         relightQuad.dispose();
+        bounceMat.dispose();
+        bounceQuad.dispose();
       },
     };
   }

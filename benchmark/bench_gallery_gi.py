@@ -135,7 +135,7 @@ def main():
                         check(sc + '-mode-' + mode);
                     }
                     aoDemo.select(64);
-                    for (const flag of ['pbr', 'hizcontact', 'mask', 'smoothfalloff', 'gi', 'gimask']) {
+                    for (const flag of ['pbr', 'hizcontact', 'mask', 'smoothfalloff', 'gi', 'multibouncegi', 'emissive', 'gimask']) {
                         const el = document.querySelector('#' + flag);
                         const prev = el.checked;
                         el.checked = true; el.onchange({ target: el });
@@ -147,14 +147,24 @@ def main():
                         el.checked = prev; el.onchange({ target: el });
                     }
                 }
-                // Test dynamic sun angle relight on Gallery
+                // Test dynamic sun angle relight on Gallery (both 1-bounce & multi-bounce)
                 await aoDemo.setScene('gallery');
-                const relightTimes = [];
+                aoDemo.setEmissive(false);
+                aoDemo.setMultiBounceGI(false);
+                const relightTimes1B = [];
                 for (const deg of [-45, -15, 0, 22, 45]) {
                     aoDemo.setSunAngle(deg);
-                    relightTimes.push(aoDemo.radianceGrid.relightMs);
+                    relightTimes1B.push(aoDemo.radianceGrid.relightMs);
                     aoDemo.render(64);
-                    check('gallery-sun-' + deg);
+                    check('gallery-sun-1b-' + deg);
+                }
+                aoDemo.setMultiBounceGI(true);
+                const relightTimesMB = [];
+                for (const deg of [-45, -15, 0, 22, 45]) {
+                    aoDemo.setSunAngle(deg);
+                    relightTimesMB.push(aoDemo.radianceGrid.relightMs);
+                    aoDemo.render(64);
+                    check('gallery-sun-mb-' + deg);
                 }
                 aoDemo.setSunAngle(22);
 
@@ -162,7 +172,8 @@ def main():
                 const bvh = aoDemo.contactResources;
                 return {
                     allErrs,
-                    relightTimes,
+                    relightTimes: relightTimes1B,
+                    relightTimesMB,
                     sunDir: aoDemo.sunDir,
                     radianceGrid: {
                         dims: rg.dims,
@@ -187,10 +198,10 @@ def main():
                   f"{bvh_meta['bytes']/1024:.1f} KiB VRAM, build {bvh_meta['buildMs']:.1f} ms")
             print(f"Radiance Grid: {rg_meta['dims']} ({rg_meta['bytes']/1024:.0f} KiB VRAM, "
                   f"{rg_meta['occupiedVoxels']} occupied voxels), build {rg_meta['buildMs']:.1f} ms, "
-                  f"relight median {np.median(check_res['relightTimes']):.2f} ms")
+                  f"relight 1B {np.median(check_res['relightTimes']):.2f} ms / MB {np.median(check_res['relightTimesMB']):.2f} ms")
             print(f"All-scenes/modes/toggles GL errors: {len(gl_errors)}, console errors: {len(console_errors)}, page errors: {len(page_errors)}")
 
-            # 2. Capture 3 visual PNGs at frame 64 on Gallery (sunAngle = 22 deg)
+            # 2. Capture visual PNGs on Gallery (sunAngle = 22 deg)
             canvas = page.locator("canvas")
 
             # (a) Gallery AO-only (GI off)
@@ -199,6 +210,8 @@ def main():
                 aoDemo.setMask(false);
                 aoDemo.setGIMask(false);
                 aoDemo.setPBR(false);
+                aoDemo.setEmissive(false);
+                aoDemo.setMultiBounceGI(false);
                 aoDemo.setGI(false);
                 aoDemo.select(64);
                 aoDemo.traced.frame.value = 0;
@@ -215,6 +228,8 @@ def main():
                 aoDemo.setSunAngle(22);
                 aoDemo.setMask(false);
                 aoDemo.setGIMask(false);
+                aoDemo.setEmissive(false);
+                aoDemo.setMultiBounceGI(false);
                 aoDemo.setGI(true);
                 aoDemo.select(64);
                 aoDemo.traced.frame.value = 0;
@@ -226,8 +241,72 @@ def main():
             canvas.screenshot(path=str(gi_png))
             print(f"Saved {gi_png}")
 
-            # (c) Gallery pure GI bounce irradiance buffer
+            # (c) Gallery Multi-Bounce GI
             page.evaluate("""() => {
+                aoDemo.setSunAngle(22);
+                aoDemo.setMask(false);
+                aoDemo.setGIMask(false);
+                aoDemo.setEmissive(false);
+                aoDemo.setGI(true);
+                aoDemo.setMultiBounceGI(true);
+                aoDemo.select(64);
+                aoDemo.traced.frame.value = 0;
+                aoDemo.resetHistory();
+                for (let i = 0; i < 64; i++) aoDemo.render(64);
+                aoDemo.renderer.getContext().finish();
+            }""")
+            mb_png = OUT_DIR / "gallery_multibounce_gi.png"
+            canvas.screenshot(path=str(mb_png))
+            print(f"Saved {mb_png}")
+
+            # (d) Gallery Dynamic Emissive Orb + Multi-Bounce GI
+            page.evaluate("""() => {
+                aoDemo.setSunAngle(22);
+                aoDemo.setMask(false);
+                aoDemo.setGIMask(false);
+                aoDemo.setGI(true);
+                aoDemo.setMultiBounceGI(true);
+                aoDemo.setEmissive(true);
+                aoDemo.setEmissiveTime(1.35);
+                aoDemo.select(64);
+                aoDemo.traced.frame.value = 0;
+                aoDemo.resetHistory();
+                for (let i = 0; i < 64; i++) aoDemo.render(64);
+                aoDemo.renderer.getContext().finish();
+            }""")
+            emissive_png = OUT_DIR / "gallery_emissive_gi.png"
+            canvas.screenshot(path=str(emissive_png))
+            print(f"Saved {emissive_png}")
+
+            # (e) Gallery Moving-Sun GI (mid-sweep 10 -> 40 deg at 2 deg/frame, frame 15)
+            page.evaluate("""() => {
+                aoDemo.setEmissive(false);
+                aoDemo.setMultiBounceGI(true);
+                aoDemo.setGI(true);
+                aoDemo.setSunAngle(10);
+                aoDemo.select(64);
+                aoDemo.traced.frame.value = 0;
+                aoDemo.resetHistory();
+                for (let i = 0; i < 32; i++) aoDemo.render(64);
+                for (let f = 1; f <= 15; f++) {
+                    aoDemo.setSunAngle(10 + f * 2);
+                    aoDemo.render(64);
+                }
+                aoDemo.renderer.getContext().finish();
+            }""")
+            moving_png = OUT_DIR / "gallery_sun_moving.png"
+            canvas.screenshot(path=str(moving_png))
+            print(f"Saved {moving_png}")
+
+            # (f) Gallery pure 1-bounce GI irradiance buffer
+            page.evaluate("""() => {
+                aoDemo.setSunAngle(22);
+                aoDemo.setEmissive(false);
+                aoDemo.setMultiBounceGI(false);
+                aoDemo.setGI(true);
+                aoDemo.traced.frame.value = 0;
+                aoDemo.resetHistory();
+                for (let i = 0; i < 64; i++) aoDemo.render(64);
                 aoDemo.setGIMask(true);
                 aoDemo.render(64);
                 aoDemo.renderer.getContext().finish();
@@ -360,14 +439,14 @@ def main():
 
             # Score Gallery 1-Bounce GI RGB @64 against 512-ray 1-bounce GI reference
             pred_rgb_gi = read_rgb_samples("""
-                aoDemo.setMask(false); aoDemo.setGIMask(false); aoDemo.setGI(true);
+                aoDemo.setMask(false); aoDemo.setGIMask(false); aoDemo.setEmissive(false); aoDemo.setMultiBounceGI(false); aoDemo.setGI(true);
                 aoDemo.select(64); aoDemo.traced.frame.value = 0; aoDemo.resetHistory();
                 for (let i = 0; i < 64; i++) aoDemo.render(64);
             """)
 
             # Score pure GI bounce irradiance buffer @64
             pred_gi_srgb = read_rgb_samples("""
-                aoDemo.setMask(false); aoDemo.setGIMask(true); aoDemo.setGI(true);
+                aoDemo.setMask(false); aoDemo.setGIMask(true); aoDemo.setEmissive(false); aoDemo.setMultiBounceGI(false); aoDemo.setGI(true);
                 aoDemo.select(64); aoDemo.traced.frame.value = 0; aoDemo.resetHistory();
                 for (let i = 0; i < 64; i++) aoDemo.render(64);
             """)
@@ -409,6 +488,8 @@ def main():
                 }, 15);
 
                 // Gallery 1-Bounce GI
+                aoDemo.setEmissive(false);
+                aoDemo.setMultiBounceGI(false);
                 aoDemo.setGI(true);
                 aoDemo.traced.frame.value = 0; aoDemo.resetHistory();
                 for (let i = 0; i < 70; i++) aoDemo.render(64);
@@ -426,7 +507,18 @@ def main():
                     aoDemo.traced.frame.value = 0; aoDemo.resetHistory(); aoDemo.render(64);
                 }, 15);
 
-                return { aoEarly, aoSettled, giEarly, giFrame70, giSettled, giMovingSun };
+                // Gallery Multi-Bounce + Dynamic Emissive Orb
+                aoDemo.setMultiBounceGI(true);
+                aoDemo.setEmissive(true);
+                let orbT = 0.0;
+                const giEmissiveMoving = measure(() => {
+                    orbT += 0.05;
+                    aoDemo.setEmissiveTime(orbT);
+                    aoDemo.render(64);
+                }, 15);
+                aoDemo.setEmissive(false);
+
+                return { aoEarly, aoSettled, giEarly, giFrame70, giSettled, giMovingSun, giEmissiveMoving };
             }""")
 
             browser.close()
@@ -437,6 +529,7 @@ def main():
         "radiance_grid": {
             **rg_meta,
             "relight_median_ms": float(np.median(check_res["relightTimes"])),
+            "relight_multibounce_median_ms": float(np.median(check_res["relightTimesMB"])),
         },
         "accuracy": {
             "ao_mae_64": ao_mae,
@@ -469,7 +562,7 @@ def main():
     print(f"Gallery AO-only  vs GI Ref: RGB MAE = {ao_only_mae_vs_gi_ref:.5f}, PSNR = {ao_only_psnr_vs_gi_ref:.2f} dB")
     print(f"Gallery 1-Bounce vs GI Ref: RGB MAE = {gi_mae_vs_gi_ref:.5f}, PSNR = {gi_psnr_vs_gi_ref:.2f} dB")
     print(f"Timing (AO-only):           early {timings['aoEarly']:.2f} ms/f, settled {timings['aoSettled']:.2f} ms/f")
-    print(f"Timing (1-Bounce GI):       early {timings['giEarly']:.2f} ms/f, frame-70 {timings['giFrame70']:.2f} ms/f, settled {timings['giSettled']:.2f} ms/f, moving-sun {timings['giMovingSun']:.2f} ms/f")
+    print(f"Timing (1-Bounce GI):       early {timings['giEarly']:.2f} ms/f, frame-70 {timings['giFrame70']:.2f} ms/f, settled {timings['giSettled']:.2f} ms/f, moving-sun {timings['giMovingSun']:.2f} ms/f, emissive-orb {timings['giEmissiveMoving']:.2f} ms/f")
     print(f"Saved report: {out_json}")
 
     if gl_errors or console_errors or page_errors:

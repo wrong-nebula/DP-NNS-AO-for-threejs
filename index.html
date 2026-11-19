@@ -14,14 +14,14 @@ nav label{display:flex;align-items:center;gap:5px;padding:6px}
 <span style="display:flex;align-items:center;color:#9fb0c4;font-size:14px;padding-right:4px">Scene:</span>
 <button data-scene="archive" aria-pressed="true">Archive (Boxes)</button>
 <button data-scene="atrium" aria-pressed="false">Atrium (Curved)</button>
-<button data-scene="gallery" aria-pressed="false">Gallery (1-Bounce GI)</button>
+<button data-scene="gallery" aria-pressed="false">Gallery (GI)</button>
 </nav><nav aria-label="Ambient occlusion method">
 <button data-taps="0" aria-pressed="true">AO off</button>
 <button data-taps="4" aria-pressed="false">Original SDF</button>
 <button data-taps="14" aria-pressed="false">SDF wall correction</button>
 <button data-taps="34" aria-pressed="false">Reweighted SDF</button>
 <button data-taps="64" aria-pressed="false">Traced SDF (temporal)</button>
-<button data-taps="32" aria-pressed="false">SSAO</button><button data-taps="36" aria-pressed="false">GTAO</button><label><input id="mask" type="checkbox"> AO mask</label><label><input id="animate" type="checkbox" checked> Animate movers</label><label><input id="dynao" type="checkbox" checked> Movers in SDF AO</label><label><input id="forcemesh" type="checkbox"> Baked SDF for all movers</label><label><input id="hizcontact" type="checkbox"> Hi-Z contact</label><label><input id="pbr" type="checkbox"> PBR + Multi-Bounce + Bent Normals</label><label><input id="smoothfalloff" type="checkbox"> Smooth falloff</label><label><input id="gi" type="checkbox"> 1-Bounce GI</label><label><input id="gimask" type="checkbox"> GI bounce only</label><label>Sun <input id="sunangle" type="range" min="-65" max="65" value="22" step="1" style="width:92px"><span id="sunangle-val" style="min-width:34px;font-variant-numeric:tabular-nums">22°</span></label></nav>
+<button data-taps="32" aria-pressed="false">SSAO</button><button data-taps="36" aria-pressed="false">GTAO</button><label><input id="mask" type="checkbox"> AO mask</label><label><input id="animate" type="checkbox" checked> Animate movers</label><label><input id="dynao" type="checkbox" checked> Movers in SDF AO</label><label><input id="forcemesh" type="checkbox"> Baked SDF for all movers</label><label><input id="hizcontact" type="checkbox"> Hi-Z contact</label><label><input id="pbr" type="checkbox"> PBR + Multi-Bounce + Bent Normals</label><label><input id="smoothfalloff" type="checkbox"> Smooth falloff</label><label><input id="gi" type="checkbox"> Diffuse GI</label><label><input id="multibouncegi" type="checkbox"> Multi-bounce GI</label><label><input id="emissive" type="checkbox"> Emissive orb</label><label><input id="gimask" type="checkbox"> GI bounce only</label><label>Sun <input id="sunangle" type="range" min="-65" max="65" value="22" step="1" style="width:92px"><span id="sunangle-val" style="min-width:34px;font-variant-numeric:tabular-nums">22°</span></label></nav>
 <div id="view"><output id="fps" aria-label="Live rendering frame rate"><strong id="fps-value">— FPS</strong><small id="frame-ms">Frame interval</small></output></div><output id="status">Loading distance field…</output></main>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
 <script type="module">
@@ -252,6 +252,11 @@ uniform bool showMask;
 uniform bool pbrMode;
 uniform bool giMask;
 uniform vec3 sunDir;
+#ifdef DIFFUSE_GI
+uniform vec3 emissivePos;
+uniform vec3 emissiveColor;
+uniform float emissiveRadius;
+#endif
 // Jimenez 2016 Multi-Bounce Colored AO approximation
 vec3 multiBounceAO(float ao,vec3 albedo){
   vec3 a=2.0404*albedo-.3324;
@@ -313,6 +318,28 @@ float sdfSunShadow(vec3 pos,vec3 nor,vec3 sDir){
   res=clamp(res,0.,1.);
   return res*res*(3.-2.*res);
 }
+#ifdef DIFFUSE_GI
+float sdfPointShadow(vec3 pos,vec3 nor,vec3 lDir,float maxDist){
+  if(maxDist<=.05)return 1.;
+  vec3 ro=pos+nor*.03+lDir*.02;
+  float ndl=max(dot(nor,lDir),.15);
+  float t=.02,res=1.;
+  for(int s=0;s<36;s++){
+    float d=staticDistance(ro+lDir*t);
+    if(d>100.)break;
+    float tol=min(.012,.20*t*ndl);
+    float dc=d-tol;
+    if(dc<=0.)return 0.;
+    res=min(res,7.*dc/t);
+    if(res<.005)return 0.;
+    float stepMul=mix(.45,.8,smoothstep(.35,.80,d));
+    t+=max(d*stepMul,.014);
+    if(t>=maxDist)break;
+  }
+  res=clamp(res,0.,1.);
+  return res*res*(3.-2.*res);
+}
+#endif
 float sdBox(vec3 q,vec3 h){
   vec3 d=abs(q)-h;
   return length(max(d,0.))+min(max(d.x,max(d.y,d.z)),0.);
@@ -664,8 +691,26 @@ void main(){
     float D=a2/(3.14159265*denom*denom+1e-6);
     float F=.04+.96*pow(1.-VoH,5.);
     float specOcc=specularOcclusion(NoV,ao,rough);
-    vec3 diff=albedo*(direct+indirect);
     vec3 spec=sunCol*(D*F*.18*sun*sunSh*specOcc)+skyCol*(.025*specOcc*pow(1.-NoV,4.));
+    if(dot(emissiveColor,emissiveColor)>1e-5){
+      vec3 toOrb=emissivePos-p;
+      float orbDist=length(toOrb);
+      vec3 oDir=toOrb/max(orbDist,1e-4);
+      float oNdl=max(0.,dot(normal,oDir));
+      if(oNdl>.001){
+        float orbSh=sdfPointShadow(p,normal,oDir,max(0.,orbDist-emissiveRadius-.04));
+        float atten=1./(orbDist*orbDist+.25);
+        direct+=emissiveColor*(oNdl*atten*orbSh);
+        vec3 Ho=normalize(V+oDir);
+        float oNoH=max(dot(normal,Ho),0.);
+        float oVoH=max(dot(V,Ho),0.);
+        float oDen=oNoH*oNoH*(a2-1.)+1.;
+        float oD=a2/(3.14159265*oDen*oDen+1e-6);
+        float oF=.04+.96*pow(1.-oVoH,5.);
+        spec+=emissiveColor*(oD*oF*.22*oNdl*atten*orbSh*specOcc);
+      }
+    }
+    vec3 diff=albedo*(direct+indirect);
     pixel=vec4(linearToSrgb(acesToneMap((diff+spec)*.88)),1.);
     return;
   }
@@ -891,7 +936,8 @@ void main(){
   #ifdef DIFFUSE_GI
   bool aoSettled=settleFrames>0.&&(h.y>=settleFrames||(h.y>=24.&&h.z<.00015));
   bool giSettled=settleFrames>0.&&giAlphaFloor<.001&&giFrames>=max(settleFrames,histMax);
-  bool settled=aoSettled&&giSettled;
+  bool giCheckerSkip=aoSettled&&giFrames>=64.&&giAlphaFloor<.001&&(((q.x^q.y)&1)!=int(uint(frame)&1u));
+  bool settled=(aoSettled&&giSettled)||giCheckerSkip;
   #else
   bool settled=settleFrames>0.&&(h.y>=settleFrames||(h.y>=24.&&h.z<.00015));
   #endif
@@ -905,10 +951,9 @@ void main(){
   #endif
   if(turn&&!settled){
     #ifdef DIFFUSE_GI
-    float effAge=min(h.y,giFrames);
-    float nd=effAge<8.?4.:(effAge<16.?3.:(giFrames>=64.&&giAlphaFloor<.001?1.:2.));
+    float nd=aoSettled?(giFrames>=64.&&giAlphaFloor<.001?1.:2.):(h.y<8.?4.:(h.y<16.?3.:(giFrames>=64.&&giAlphaFloor<.001?1.:2.)));
     vec3 sampleGI;
-    vec4 resAO=tracedAOBentGI(p,normal,nd,sampleGI);
+    vec4 resAO=tracedAOBentGI(p,normal,nd,!aoSettled,sampleGI);
     // Soft firefly suppression only while sun is moving or first few frames (zero bias on converged GI)
     if(giAlphaFloor>.01||giFrames<6.){
       float maxC=max(sampleGI.r,max(sampleGI.g,sampleGI.b));
@@ -1130,12 +1175,30 @@ try {
   const mask={value:false};
   const pbrMode={value:false};
   const giMode={value:false};
+  const multiBounceGI={value:false};
+  const emissiveMode={value:false};
   const giMask={value:false};
+  let emissiveTime=1.35;
   let sunAngleDeg=22;
   const DEFAULT_SUN_DIR=new T.Vector3(-.4,-.55,1.).normalize();
   function computeGallerySunDir(deg){
     const r=deg*Math.PI/180;
     return new T.Vector3(Math.sin(r)*.82,-.24,Math.cos(r)*.85+.25).normalize();
+  }
+  function computeEmissiveOrb(t){
+    const ang=t*0.75;
+    const pos=[
+      1.35*Math.cos(ang),
+      0.55+1.05*Math.sin(ang),
+      1.95+0.25*Math.sin(t*1.5),
+    ];
+    // Smoothly shift between warm amber-gold and vibrant cyan-aqua as it orbits
+    const k=0.5-0.5*Math.cos(t*0.42);
+    const r=1.0*(1-k)+0.06*k;
+    const g=0.40*(1-k)+0.78*k;
+    const b=0.05*(1-k)+1.00*k;
+    const intensity=6.8;
+    return {pos,color:[r*intensity,g*intensity,b*intensity],baseColor:[r,g,b],radius:0.18};
   }
   const dyn={
     dynInv:{value:Array.from({length:MAX_DYN},()=>new T.Matrix4())},
@@ -1156,7 +1219,7 @@ try {
   //   history); normal + frames/255. The AO pass writes one while reading the other; the scene draw reads it.
   const nearest=t=>{t.minFilter=t.magFilter=T.NearestFilter;t.generateMipmaps=false;};
   let aoScale=.5,gTarget,histories,historiesBent=null,historiesGI=null,giDenoiseTargets=null,hiz1,hiz2;let histIndex=0;
-  let giAccumFrames=0,giSunCooldown=0,giDenoiseCached=false,giDenoiseLastIdx=1;
+  let giAccumFrames=0,giSunCooldown=0,giDenoiseCached=false,giDenoiseLastIdx=1,giGTargetValid=false;
   function makeHistPair(w,h,count,giHalf=false){
     return [0,1].map(()=>{const rt=new T.WebGLRenderTarget(w,h,{count,depthBuffer:false});
       rt.textures[0].type=T.FloatType;rt.textures[0].format=T.RGFormat;
@@ -1185,7 +1248,7 @@ try {
   function makeTracedTargets(scale){
     const w=Math.round(W*scale),h=Math.round(H*scale);
     gTarget?.dispose();histories?.forEach(rt=>rt.dispose());historiesBent?.forEach(rt=>rt.dispose());historiesBent=null;historiesGI?.forEach(rt=>rt.dispose());historiesGI=null;giDenoiseTargets?.forEach(rt=>rt.dispose());giDenoiseTargets=null;hiz1?.dispose();hiz2?.dispose();
-    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;
+    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;giGTargetValid=false;
     gTarget=new T.WebGLRenderTarget(w,h,{count:2});
     gTarget.textures[0].type=T.FloatType;gTarget.textures[1].type=T.HalfFloatType;gTarget.textures.forEach(nearest);
     // Standard traced path: 2 MRTs (RG32F + RGBA8 = 12 B/px). 3rd bentOut MRT is allocated only when PBR is active.
@@ -1224,6 +1287,9 @@ try {
     sdfInvSpan:{value:new T.Vector3(1/26,1/18,1/8)},
     sceneId:{value:0},
     sunDir:{value:DEFAULT_SUN_DIR.clone()},
+    emissivePos:{value:new T.Vector3(0,0,-100)},
+    emissiveColor:{value:new T.Vector3(0,0,0)},
+    emissiveRadius:{value:0.18},
   };
   // Also restore clean cumulative Halton(2,3) indexing when nd=4/3/2, avoiding any low-bit aliasing
   // when nd drops to 1 ray on converged low-variance pixels.
@@ -1388,6 +1454,44 @@ try {
   let activeScene='archive',atriumMesh=null,atriumField=null,atriumMeta=null,atriumLoading=null,atriumHalf=null;
   let galleryMesh=null,galleryField=null,galleryMeta=null,galleryLoading=null,galleryHalf=null;
   const radianceGrids={archive:null,atrium:null,gallery:null};
+  // Floating glowing emissive orb for real-time dynamic GI showcase in Gallery (hidden unless #emissive is on)
+  const emissiveOrbMat=new T.ShaderMaterial({
+    glslVersion:T.GLSL3,
+    uniforms:{orbColor:{value:new T.Vector3(1,.46,.1)}},
+    vertexShader:`out vec3 vNor;out vec3 vPos;void main(){vec4 w=modelMatrix*vec4(position,1.);vPos=w.xyz;vNor=normalize(mat3(modelMatrix)*normal);gl_Position=projectionMatrix*viewMatrix*w;}`,
+    fragmentShader:`precision highp float;uniform vec3 orbColor;in vec3 vNor;in vec3 vPos;out vec4 o;
+    vec3 aces(vec3 x){return clamp((x*(2.51*x+.03))/(x*(2.43*x+.59)+.14),0.,1.);}
+    vec3 toSrgb(vec3 c){return mix(12.92*c,1.055*pow(max(c,vec3(0.)),vec3(1./2.4))-.055,step(vec3(.0031308),c));}
+    void main(){
+      vec3 V=normalize(cameraPosition-vPos);
+      float ndv=max(dot(normalize(vNor),V),0.);
+      vec3 col=mix(orbColor*2.2,orbColor*4.8+vec3(0.95,0.88,0.72),pow(ndv,2.0));
+      o=vec4(toSrgb(aces(col)),1.);
+    }`,
+  });
+  const emissiveOrbMesh=new T.Mesh(new T.SphereGeometry(0.18,28,20),emissiveOrbMat);
+  emissiveOrbMesh.visible=false;
+  scene.add(emissiveOrbMesh);
+  function currentEmissiveSpec(){
+    if(!emissiveMode.value||activeScene!=='gallery')return null;
+    const orb=computeEmissiveOrb(emissiveTime);
+    sdfUniforms.emissivePos.value.set(...orb.pos);
+    sdfUniforms.emissiveColor.value.set(...orb.color);
+    sdfUniforms.emissiveRadius.value=orb.radius;
+    emissiveOrbMesh.position.set(...orb.pos);
+    emissiveOrbMat.uniforms.orbColor.value.set(...orb.baseColor);
+    return orb;
+  }
+  function relightActiveRadianceGrid(){
+    const rg=radianceGrids[activeScene];
+    if(!rg)return null;
+    const orb=currentEmissiveSpec();
+    if(!orb)sdfUniforms.emissiveColor.value.set(0,0,0);
+    const s=sdfUniforms.sunDir.value;
+    rg.relight([s.x,s.y,s.z],{multiBounce:multiBounceGI.value,bounceWeight:0.72,emissive:orb});
+    aoPassGI.material.uniforms.radianceVol.value=rg.texture;
+    return rg;
+  }
   function ensureRadianceGrid(){
     let rg=radianceGrids[activeScene];
     if(!rg){
@@ -1400,9 +1504,7 @@ try {
       }
       radianceGrids[activeScene]=rg;
     }
-    const s=sdfUniforms.sunDir.value;
-    rg.relight([s.x,s.y,s.z]);
-    aoPassGI.material.uniforms.radianceVol.value=rg.texture;
+    relightActiveRadianceGrid();
     aoPassGI.material.uniforms.radianceScale.value=rg.scale;
     aoPassGI.material.uniforms.giMaxDist.value=activeScene==='gallery'?8.5:(activeScene==='atrium'?11.0:14.0);
     return rg;
@@ -1493,14 +1595,20 @@ try {
         traced.aoTex.value=lastWritten.textures[0];traced.aoNormalTex.value=lastWritten.textures[1];
         traced.aoBentTex.value=lastWritten.textures[2];
         traced.aoGITex.value=giDenoiseTargets[giDenoiseLastIdx].texture;
+        emissiveOrbMesh.visible=emissiveMode.value&&activeScene==='gallery'&&!mask.value&&!giMask.value;
         renderer.setRenderTarget(null);renderer.render(scene,camera);
         traced.frame.value++;
         return;
       }
-      const material=mesh.material,bg=scene.background,cc=renderer.getClearColor(new T.Color()),ca=renderer.getClearAlpha();
-      setMaterial(gMaterial);scene.background=null;renderer.setClearColor(0,0);
-      renderer.setRenderTarget(gTarget);renderer.render(scene,camera);
-      scene.background=bg;renderer.setClearColor(cc,ca);setMaterial(material);
+      const skipGTarget=useGI&&stillCamera&&dyn.dynCount.value===0&&giGTargetValid;
+      if(!skipGTarget){
+        const material=mesh.material,bg=scene.background,cc=renderer.getClearColor(new T.Color()),ca=renderer.getClearAlpha();
+        emissiveOrbMesh.visible=false;
+        setMaterial(gMaterial);scene.background=null;renderer.setClearColor(0,0);
+        renderer.setRenderTarget(gTarget);renderer.render(scene,camera);
+        scene.background=bg;renderer.setClearColor(cc,ca);setMaterial(material);
+        giGTargetValid=useGI&&dyn.dynCount.value===0;
+      }
       m.gPos.value=gTarget.textures[0];m.gNormal.value=gTarget.textures[1];
       m.histTex.value=prev.textures[0];m.normalTex.value=prev.textures[1];
       if(useBent)m.bentTex.value=prev.textures[2];
@@ -1561,18 +1669,22 @@ try {
         }
         if(giSunCooldown>0)giSunCooldown--;
       }
+      emissiveOrbMesh.visible=useGI&&emissiveMode.value&&activeScene==='gallery'&&!mask.value&&!giMask.value;
       renderer.setRenderTarget(null);renderer.render(scene,camera);
       traced.prevViewProj.value.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
       traced.prevView.value.copy(camera.matrixWorldInverse);
       traced.frame.value++;histIndex=1-histIndex;
       return;
     }
+    emissiveOrbMesh.visible=false;
     renderer.setRenderTarget(null);
     renderer.render(scene,camera);
   }
   const buttons=[...document.querySelectorAll('button[data-taps]')];
   const sceneButtons=[...document.querySelectorAll('button[data-scene]')];
   const giCheckbox=document.querySelector('#gi');
+  const multiBounceCheckbox=document.querySelector('#multibouncegi');
+  const emissiveCheckbox=document.querySelector('#emissive');
   const giMaskCheckbox=document.querySelector('#gimask');
   const sunAngleInput=document.querySelector('#sunangle');
   const sunAngleVal=document.querySelector('#sunangle-val');
@@ -1592,7 +1704,9 @@ try {
     const label=buttons.find(button=>Number(button.dataset.taps)===selected).textContent;
     if(activeScene==='gallery'&&galleryMeta){
       const rg=radianceGrids.gallery;
-      const giNote=giMode.value?(rg?` · 1-Bounce GI (${rg.dims.join('×')}, ${(rg.bytes/1024).toFixed(0)} KiB, relight ${rg.relightMs.toFixed(1)} ms)`:' · 1-Bounce GI'):' · AO-only';
+      const giLabel=multiBounceGI.value?'Multi-Bounce GI':'1-Bounce GI';
+      const orbNote=emissiveMode.value?' + Emissive Orb':'';
+      const giNote=giMode.value?(rg?` · ${giLabel}${orbNote} (${rg.dims.join('×')}, ${(rg.bytes/1024).toFixed(0)} KiB, relight ${rg.relightMs.toFixed(2)} ms)`:` · ${giLabel}${orbNote}`):' · AO-only';
       status.value=`Gallery (${galleryMeta.triangles.toLocaleString()} tris) · ${label}${giNote} · BVH ${contactResources.buildMs.toFixed(1)} ms`;
     }else if(activeScene==='atrium'&&atriumMeta){
       status.value=`Atrium (Curved, ${atriumMeta.triangles.toLocaleString()} tris) · ${label} · 1280 × 720 · 1.12 m AO radius · BVH ${contactResources.buildMs.toFixed(1)} ms`;
@@ -1611,7 +1725,7 @@ try {
     if(historiesBent)for(const rt of historiesBent){renderer.setRenderTarget(rt);renderer.clear();}
     if(historiesGI)for(const rt of historiesGI){renderer.setRenderTarget(rt);renderer.clear();}
     renderer.setRenderTarget(null);
-    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;
+    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;giGTargetValid=false;
   }
   function setGI(on){
     giMode.value=!!on;
@@ -1630,14 +1744,65 @@ try {
     giMaskCheckbox.checked=giMask.value;
     resetFps();
   }
+  function setMultiBounceGI(on){
+    multiBounceGI.value=!!on;
+    multiBounceCheckbox.checked=multiBounceGI.value;
+    if(giMode.value&&radianceGrids[activeScene]){
+      relightActiveRadianceGrid();
+      giSunCooldown=2;
+      giAccumFrames=1;
+      giDenoiseCached=false;
+    }
+    updateStatus();
+    resetFps();
+  }
+  function updateEmissiveOrb(t,relight=true){
+    emissiveTime=Number(t)||0;
+    if(!emissiveMode.value||activeScene!=='gallery'){
+      sdfUniforms.emissiveColor.value.set(0,0,0);
+      emissiveOrbMesh.visible=false;
+      return;
+    }
+    currentEmissiveSpec();
+    if(relight&&giMode.value&&radianceGrids[activeScene]){
+      relightActiveRadianceGrid();
+      giSunCooldown=2;
+      giDenoiseCached=false;
+    }
+  }
+  function setEmissive(on){
+    emissiveMode.value=!!on;
+    emissiveCheckbox.checked=emissiveMode.value;
+    if(emissiveMode.value&&activeScene==='gallery'&&!giMode.value){
+      setGI(true);
+    }
+    if(emissiveMode.value&&activeScene==='gallery'){
+      currentEmissiveSpec();
+    }else{
+      sdfUniforms.emissiveColor.value.set(0,0,0);
+      emissiveOrbMesh.visible=false;
+    }
+    if(giMode.value&&radianceGrids[activeScene]){
+      relightActiveRadianceGrid();
+      giSunCooldown=2;
+      giAccumFrames=1;
+      giDenoiseCached=false;
+    }
+    updateStatus();
+    resetFps();
+  }
+  function setEmissiveTime(t){
+    updateEmissiveOrb(t,true);
+    giAccumFrames=1;
+    updateStatus();
+  }
   function setSunAngle(deg){
     sunAngleDeg=Number(deg)||0;
     sunAngleInput.value=String(sunAngleDeg);
     sunAngleVal.textContent=`${sunAngleDeg}°`;
     sdfUniforms.sunDir.value.copy(computeGallerySunDir(sunAngleDeg));
     if(giMode.value&&radianceGrids[activeScene]){
-      const s=sdfUniforms.sunDir.value;
-      radianceGrids[activeScene].relight([s.x,s.y,s.z]);
+      relightActiveRadianceGrid();
     }
     // Keep static AO & bent-normal history intact; only mark GI responsive & invalidate GI denoise cache.
     giSunCooldown=2;
@@ -1730,6 +1895,12 @@ try {
       rebuildStaticContact([galleryMesh],{gridSize:'auto',range,bias:.0003});
       giMode.value=true;
       giCheckbox.checked=true;
+      multiBounceGI.value=true;
+      multiBounceCheckbox.checked=true;
+      emissiveMode.value=false;
+      emissiveCheckbox.checked=false;
+      sdfUniforms.emissiveColor.value.set(0,0,0);
+      emissiveOrbMesh.visible=false;
       ensureRadianceGrid();
       if(selected!==64)select(64);
     }else if(target==='atrium'){
@@ -1745,6 +1916,9 @@ try {
       const range=Math.max(.18,.12+.5*Math.hypot(atriumMeta.span[0]/atriumMeta.dims[0],atriumMeta.span[1]/atriumMeta.dims[1],atriumMeta.span[2]/atriumMeta.dims[2]));
       rebuildStaticContact([atriumMesh],{gridSize:'auto',range,bias:.0003});
       giMode.value=false;giCheckbox.checked=false;
+      multiBounceGI.value=false;multiBounceCheckbox.checked=false;
+      emissiveMode.value=false;emissiveCheckbox.checked=false;
+      sdfUniforms.emissiveColor.value.set(0,0,0);emissiveOrbMesh.visible=false;
       giMask.value=false;giMaskCheckbox.checked=false;
     }else{
       dyn.dynCount.value=dynamicAO?movers.length:0;
@@ -1758,9 +1932,13 @@ try {
       controls.update();
       rebuildStaticContact([mesh],{gridSize:'auto',range:contactRange,bias:.0003});
       giMode.value=false;giCheckbox.checked=false;
+      multiBounceGI.value=false;multiBounceCheckbox.checked=false;
+      emissiveMode.value=false;emissiveCheckbox.checked=false;
+      sdfUniforms.emissiveColor.value.set(0,0,0);emissiveOrbMesh.visible=false;
       giMask.value=false;giMaskCheckbox.checked=false;
     }
     lastCamera.identity();
+    giGTargetValid=false;
     updateStatus();
     resetFps();
   }
@@ -1774,10 +1952,12 @@ try {
   document.querySelector('#pbr').onchange=event=>{pbrMode.value=event.target.checked;traced.frame.value=0;resetHistory();resetFps();};
   document.querySelector('#smoothfalloff').onchange=event=>{traced.smoothFalloff.value=event.target.checked?1:0;traced.frame.value=0;resetHistory();resetFps();};
   giCheckbox.onchange=event=>setGI(event.target.checked);
+  multiBounceCheckbox.onchange=event=>setMultiBounceGI(event.target.checked);
+  emissiveCheckbox.onchange=event=>setEmissive(event.target.checked);
   giMaskCheckbox.onchange=event=>setGIMask(event.target.checked);
   sunAngleInput.oninput=event=>setSunAngle(Number(event.target.value));
   // Debug hook for timing from the console.
-  window.aoDemo={scene,mesh,get atriumMesh(){return atriumMesh;},get galleryMesh(){return galleryMesh;},get sceneName(){return activeScene;},get radianceGrid(){return radianceGrids[activeScene];},setScene,boxes,T,aoPass,aoPassBent,aoPassGI,field,get activeField(){return sdfUniforms.field.value;},get contactResources(){return contactResources;},rebuildStaticContact,renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,bakeSyncMs,bakeGpuMs,totalTris,get atlas(){return baked.tex;},meshRes:MESH_RES,setMask:on=>{mask.value=on;},setPBR:on=>{pbrMode.value=on;traced.frame.value=0;resetHistory();},setGI,setGIMask,setSunAngle,get sunDir(){return sdfUniforms.sunDir.value.toArray();},setSmoothFalloff:on=>{traced.smoothFalloff.value=on?1:0;traced.frame.value=0;resetHistory();},setMoverScale:(x,y=x,z=x,w=x)=>dyn.moverScale.value.set(x,y,z,w),select:mode=>select(mode),
+  window.aoDemo={scene,mesh,get atriumMesh(){return atriumMesh;},get galleryMesh(){return galleryMesh;},get sceneName(){return activeScene;},get radianceGrid(){return radianceGrids[activeScene];},setScene,boxes,T,aoPass,aoPassBent,aoPassGI,field,get activeField(){return sdfUniforms.field.value;},get contactResources(){return contactResources;},rebuildStaticContact,renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,bakeSyncMs,bakeGpuMs,totalTris,get atlas(){return baked.tex;},meshRes:MESH_RES,setMask:on=>{mask.value=on;},setPBR:on=>{pbrMode.value=on;traced.frame.value=0;resetHistory();},setGI,setMultiBounceGI,setEmissive,setEmissiveTime,setGIMask,setSunAngle,get sunDir(){return sdfUniforms.sunDir.value.toArray();},setSmoothFalloff:on=>{traced.smoothFalloff.value=on?1:0;traced.frame.value=0;resetHistory();},setMoverScale:(x,y=x,z=x,w=x)=>dyn.moverScale.value.set(x,y,z,w),select:mode=>select(mode),
     setDynamicAO:on=>{dynamicAO=on;updateMovers(simTime);},setContactMode:mode=>{traced.contactMode.value=Number(mode)||0;traced.frame.value=0;resetHistory();},traced,
     resetHistory,
     setAOScale:scale=>{aoScale=scale;makeTracedTargets(scale);},
@@ -1787,9 +1967,13 @@ try {
   const initScene=new URLSearchParams(location.search).get('scene');
   if(initScene==='atrium'||initScene==='gallery')await setScene(initScene);
   renderer.setAnimationLoop(now=>{
-    if(animate&&lastNow)simTime+=Math.min(now-lastNow,100)/1000;
+    const dt=(animate&&lastNow)?Math.min(now-lastNow,100)/1000:0;
+    if(dt>0)simTime+=dt;
     lastNow=now;
-    if(animate)updateMovers(simTime);
+    if(animate){
+      updateMovers(simTime);
+      if(emissiveMode.value&&activeScene==='gallery'&&dt>0)updateEmissiveOrb(emissiveTime+dt,true);
+    }
     render(selected);
     if(!started){started=now;return;}
     frames++;

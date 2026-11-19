@@ -316,7 +316,7 @@ vec3 sampleRadianceVol(vec3 hitP){
  if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return vec3(0.);
  return texture(radianceVol,uv).rgb*radianceScale;
 }
-vec4 tracedAOBentGI(vec3 p,vec3 n,float nd,out vec3 giOutIrr){
+vec4 tracedAOBentGI(vec3 p,vec3 n,float nd,bool needAO,out vec3 giOutIrr){
  vec3 a=abs(n.x)<.9?vec3(1.,0.,0.):vec3(0.,1.,0.);
  vec3 t=normalize(cross(n,a)),b=cross(n,t);
  float su=ign(gl_FragCoord.xy);
@@ -324,8 +324,11 @@ vec4 tracedAOBentGI(vec3 p,vec3 n,float nd,out vec3 giOutIrr){
  float vis=0.;
  vec3 bent=vec3(0.);
  vec3 giSum=vec3(0.);
+ float giRays=0.;
  float fu=fract(su+vdc2(uint(frame)));
  uint base=uint(frame)*4u;
+ int fParity=int(uint(frame)&1u);
+ int fMod3=int(uint(frame)%3u);
  float minCosClear=2.;
  if(contactMode==0){
   float dClear2=staticDistance(p+n*(2.*contactRange));
@@ -359,37 +362,44 @@ vec4 tracedAOBentGI(vec3 p,vec3 n,float nd,out vec3 giOutIrr){
   float phi=6.2831853*fract(sp+vdc3(base+uint(i)));
   float cosn=sqrt(1.-u);
   vec3 w=t*(sqrt(u)*cos(phi))+b*(sqrt(u)*sin(phi))+n*cosn;
+  // Trace far GI extension on at most 2 stratified rays/frame (unbiased across strata) while keeping
+  // all nd short rays for crisp AO & near-contact visibility.
+  bool doGI=(nd<=2.5)||(nd<3.5?(i!=fMod3):((i&1)==fParity));
+  if(doGI)giRays+=1.;
   bool skipBvh=cosn>=minCosClear;
   float tHit=contactRange*.5;
   vec3 hitN=vec3(0.);
   bool blocked=false;
   if(!skipBvh){
    if(contactMode==1)blocked=contactBlockedHiZ(p,n,w);
-   else blocked=contactHitCell(origin,w,cellRoot,cellCount,cellQMin,cellQScale,tHit,hitN);
+   else if(doGI)blocked=contactHitCell(origin,w,cellRoot,cellCount,cellQMin,cellQScale,tHit,hitN);
+   else blocked=contactBlockedCell(origin,w,cellRoot,cellCount,cellQMin,cellQScale);
   }
   if(blocked){
-   if(contactMode==1){
-    giSum+=sampleRadianceVol(p+w*tHit);
-   }else{
-    float nl=length(hitN);
-    if(nl>1e-8){
-     hitN/=nl;
-     // Reject back-facing radiance hits (inside overlapping geometry / embedded trims)
-     if(dot(hitN,-w)>0.){
-      vec3 hitP=origin+w*tHit;
-      vec3 rad=sampleRadianceVol(hitP);
-      vec3 sDir=normalize(giSunDir);
-      float hitNdl=max(0.,dot(hitN,sDir));
-      float hitSkyF=.42+.32*max(0.,hitN.z);
-      // Crease shadow & same-voxel self-hit guard: prevent coarse-voxel sunlit tops from
-      // creating glowing rings inside tight creases (pedestal tiers, torus trims, contacts)
-      if(hitNdl>.01&&tHit<.15){
-       float sdSh=staticDistance(hitP+hitN*.035+sDir*.11);
-       if(sdSh<.05)hitNdl*=smoothstep(.005,.05,sdSh);
-       hitNdl*=smoothstep(.008,.095,tHit);
+   if(doGI){
+    if(contactMode==1){
+     giSum+=sampleRadianceVol(p+w*tHit);
+    }else{
+     float nl=length(hitN);
+     if(nl>1e-8){
+      hitN/=nl;
+      // Reject back-facing radiance hits (inside overlapping geometry / embedded trims)
+      if(dot(hitN,-w)>0.){
+       vec3 hitP=origin+w*tHit;
+       vec3 rad=sampleRadianceVol(hitP);
+       vec3 sDir=normalize(giSunDir);
+       float hitNdl=max(0.,dot(hitN,sDir));
+       float hitSkyF=.42+.32*max(0.,hitN.z);
+       // Crease shadow & same-voxel self-hit guard: prevent coarse-voxel sunlit tops from
+       // creating glowing rings inside tight creases (pedestal tiers, torus trims, contacts)
+       if(hitNdl>.01&&tHit<.15){
+        float sdSh=staticDistance(hitP+hitN*.035+sDir*.11);
+        if(sdSh<.05)hitNdl*=smoothstep(.005,.05,sdSh);
+        hitNdl*=smoothstep(.008,.095,tHit);
+       }
+       vec3 maxRad=vec3(3.10,2.90,2.55)*hitNdl+vec3(.56,.64,.76)*hitSkyF;
+       giSum+=min(rad,maxRad);
       }
-      vec3 maxRad=vec3(3.10,2.90,2.55)*hitNdl+vec3(.56,.64,.76)*hitSkyF;
-      giSum+=min(rad,maxRad);
      }
     }
    }
@@ -398,37 +408,53 @@ vec4 tracedAOBentGI(vec3 p,vec3 n,float nd,out vec3 giOutIrr){
   float s=contactRange,v=1.;
   bool giHit=false;
   float tGi=0.,tMinVis=contactRange;
-  for(int k=0;k<16;k++){
-   float d=staticDistance(p+w*s),e=max(min(.025,.1*s*cosn),1e-6);
-   float stepVis=clamp((d+e)/(4.*e),0.,1.);
-   if(smoothFalloff>.5){
-    float fade=smoothstep(1.12,.72,s);
-    stepVis=mix(1.,stepVis,fade);
+  if(needAO){
+   for(int k=0;k<16;k++){
+    float d=staticDistance(p+w*s),e=max(min(.025,.1*s*cosn),1e-6);
+    float stepVis=clamp((d+e)/(4.*e),0.,1.);
+    if(smoothFalloff>.5){
+     float fade=smoothstep(1.12,.72,s);
+     stepVis=mix(1.,stepVis,fade);
+    }
+    if(stepVis<v){v=stepVis;tMinVis=s;}
+    if(doGI&&d<.028&&!giHit){giHit=true;tGi=s+max(d,0.);}
+    if(v<.01){if(doGI&&!giHit){giHit=true;tGi=s+max(d,0.);}break;}
+    s+=max(d,.072);if(s>1.12)break;
    }
-   if(stepVis<v){v=stepVis;tMinVis=s;}
-   if(d<.028&&!giHit){giHit=true;tGi=s+max(d,0.);}
-   if(v<.01){if(!giHit){giHit=true;tGi=s+max(d,0.);}break;}
-   s+=max(d,.072);if(s>1.12)break;
-  }
-  // Continue sphere-tracing past 1.12 m up to giMaxDist to capture room-scale color bleeding
-  if(!giHit&&giMaxDist>1.12){
-   for(int k=0;k<14;k++){
+   // Continue sphere-tracing past 1.12 m up to giMaxDist only on the 2 GI rays/frame
+   if(doGI&&!giHit&&giMaxDist>1.12){
+    for(int k=0;k<14;k++){
+     float d=staticDistance(p+w*s);
+     if(d>1e3)break;
+     if(d<.042){giHit=true;tGi=s+max(d,0.);break;}
+     s+=d>.30?d*1.15:max(d,.08);
+     if(s>giMaxDist)break;
+    }
+   }
+   vis+=v;
+   bent+=w*v;
+   if(doGI){
+    if(giHit){
+     giSum+=sampleRadianceVol(p+w*tGi);
+    }else if(v<.99){
+     giSum+=(1.-v)*sampleRadianceVol(p+w*tMinVis);
+    }
+   }
+  }else{
+   // AO already settled: single fast GI-only sphere trace directly to giMaxDist
+   for(int k=0;k<18;k++){
     float d=staticDistance(p+w*s);
     if(d>1e3)break;
-    if(d<.042){giHit=true;tGi=s+max(d,0.);break;}
+    if(d<.038){giHit=true;tGi=s+max(d,0.);break;}
     s+=d>.30?d*1.15:max(d,.08);
     if(s>giMaxDist)break;
    }
-  }
-  vis+=v;
-  bent+=w*v;
-  if(giHit){
-   giSum+=sampleRadianceVol(p+w*tGi);
-  }else if(v<.99){
-   giSum+=(1.-v)*sampleRadianceVol(p+w*tMinVis);
+   if(giHit){
+    giSum+=sampleRadianceVol(p+w*tGi);
+   }
   }
  }
- giOutIrr=giSum/nd;
+ giOutIrr=giSum/max(giRays,1.);
  float bl=length(bent);
  return vec4(vis/nd,bl>1e-4?bent/bl:n);
 }

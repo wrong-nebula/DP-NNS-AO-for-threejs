@@ -270,3 +270,29 @@ Fixed 5 verified visual defects on the Sunlit Gallery 1-Bounce GI renderer witho
 - **Archive Regression (`judge_v2.py --tag post-gi-opt`)**: Fit@64 **0.00585**, Held@64 **0.00497**, Contact@64 **0.01877**, FLIP **0.02193**, GMSD **0.01051** (**bit-exact**), 0 errors.
 - **Atrium Regression (`bench_atrium.py`)**: MAE@64 **0.01050** (**bit-exact**), 0 errors.
 - **Tests**: `npm test` + `python3 test/webgl2-smoke.py` pass with 0 WebGL / console / page errors.
+
+---
+
+## Multi-Bounce GPU GI, Dynamic Emissive Orb, Active-GI Speedup & Subpixel Jitter Ablation (`post-multibounce`)
+
+### Changes Implemented (`radiance-grid.js`, `contact-bvh.js`, `index.html`, `benchmark/bench_gallery_gi.py`)
+1. **Multi-Bounce Recursive GPU GI (`radiance-grid.js`, `#multibouncegi`, `aoDemo.setMultiBounceGI(on)`)**:
+   - Added a lazily-allocated second `64 × 64 × 40` `RGBA8` `WebGL3DRenderTarget` (`targetB`, 640 KiB) and a Pass-2 GPU multi-bounce propagation shader (`bounceMat`) that gathers 6 hemisphere-aligned short SDF rays per occupied/dilated voxel from `targetA` and writes `direct + bounceWeight * albedo * indirect` (`bounceWeight = 0.72`, physically bounded `< 0.85`) into `targetB`.
+   - Runs ONLY during `relight()` (**0.20 ms** median on Apple M1 GPU, **0.00 ms/f** when lighting is static); default ON in UI for Gallery and toggleable off for apples-to-apples 1-bounce benchmarking against `tools/trace_gi.cpp`.
+2. **Real-Time Dynamic Emissive Orb (`radiance-grid.js`, `index.html`, `#emissive`, `aoDemo.setEmissive(on)`)**:
+   - Added an opt-in glowing floating orb (smoothly shifting warm amber-gold ↔ electric cyan) orbiting around the Gallery pedestal & shadowed archway.
+   - Injects emissive radiance directly into open-air & SDF-shadowed surface voxels of `radianceVol` during the 0.20 ms GPU `relight()` pass, paired with direct inverse-square SDF-shadowed point light (`sdfPointShadow`, gated inside `#ifdef DIFFUSE_GI`) and a Fresnel-glowing orb mesh hidden during `gTarget`.
+   - Runs live orbiting at **16.00 ms/f** (>60 FPS) with smooth, blotch-free colored GI & soft shadows.
+3. **Active / Moving-Sun GI Tracing Speedup (`contact-bvh.js`, `index.html`)**:
+   - Capped far `1.12..8.5 m` GI tracing to **2 unbiased stratified rays/frame** (`(i & 1) == (frame & 1)` for `nd=4`, cycling for `nd=3`) while keeping all `nd` short rays for crisp AO & near-contact visibility.
+   - Added `!needAO` fast GI-only sphere trace (single 18-step loop once `aoSettled` is true), still-camera `gTarget` reuse under `useGI`, and checkerboard late refinement (`giFrames >= 64 && aoSettled && !sunMoving`).
+   - Result: moving-sun GI dropped **-23.9%** (`13.80 → 10.50 ms/f`), frame-70 dropped **-12.3%** (`6.50 → 5.70 ms/f`), settled dropped to **2.70 ms/f** — with bit-exact 1-bounce accuracy (`AO MAE 0.01152`, `RGB MAE 0.04112`, `PSNR 23.85 dB`).
+4. **Ablated & Rejected: 2×2 Subpixel Half-Res Jitter on `Archive` (`ablate-subpixel`)**:
+   - Tested 4-phase `(±0.25, ±0.25)` half-res projection jitter on `gTarget` with unjittered reprojection in `history()` and `tracedAt()`.
+   - Result on `judge_v2.py --tag ablate-subpixel`: fixed `pix575366` (`0.3961 → 0.7294`, ref `0.795`) and improved Fit@4/16 (`0.01256 / 0.00789`), **but** forced `±0.5`-texel bilinear history resampling every frame on still cameras, regressing `Fit@64` (`0.00585 → 0.00869`), `Held@64` (`0.00497 → 0.00600`), `Contact@64` (`0.01877 → 0.02788`), `FLIP` (`0.02193 → 0.02764`), `GMSD` (`0.01051 → 0.02947`), and `Flicker` (`0.00079 → 0.00144`). Cleanly reverted.
+
+### Verified Apple M1 Chrome WebGL2 Results (`post-multibounce`)
+- **Gallery GI (`bench_gallery_gi.py`)**: 1-bounce `AO MAE@64 = 0.01152`, `Bounce MAE = 0.05785`, `RGB MAE = 0.04112`, `PSNR = 23.85 dB` (**bit-exact**); GPU relight **0.20 ms** (1-bounce & multi-bounce); Wall ms/f: early **11.80**, frame-70 **5.70**, settled **2.70**, moving-sun **10.50**, orbiting emissive orb **16.00**; **0 GL / 0 console / 0 page errors** across all 3 scenes × 7 modes × all 8 toggles.
+- **Archive Regression (`judge_v2.py --tag post-multibounce`)**: Fit@64 **0.00585**, Held@64 **0.00497**, Contact@64 **0.01877**, FLIP **0.02193**, GMSD **0.01051** (**bit-exact**), 0 errors.
+- **Atrium Regression (`bench_atrium.py`)**: MAE@64 **0.01050** (**bit-exact**), Wall settled **1.90 ms/f**, 0 errors.
+- **Tests**: `npm test` + `python3 test/webgl2-smoke.py` pass with 0 errors.
