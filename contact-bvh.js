@@ -238,6 +238,7 @@ uniform sampler3D radianceVol;
 uniform float radianceScale;
 uniform float giMaxDist;
 uniform vec3 giSunDir;
+uniform int giMaxSteps;
 bool contactTestLeafHit(uint meta,vec3 origin,vec3 w,inout float bestT,inout vec3 bestN){
  int first=int((meta&0x7FFFFFFFu)>>3u);
  int count=int(meta&7u);
@@ -460,6 +461,118 @@ vec4 tracedAOBentGI(vec3 p,vec3 n,float nd,bool needAO,out vec3 giOutIrr){
  giOutIrr=giSum/max(giRays,1.);
  float bl=length(bent);
  return vec4(vis/nd,bl>1e-4?bent/bl:n);
+}
+// Decoupled L1 YCoCg SH + 1st-bounce hit-distance diffuse GI tracer (NRD REBLUR-compatible):
+// traces nd antithetic cosine-weighted rays from [0, giMaxDist], returning mean linear RGB irradiance,
+// luminance-weighted ray direction (c1 = avg(w * Y)), and mean 1st-bounce hit distance.
+void tracedGISH(vec3 p,vec3 n,float nd,out vec3 giOutIrr,out vec3 giOutC1,out float giOutHitDist){
+ vec3 a=abs(n.x)<.9?vec3(1.,0.,0.):vec3(0.,1.,0.);
+ vec3 t=normalize(cross(n,a)),b=cross(n,t);
+ float su=ign(gl_FragCoord.xy);
+ float sp=ign(gl_FragCoord.xy+vec2(37.,17.));
+ float fu=fract(su+vdc2(uint(frame)));
+ float phiBase=6.2831853*fract(sp+vdc3(uint(frame)));
+ float minCosClear=2.;
+ if(contactMode==0){
+  float dClear2=staticDistance(p+n*(2.*contactRange));
+  if(dClear2>=2.*contactRange-.004&&dClear2<1e3){
+   minCosClear=.25;
+  }else{
+   float dClear1=staticDistance(p+n*contactRange);
+   if(dClear1>=contactRange-.003&&dClear1<1e3)minCosClear=.5;
+  }
+ }
+ vec3 origin=p+n*contactBias;
+ int cellRoot=0,cellCount=0;
+ vec3 cellQMin=contactRootMin,cellQScale=contactRootSpan*(1./65535.);
+ if(contactMode!=1){
+  if(contactGridSize>0.){
+   ivec3 cell=ivec3(floor((p-contactGridMin)/contactGridSize));
+   ivec3 dims=textureSize(contactGrid,0);
+   if(!any(lessThan(cell,ivec3(0)))&&!any(greaterThanEqual(cell,dims))){
+    uvec2 bounds=texelFetch(contactGrid,cell,0).xy;
+    cellRoot=int(bounds.x);cellCount=int(bounds.y);
+    cellQMin=contactGridMin+vec3(cell)*contactGridSize-vec3(contactRange+abs(contactBias));
+    cellQScale=vec3((contactGridSize+2.*(contactRange+abs(contactBias)))*(1./65535.));
+   }
+  }else{
+   cellCount=contactNodeCount;
+  }
+ }
+ vec3 sDir=normalize(giSunDir);
+ vec3 giSum=vec3(0.),c1Sum=vec3(0.);
+ float hitSum=0.;
+ int maxSteps=giMaxSteps>0?giMaxSteps:18;
+ for(int i=0;i<4;i++){
+  if(float(i)>=nd)break;
+  float u=clamp((float(i)+fu)/nd,1e-4,.9999);
+  float phi=phiBase+float(i)*(6.2831853/nd);
+  float cosn=sqrt(1.-u);
+  vec3 w=t*(sqrt(u)*cos(phi))+b*(sqrt(u)*sin(phi))+n*cosn;
+  bool skipBvh=cosn>=minCosClear;
+  float tHit=contactRange*.5;
+  vec3 hitN=vec3(0.);
+  bool blocked=false;
+  if(!skipBvh){
+   if(contactMode==1)blocked=contactBlockedHiZ(p,n,w);
+   else blocked=contactHitCell(origin,w,cellRoot,cellCount,cellQMin,cellQScale,tHit,hitN);
+  }
+  vec3 rad=vec3(0.);
+  float rayHitT=giMaxDist;
+  if(blocked){
+   rayHitT=tHit;
+   if(contactMode==1){
+    rad=sampleRadianceVol(p+w*tHit);
+   }else{
+    float nl=length(hitN);
+    if(nl>1e-8){
+     hitN/=nl;
+     if(dot(hitN,-w)>0.){
+      vec3 hitP=origin+w*tHit;
+      vec3 rawRad=sampleRadianceVol(hitP);
+      float hitNdl=max(0.,dot(hitN,sDir));
+      float hitSkyF=.42+.32*max(0.,hitN.z);
+      if(hitNdl>.01&&tHit<.15){
+       float sdSh=staticDistance(hitP+hitN*.035+sDir*.11);
+       if(sdSh<.05)hitNdl*=smoothstep(.005,.05,sdSh);
+       hitNdl*=smoothstep(.008,.095,tHit);
+      }
+      vec3 maxRad=vec3(3.10,2.90,2.55)*hitNdl+vec3(.56,.64,.76)*hitSkyF;
+      rad=min(rawRad,maxRad);
+     }
+    }
+   }
+  }else{
+   float s=contactRange;
+   bool giHit=false;
+   float tGi=giMaxDist,minD=1e4,tMinD=contactRange;
+   for(int k=0;k<24;k++){
+    if(k>=maxSteps)break;
+    float d=staticDistance(p+w*s);
+    if(d>1e3)break;
+    if(d<minD){minD=d;tMinD=s;}
+    float hitEps=s<1.2?.038:.044;
+    if(d<hitEps){giHit=true;tGi=s+max(d,0.);break;}
+    s+=d>.30?d*1.15:max(d,.072);
+    if(s>giMaxDist)break;
+   }
+   if(giHit){
+    rayHitT=tGi;
+    rad=sampleRadianceVol(p+w*tGi);
+   }else if(minD<.068){
+    rayHitT=tMinD;
+    rad=smoothstep(.068,.036,minD)*sampleRadianceVol(p+w*tMinD);
+   }
+  }
+  giSum+=rad;
+  float y=dot(rad,vec3(.25,.5,.25));
+  c1Sum+=w*y;
+  hitSum+=rayHitT;
+ }
+ float invNd=1./max(nd,1.);
+ giOutIrr=giSum*invNd;
+ giOutC1=c1Sum*invNd;
+ giOutHitDist=hitSum*invNd;
 }
 #endif
 `;

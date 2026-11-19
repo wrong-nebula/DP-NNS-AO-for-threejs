@@ -108,6 +108,7 @@ uniform sampler2D aoNormalTex;
 uniform sampler2D aoBentTex;
 #ifdef DIFFUSE_GI
 uniform sampler2D aoGITex;
+uniform sampler2D aoGISH1Tex;
 uniform sampler2D sunShadowTex;
 uniform sampler2D orbShadowTex;
 #endif
@@ -179,71 +180,113 @@ vec3 tracedAt(vec3 pWorld,vec3 n){
   return resVal;
 }
 #ifdef DIFFUSE_GI
+vec3 ycocgToLinear(vec3 c){
+  float t=c.x-c.z;
+  return max(vec3(t+c.y,c.x+c.z,t-c.y),vec3(0.));
+}
+// Lean single-loop tangent-plane upsampler for AO (at aoScale) + L1 YCoCg SH GI (at giScale <= aoScale):
+// Uses aoTex/aoNormalTex at q*giStride as guides (ZERO extra depth/meta texture reads in full-res pass!)
+// and fetches RGBA8 dominant direction aoGISH1Tex ONCE per pixel for full-res normal L1 SH resolve.
 vec3 tracedAtGI(vec3 pWorld,vec3 n,out vec3 giOutIrr){
   giOutIrr=vec3(0.);
-  vec2 res=vec2(textureSize(aoTex,0));
-  vec2 invRes2=2./res;
-  vec2 f=gl_FragCoord.xy*res/vec2(${W}.,${H}.)-.5;
-  f=mix(f,round(f),vec2(lessThan(abs(f-round(f)),vec2(.02))));
-  ivec2 i0=ivec2(floor(f));vec2 w=f-floor(f);
+  ivec2 resAO=textureSize(aoTex,0);
   vec3 vp=(viewMatrix*vec4(pWorld,1.)).xyz;
   vec3 vn=mat3(viewMatrix)*n;
   float viewDepth=-vp.z;
   vec2 vnXY=vn.xy*invProjXY;
   float vpDotN=dot(vn,vp);
-  vec3 acc=vec3(0.);vec3 gAcc=vec3(0.);float ws=0.;
-  float bestScore=1e9;vec3 bestGI=vec3(0.);
-  float planeTol=.0015*viewDepth+.005;
   float depthTol=.08*viewDepth+.05;
-  for(int k=0;k<4;k++){
-    ivec2 o=ivec2(k&1,k>>1),q=clamp(i0+o,ivec2(0),ivec2(res)-1);
-    float bw=(o.x==1?w.x:1.-w.x)*(o.y==1?w.y:1.-w.y);
-    vec2 h=texelFetch(aoTex,q,0).xy;
-    vec4 hn=texelFetch(aoNormalTex,q,0);
-    float frames=hn.w*255.;
-    if(frames<.5)continue;
-    vec3 nv=octDecodeRaw(hn.xy);float dn=dot(nv,n);
-    float nv2=dot(nv,nv);
-    float nCos=dn*inversesqrt(max(nv2,1e-6));
-    float sc=abs(h.y-viewDepth)/(viewDepth+.1)+(1.-max(0.,nCos))*.5;
-    vec4 gTap=texelFetch(aoGITex,q,0);
-    if(sc<bestScore){bestScore=sc;bestGI=gTap.rgb;}
-    if(bw<1e-4||abs(h.y-viewDepth)>depthTol)continue;
-    if(dn<=0.||dn*dn<.81*nv2)continue;
-    vec2 ndcQ=(vec2(q)+.5)*invRes2-1.;
-    if(abs((dot(vnXY,ndcQ)-vn.z)*h.y-vpDotN)>planeTol)continue;
-    float sig=hn.z*.25;
-    acc+=bw*vec3(h.x,frames,sig*sig);
-    gAcc+=bw*gTap.rgb;
-    ws+=bw;
+  vec3 aoTr;
+  vec3 sh0=vec3(0.),nC=n;
+  ivec2 bestGIQ=ivec2(0);
+  #ifndef GI_DECOUPLED
+  {
+    // Same-grid fast path (0.5x AO + 0.5x GI): 13 fetches total, minimal registers on Metal TBDR!
+    vec2 res=vec2(resAO),invRes2=2./res;
+    vec2 f=gl_FragCoord.xy*res/vec2(${W}.,${H}.)-.5;
+    f=mix(f,round(f),vec2(lessThan(abs(f-round(f)),vec2(.02))));
+    ivec2 i0=ivec2(floor(f));vec2 w=f-floor(f);
+    float planeTol=.0015*viewDepth+.005;
+    vec3 acc=vec3(0.),sh0Acc=vec3(0.),nAcc=vec3(0.);float ws=0.;
+    float bestScore=1e9;bestGIQ=clamp(ivec2(round(f)),ivec2(0),resAO-1);vec3 bestN=n;
+    for(int k=0;k<4;k++){
+      ivec2 o=ivec2(k&1,k>>1),q=clamp(i0+o,ivec2(0),resAO-1);
+      float bw=(o.x==1?w.x:1.-w.x)*(o.y==1?w.y:1.-w.y);
+      vec2 h=texelFetch(aoTex,q,0).xy;
+      vec4 hn=texelFetch(aoNormalTex,q,0);
+      float frames=hn.w*255.;
+      if(frames<.5)continue;
+      vec3 nv=octDecodeRaw(hn.xy);float dn=dot(nv,n);float nv2=dot(nv,nv);
+      float invNl=inversesqrt(max(nv2,1e-6));
+      float sc=abs(h.y-viewDepth)/(viewDepth+.1)+(1.-max(0.,dn*invNl))*.5;
+      if(sc<bestScore){bestScore=sc;bestGIQ=q;bestN=nv*invNl;}
+      if(bw<1e-4||abs(h.y-viewDepth)>depthTol)continue;
+      if(dn<=0.||dn*dn<.81*nv2)continue;
+      vec2 ndcQ=(vec2(q)+.5)*invRes2-1.;
+      if(abs((dot(vnXY,ndcQ)-vn.z)*h.y-vpDotN)>planeTol)continue;
+      float sig=hn.z*.25;
+      acc+=bw*vec3(h.x,frames,sig*sig);
+      sh0Acc+=bw*texelFetch(aoGITex,q,0).rgb;
+      nAcc+=bw*(nv*invNl);
+      ws+=bw;
+    }
+    if(ws<=.01){
+      sh0=texelFetch(aoGITex,bestGIQ,0).rgb;nC=bestN;aoTr=vec3(0.);
+    }else{
+      aoTr=acc/ws;sh0=sh0Acc/ws;nC=nAcc/ws;
+    }
   }
-  if(ws<=.01){
-    // Silhouette fallback: pick best matching half-res neighbor so curved edges never drop to black
-    giOutIrr=bestScore<1e8?bestGI:texelFetch(aoGITex,clamp(ivec2(round(f)),ivec2(0),ivec2(res)-1),0).rgb;
-    return vec3(0.);
+  #else
+  {
+    // Decoupled quarter-res GI (0.25x) + half-res AO (0.5x): GI guides read directly from aoTex/aoNormalTex at q*giStride!
+    ivec2 resGI=textureSize(aoGITex,0);
+    ivec2 giStride=max(ivec2(1),(resAO+resGI/2)/max(resGI,ivec2(1)));
+    aoTr=tracedAt(pWorld,n);
+    vec2 resG=vec2(resGI),invResAO2=2./vec2(resAO);
+    vec2 f=gl_FragCoord.xy*resG/vec2(${W}.,${H}.)-.5;
+    ivec2 i0=ivec2(floor(f));vec2 w=f-floor(f);
+    float planeTol=(.0020*viewDepth+.006)*float(giStride.x);
+    vec3 sh0Acc=vec3(0.),nAcc=vec3(0.);float ws=0.;
+    float bestScore=1e9;bestGIQ=clamp(ivec2(round(f)),ivec2(0),resGI-1);vec3 bestN=n;
+    for(int k=0;k<4;k++){
+      ivec2 o=ivec2(k&1,k>>1),q=clamp(i0+o,ivec2(0),resGI-1);
+      ivec2 gq=clamp(q*giStride,ivec2(0),resAO-1);
+      float bw=(o.x==1?w.x:1.-w.x)*(o.y==1?w.y:1.-w.y);
+      vec2 h=texelFetch(aoTex,gq,0).xy;
+      vec4 hn=texelFetch(aoNormalTex,gq,0);
+      if(hn.w*255.<.5)continue;
+      vec3 nv=octDecodeRaw(hn.xy);float dn=dot(nv,n);float nv2=dot(nv,nv);
+      float invNl=inversesqrt(max(nv2,1e-6));
+      float sc=abs(h.y-viewDepth)/(viewDepth+.1)+(1.-max(0.,dn*invNl))*.5;
+      if(sc<bestScore){bestScore=sc;bestGIQ=q;bestN=nv*invNl;}
+      if(bw<1e-4||abs(h.y-viewDepth)>depthTol)continue;
+      if(dn<=0.||dn*dn<.78*nv2)continue;
+      vec2 ndcQ=(vec2(gq)+.5)*invResAO2-1.;
+      if(abs((dot(vnXY,ndcQ)-vn.z)*h.y-vpDotN)>planeTol)continue;
+      sh0Acc+=bw*texelFetch(aoGITex,q,0).rgb;
+      nAcc+=bw*(nv*invNl);
+      ws+=bw;
+    }
+    if(ws<=.01){
+      sh0=texelFetch(aoGITex,bestGIQ,0).rgb;nC=bestN;
+    }else{
+      sh0=sh0Acc/ws;nC=nAcc/ws;
+    }
   }
-  vec3 resVal=acc/ws;
-  giOutIrr=gAcc/ws;
-  // Lightweight 4-tap axial edge-preserving polish (aoGITex is already denoised by 2/3-pass half-res a-trous)
-  ivec2 c0=clamp(ivec2(round(f)),ivec2(0),ivec2(res)-1);
-  float fSum=resVal.x*2.,fw=2.;
-  vec3 gSum=giOutIrr*2.;float gw=2.;
-  const ivec2 offs[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
-  for(int k=0;k<4;k++){
-    ivec2 q=clamp(c0+offs[k],ivec2(0),ivec2(res)-1);
-    vec2 h=texelFetch(aoTex,q,0).xy;
-    vec4 hn=texelFetch(aoNormalTex,q,0);
-    if(hn.w*255.<.5||abs(h.y-viewDepth)>depthTol)continue;
-    vec3 nv=octDecodeRaw(hn.xy);float dn=dot(nv,n);
-    if(dn<=0.||dn*dn<.81*dot(nv,nv))continue;
-    vec2 ndcQ=(vec2(q)+.5)*invRes2-1.;
-    if(abs((dot(vnXY,ndcQ)-vn.z)*h.y-vpDotN)>planeTol*1.5)continue;
-    gSum+=texelFetch(aoGITex,q,0).rgb;gw+=1.;
-    if(resVal.y<10.){fSum+=h.x;fw+=1.;}
-  }
-  if(resVal.y<10.)resVal.x=fSum/fw;
-  giOutIrr=gSum/gw;
-  return resVal;
+  #endif
+  // 1 single RGBA8 fetch for scale-invariant dominant GI direction d1 = c1 / Y in [-1, 1]^3:
+  // white-furnace-preserving L1 YCoCg SH normal resolve against full-res normal n!
+  vec3 d1=texelFetch(aoGISH1Tex,bestGIQ,0).rgb*2.-1.;
+  float y0=max(sh0.x,0.);
+  float nlC=length(nC);
+  vec3 nCoarse=nlC>1e-4?nC/nlC:n;
+  float yFull=max(0.,.333333+dot(d1,n));
+  float yBase=max(.08,.333333+dot(d1,nCoarse));
+  float dirScale=clamp(yFull/yBase,.40,1.60);
+  float yOut=y0*dirScale;
+  vec2 chroma=sh0.yz*((yOut+1e-4)/(y0+1e-4));
+  giOutIrr=ycocgToLinear(vec3(yOut,chroma));
+  return aoTr;
 }
 #endif
 #endif
@@ -983,9 +1026,189 @@ void main(){
   #ifdef BENT_NORMALS
   bentOut=vec4(bentN*.5+.5,1.);
   #endif
-  #ifdef DIFFUSE_GI
-  giOut=vec4(giIrr,1.);
-  #endif
+}`;
+// Decoupled L1 YCoCg SH Diffuse GI pass (NRD REBLUR-compatible, 4 MRTs at giScale):
+//   loc 0: giSH0Out  (RGBA16F: Y, Co, Cg, normHitDist)
+//   loc 1: giSH1Out  (RGBA16F: c1.x, c1.y, c1.z, fastLuma)
+//   loc 2: giMetaOut (RGBA8:   octNormal.xy, giFrames/255, fastFrames/16)
+//   loc 3: giDepthOut(R32F:    viewDepth)
+const giPassFragment=`
+precision highp float;
+precision highp sampler3D;
+uniform sampler3D field;
+uniform sampler2D gPos;
+uniform sampler2D gNormal;
+uniform sampler2D giSH0Tex;
+uniform sampler2D giSH1Tex;
+uniform sampler2D giMetaTex;
+uniform sampler2D giDepthTex;
+uniform mat4 prevViewProj;
+uniform mat4 prevView;
+uniform vec2 invProjXY;
+uniform float frame;
+uniform float giHistMax;
+uniform float giFastMax;
+uniform float giDynamic;
+uniform float giRays;
+uniform float settleFrames;
+uniform vec3 sdfMin;
+uniform vec3 sdfInvSpan;
+layout(location=0) out vec4 giSH0Out;
+layout(location=1) out vec4 giSH1Out;
+layout(location=2) out vec4 giMetaOut;
+layout(location=3) out vec4 giDepthOut;
+vec2 octEncode(vec3 n){
+  n/=abs(n.x)+abs(n.y)+abs(n.z);
+  if(n.z<0.)n.xy=(1.-abs(n.yx))*vec2(n.x>=0.?1.:-1.,n.y>=0.?1.:-1.);
+  return n.xy*.5+.5;
+}
+vec3 octDecodeRaw(vec2 e){
+  e=e*2.-1.;
+  vec3 v=vec3(e.xy,1.-abs(e.x)-abs(e.y));
+  if(v.z<0.)v.xy=(1.-abs(v.yx))*vec2(v.x>=0.?1.:-1.,v.y>=0.?1.:-1.);
+  return v;
+}
+vec3 linearToYCoCg(vec3 c){
+  return vec3(dot(c,vec3(.25,.5,.25)),dot(c,vec3(.5,0.,-.5)),dot(c,vec3(-.25,.5,-.25)));
+}
+float staticDistance(vec3 pos){
+  vec3 uv=(pos-sdfMin)*sdfInvSpan;
+  if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return 1e4;
+  return texture(field,uv).r;
+}
+float ign(vec2 q){return fract(52.9829189*fract(dot(q,vec2(.06711056,.00583715))));}
+${CONTACT_GLSL.replaceAll('candidateAO(', 'tracedAO(').replaceAll('candidateAOBent(', 'tracedAOBent(')}
+bool giHistory(vec3 p,vec3 n,out vec4 prevSH0,out vec4 prevSH1,out vec2 prevFrames,out vec3 fastStats){
+  prevSH0=vec4(0.,0.,0.,1.);
+  prevSH1=vec4(0.);
+  prevFrames=vec2(0.);
+  fastStats=vec3(0.);
+  vec4 c=prevViewProj*vec4(p,1.);
+  if(c.w<=0.)return false;
+  vec2 res=vec2(textureSize(giSH0Tex,0));
+  vec2 invRes2=2./res;
+  vec2 f=(c.xy/c.w*.5+.5)*res-.5;
+  f=mix(f,round(f),vec2(lessThan(abs(f-round(f)),vec2(.02))));
+  ivec2 i0=ivec2(floor(f));vec2 w=f-floor(f);
+  vec3 vp=(prevView*vec4(p,1.)).xyz;
+  vec3 vn=mat3(prevView)*n;
+  vec2 vnXY=vn.xy*invProjXY;
+  float vpDotN=dot(vn,vp);
+  float scaleBoost=max(1.,640./max(res.x,1.));
+  float planeTol=(.0018*c.w+.006)*scaleBoost;
+  float depthTol=.08*c.w+.05;
+  vec4 acc0=vec4(0.),acc1=vec4(0.);vec2 accF=vec2(0.);float ws=0.;
+  for(int k=0;k<4;k++){
+    ivec2 o=ivec2(k&1,k>>1),q=i0+o;
+    float bw=(o.x==1?w.x:1.-w.x)*(o.y==1?w.y:1.-w.y);
+    if(bw<1e-4||any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,ivec2(res))))continue;
+    float dQ=texelFetch(giDepthTex,q,0).r;
+    vec4 gm=texelFetch(giMetaTex,q,0);
+    float gf=gm.z*255.;
+    if(gf<.5||abs(dQ-c.w)>depthTol)continue;
+    vec3 nv=octDecodeRaw(gm.xy);float dn=dot(nv,n);
+    if(dn<=0.||dn*dn<.81*dot(nv,nv))continue;
+    vec2 ndcQ=(vec2(q)+.5)*invRes2-1.;
+    if(abs((dot(vnXY,ndcQ)-vn.z)*dQ-vpDotN)>planeTol)continue;
+    acc0+=bw*texelFetch(giSH0Tex,q,0);
+    acc1+=bw*texelFetch(giSH1Tex,q,0);
+    accF+=bw*vec2(gf,gm.w*16.);
+    ws+=bw;
+  }
+  if(ws<=.01)return false;
+  prevSH0=acc0/ws;prevSH1=acc1/ws;prevFrames=accF/ws;
+  // Collect 4-tap axial fast-history luminance moments around reprojected center for REBLUR anti-lag
+  ivec2 c0=clamp(ivec2(round(f)),ivec2(0),ivec2(res)-1);
+  float fSum=0.,fSum2=0.,fCnt=0.;
+  const ivec2 offs[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
+  for(int k=0;k<4;k++){
+    ivec2 q=clamp(c0+offs[k],ivec2(0),ivec2(res)-1);
+    float dQ=texelFetch(giDepthTex,q,0).r;
+    vec4 gm=texelFetch(giMetaTex,q,0);
+    if(gm.z*255.<.5||abs(dQ-c.w)>depthTol)continue;
+    vec3 nv=octDecodeRaw(gm.xy);float dn=dot(nv,n);
+    if(dn<=0.||dn*dn<.81*dot(nv,nv))continue;
+    vec2 ndcQ=(vec2(q)+.5)*invRes2-1.;
+    if(abs((dot(vnXY,ndcQ)-vn.z)*dQ-vpDotN)>planeTol*1.5)continue;
+    float fyEnc=texelFetch(giSH1Tex,q,0).w;
+    float fy=fyEnc/max(1.-fyEnc,.02);
+    fSum+=fy;fSum2+=fy*fy;fCnt+=1.;
+  }
+  fastStats=vec3(fSum,fSum2,fCnt);
+  return true;
+}
+void main(){
+  ivec2 q=ivec2(gl_FragCoord.xy);
+  ivec2 gRes=textureSize(gPos,0);
+  ivec2 giRes=textureSize(giSH0Tex,0);
+  ivec2 giStride=max(ivec2(1),(gRes+giRes/2)/max(giRes,ivec2(1)));
+  ivec2 gq=clamp(q*giStride,ivec2(0),gRes-1);
+  vec4 g=texelFetch(gPos,gq,0),gn=texelFetch(gNormal,gq,0);
+  if(g.w<=0.||gn.w>.5){
+    giSH0Out=vec4(0.,0.,0.,1.);giSH1Out=vec4(.5,.5,.5,0.);giMetaOut=vec4(0.);giDepthOut=vec4(0.,0.,0.,1.);
+    return;
+  }
+  vec3 p=g.xyz,normal=normalize(gn.xyz);
+  vec4 prevSH0,prevSH1;vec2 prevFrames;vec3 fastStats;
+  bool hasHist=giHistory(p,normal,prevSH0,prevSH1,prevFrames,fastStats);
+  bool giSettled=hasHist&&settleFrames>0.&&giDynamic<.5&&prevFrames.x>=max(settleFrames,giHistMax);
+  bool giCheckerSkip=hasHist&&giDynamic<.5&&prevFrames.x>=64.&&(((q.x^q.y)&1)!=int(uint(frame)&1u));
+  if(giSettled||giCheckerSkip){
+    giSH0Out=prevSH0;giSH1Out=prevSH1;
+    giMetaOut=vec4(octEncode(normal),min(prevFrames.x,giHistMax)/255.,min(prevFrames.y,16.)/16.);
+    giDepthOut=vec4(g.w,0.,0.,1.);
+    return;
+  }
+  float nd=(hasHist&&prevFrames.x>=64.&&giDynamic<.5)?1.:max(giRays,1.);
+  vec3 sampleIrr,sampleC1;float sampleHitDist;
+  tracedGISH(p,normal,nd,sampleIrr,sampleC1,sampleHitDist);
+  if(giDynamic>.5||!hasHist||prevFrames.x<6.){
+    float maxC=max(sampleIrr.r,max(sampleIrr.g,sampleIrr.b));
+    float fScale=1./(1.+.15*maxC);
+    sampleIrr*=fScale;sampleC1*=fScale;
+  }
+  vec3 sYcc=linearToYCoCg(sampleIrr);
+  float sNormHit=clamp(sampleHitDist/(3.0+.15*g.w),0.,1.);
+  vec4 sh0Out;vec4 sh1Out;float giFramesOut,fastFramesOut;
+  if(!hasHist){
+    sh0Out=vec4(sYcc,sNormHit);
+    vec3 d1=clamp(sampleC1/max(sYcc.x,1e-4),-1.,1.);
+    sh1Out=vec4(d1*.5+.5,sYcc.x/(1.+sYcc.x));
+    giFramesOut=1.;fastFramesOut=1.;
+  }else{
+    // Dual Fast/Slow History Per-Pixel Anti-Lag (NVIDIA NRD REBLUR ComputeAntilag):
+    // fast history tracks 4-5 frames; when local fast mean diverges beyond sigma band from slow history,
+    // per-pixel history length smoothly accelerates ONLY where lighting actually changed!
+    fastFramesOut=min(prevFrames.y+1.,max(giFastMax,2.));
+    float prevFastY=prevSH1.w/max(1.-prevSH1.w,.02);
+    float fastY=mix(prevFastY,sYcc.x,1./fastFramesOut);
+    float m1=(fastStats.x+fastY)/(fastStats.z+1.);
+    float m2=(fastStats.y+fastY*fastY)/(fastStats.z+1.);
+    float fSigma=sqrt(max(0.,m2-m1*m1));
+    float sBand=fSigma*1.75+.04;
+    float hClamped=clamp(prevSH0.x,m1-sBand,m1+sBand);
+    float relDiff=abs(prevSH0.x-hClamped)/(max(prevSH0.x,hClamped)+.025);
+    float antilag=1./(1.+relDiff*prevFrames.x*(giDynamic>.5?4.0:1.5));
+    float effFrames=prevFrames.x;
+    if(giDynamic>.5){
+      effFrames=min(effFrames,mix(8.,26.,antilag));
+    }else if(prevFrames.x>=16.&&relDiff>.28){
+      effFrames=max(8.,effFrames*antilag);
+    }
+    giFramesOut=min(effFrames+1.,giHistMax);
+    float alpha=1./giFramesOut;
+    float hitAlpha=max(alpha,.08);
+    vec3 yccOut=mix(prevSH0.rgb,sYcc,alpha);
+    vec3 prevC1=(prevSH1.rgb*2.-1.)*max(prevSH0.x,0.);
+    vec3 c1Out=mix(prevC1,sampleC1,alpha);
+    vec3 d1Out=clamp(c1Out/max(yccOut.x,1e-4),-1.,1.);
+    sh0Out=vec4(yccOut,mix(prevSH0.w,sNormHit,hitAlpha));
+    sh1Out=vec4(d1Out*.5+.5,fastY/(1.+fastY));
+  }
+  giSH0Out=sh0Out;
+  giSH1Out=sh1Out;
+  giMetaOut=vec4(octEncode(normal),giFramesOut/255.,fastFramesOut/16.);
+  giDepthOut=vec4(g.w,0.,0.,1.);
 }`;
 // GPU bake of a signed distance field for an arbitrary triangle mesh, one z-layer
 // per draw. Distance: exact point-triangle distance (min over all triangles).
@@ -1195,13 +1418,20 @@ try {
   // - two history targets, ping-ponged: AO + view depth (float: half floats round away the small updates of a long
   //   history); normal + frames/255. The AO pass writes one while reading the other; the scene draw reads it.
   const nearest=t=>{t.minFilter=t.magFilter=T.NearestFilter;t.generateMipmaps=false;};
-  let aoScale=.5,gTarget,histories,historiesBent=null,historiesGI=null,giDenoiseTargets=null,sunShadowTarget=null,orbShadowTarget=null,hiz1,hiz2;let histIndex=0;
-  let giAccumFrames=0,giSunCooldown=0,giDenoiseCached=false,giDenoiseLastIdx=0,giGTargetValid=false,giHasRecurrent=false;
+  let aoScale=.5,giScale=.5,gTarget,histories,historiesBent=null,historiesGI=null,giDenoiseTargets=null,sunShadowTarget=null,orbShadowTarget=null,hiz1,hiz2;let histIndex=0,giHistIndex=0;
+  let aoAccumFrames=0,giAccumFrames=0,giSunCooldown=0,giDenoiseCached=false,giDenoiseLastIdx=0,giGTargetValid=false,giHasRecurrent=false;
   let sunShadowDirty=true,orbShadowDirty=true;
-  function makeHistPair(w,h,count,giHalf=false){
+  function makeHistPair(w,h,count){
     return [0,1].map(()=>{const rt=new T.WebGLRenderTarget(w,h,{count,depthBuffer:false});
       rt.textures[0].type=T.FloatType;rt.textures[0].format=T.RGFormat;
-      if(giHalf&&count>=4)rt.textures[3].type=T.HalfFloatType;
+      rt.textures.forEach(nearest);return rt;});
+  }
+  function makeGIHistPair(w,h){
+    return [0,1].map(()=>{const rt=new T.WebGLRenderTarget(w,h,{count:4,depthBuffer:false});
+      rt.textures[0].type=T.HalfFloatType; // giSH0: RGBA16F (Y, Co, Cg, normHitDist)
+      // textures[1]: RGBA8 giSH1 (d1*0.5+0.5, fastLuma/(1+fastLuma)) -> 2x less VRAM & bandwidth!
+      // textures[2]: RGBA8 giMeta (octN.xy, giFrames/255, fastFrames/16)
+      rt.textures[3].type=T.FloatType;rt.textures[3].format=T.RedFormat; // giDepth: viewDepth
       rt.textures.forEach(nearest);return rt;});
   }
   function ensureBentHistories(){
@@ -1213,17 +1443,21 @@ try {
   }
   function ensureGIHistories(){
     if(historiesGI)return;
-    const w=Math.round(W*aoScale),h=Math.round(H*aoScale);
-    historiesGI=makeHistPair(w,h,4,true);
+    const aw=Math.round(W*aoScale),ah=Math.round(H*aoScale);
+    const gw=Math.round(W*giScale),gh=Math.round(H*giScale);
+    ensureBentHistories();
+    historiesGI=makeGIHistPair(gw,gh);
     for(const rt of historiesGI){renderer.setRenderTarget(rt);renderer.clear();}
-    // [1] holds true Pass-1 (stride=1) denoised GI for REBLUR recurrent feedback; [0] holds Pass-2; [2] holds Pass-3.
+    // 2-MRT denoiser targets (RGBA16F giSH0 + RGBA8 giSH1): [1] holds true Pass-1 (stride=1) for REBLUR recurrent feedback;
+    // [0] holds Pass-2; [2] holds Pass-3.
     giDenoiseTargets=[0,1,2].map(()=>{
-      const rt=new T.WebGLRenderTarget(w,h,{depthBuffer:false});
-      rt.texture.type=T.HalfFloatType;nearest(rt.texture);return rt;
+      const rt=new T.WebGLRenderTarget(gw,gh,{count:2,depthBuffer:false});
+      rt.textures[0].type=T.HalfFloatType;
+      rt.textures.forEach(nearest);return rt;
     });
     for(const rt of giDenoiseTargets){renderer.setRenderTarget(rt);renderer.clear();}
     const makeShadowRT=()=>{
-      const rt=new T.WebGLRenderTarget(w,h,{depthBuffer:false});
+      const rt=new T.WebGLRenderTarget(aw,ah,{depthBuffer:false});
       rt.texture.format=T.RedFormat;rt.texture.type=T.UnsignedByteType;
       rt.texture.minFilter=rt.texture.magFilter=T.LinearFilter;rt.texture.generateMipmaps=false;
       return rt;
@@ -1233,10 +1467,17 @@ try {
     for(const rt of [sunShadowTarget,orbShadowTarget]){renderer.setRenderTarget(rt);renderer.clear();}
     renderer.setRenderTarget(null);
   }
+  function disposeGITargets(){
+    historiesGI?.forEach(rt=>rt.dispose());historiesGI=null;
+    giDenoiseTargets?.forEach(rt=>rt.dispose());giDenoiseTargets=null;
+    sunShadowTarget?.dispose();sunShadowTarget=null;
+    orbShadowTarget?.dispose();orbShadowTarget=null;
+    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;giHasRecurrent=false;sunShadowDirty=true;orbShadowDirty=true;
+  }
   function makeTracedTargets(scale){
     const w=Math.round(W*scale),h=Math.round(H*scale);
-    gTarget?.dispose();histories?.forEach(rt=>rt.dispose());historiesBent?.forEach(rt=>rt.dispose());historiesBent=null;historiesGI?.forEach(rt=>rt.dispose());historiesGI=null;giDenoiseTargets?.forEach(rt=>rt.dispose());giDenoiseTargets=null;sunShadowTarget?.dispose();sunShadowTarget=null;orbShadowTarget?.dispose();orbShadowTarget=null;hiz1?.dispose();hiz2?.dispose();
-    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;giGTargetValid=false;giHasRecurrent=false;sunShadowDirty=true;orbShadowDirty=true;
+    gTarget?.dispose();histories?.forEach(rt=>rt.dispose());historiesBent?.forEach(rt=>rt.dispose());historiesBent=null;disposeGITargets();hiz1?.dispose();hiz2?.dispose();
+    aoAccumFrames=0;giGTargetValid=false;
     gTarget=new T.WebGLRenderTarget(w,h,{count:2});
     gTarget.textures[0].type=T.FloatType;gTarget.textures[1].type=T.HalfFloatType;gTarget.textures.forEach(nearest);
     // Standard traced path: 2 MRTs (RG32F + RGBA8 = 12 B/px). 3rd bentOut MRT is allocated only when PBR is active.
@@ -1268,7 +1509,7 @@ try {
     // 64: on a still camera, settled pixels stop tracing (about 1 s at 60 fps), with the same error as tracing
     // on (0.0175 at 256 frames; 32 settles at 0.0188).
     settleFrames:{value:64},smoothFalloff:{value:0},
-    aoTex:{value:null},aoNormalTex:{value:null},aoBentTex:{value:null},aoGITex:{value:null},sunShadowTex:{value:null},orbShadowTex:{value:null}};
+    aoTex:{value:null},aoNormalTex:{value:null},aoBentTex:{value:null},aoGITex:{value:null},aoGISH1Tex:{value:null},sunShadowTex:{value:null},orbShadowTex:{value:null}};
   const sdfUniforms={
     field:{value:field},
     sdfMin:{value:new T.Vector3(-1,-1,-1)},
@@ -1287,20 +1528,32 @@ try {
     vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',fragmentShader:aoPassFragment}));
   const aoPass=makeAOPass({});
   const aoPassBent=makeAOPass({BENT_NORMALS:1});
-  const aoPassGI=makeAOPass({BENT_NORMALS:1,DIFFUSE_GI:1});
-  // Lazily-used history-aware 2/3-pass half-res edge-preserving a-trous wavelet denoiser for 1-Bounce GI (zero cost when #gi is off).
+  const giPass=new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,defines:{DIFFUSE_GI:1},
+    uniforms:{field:sdfUniforms.field,sdfMin:sdfUniforms.sdfMin,sdfInvSpan:sdfUniforms.sdfInvSpan,
+      gPos:{value:gTarget.textures[0]},gNormal:{value:gTarget.textures[1]},
+      giSH0Tex:{value:null},giSH1Tex:{value:null},giMetaTex:{value:null},giDepthTex:{value:null},
+      radianceVol:{value:null},radianceScale:{value:RADIANCE_SCALE},giMaxDist:{value:8.5},giSunDir:sdfUniforms.sunDir,giMaxSteps:{value:18},
+      giHistMax:{value:128},giFastMax:{value:5},giDynamic:{value:0},giRays:{value:2},
+      hizTex1:{value:hiz1.texture},hizTex2:{value:hiz2.texture},
+      prevViewProj:traced.prevViewProj,prevView:traced.prevView,curViewProj:traced.curViewProj,curView:traced.curView,invProjXY:traced.invProjXY,
+      frame:traced.frame,contactMode:traced.contactMode,smoothFalloff:traced.smoothFalloff,settleFrames:traced.settleFrames},
+    vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',fragmentShader:giPassFragment}));
+  const aoPassGI=giPass;
+  // Lazily-used 2-MRT Hit-Distance-Guided Edge-Preserving À-Trous Denoiser for L1 YCoCg SH GI (zero cost when #gi is off).
   const giDenoisePass=new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,
-    uniforms:{giSrc:{value:null},aoTex:{value:null},aoNormalTex:{value:null},curView:traced.curView,invProjXY:traced.invProjXY,stepSize:{value:1},giSmoothFactor:{value:0}},
+    uniforms:{giSH0Src:{value:null},giSH1Src:{value:null},giMetaTex:{value:null},giDepthTex:{value:null},curView:traced.curView,invProjXY:traced.invProjXY,stepSize:{value:1},giSmoothFactor:{value:0}},
     vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',
     fragmentShader:`precision highp float;
-    uniform sampler2D giSrc;
-    uniform sampler2D aoTex;
-    uniform sampler2D aoNormalTex;
+    uniform sampler2D giSH0Src;
+    uniform sampler2D giSH1Src;
+    uniform sampler2D giMetaTex;
+    uniform sampler2D giDepthTex;
     uniform mat4 curView;
     uniform vec2 invProjXY;
     uniform int stepSize;
     uniform float giSmoothFactor;
-    out vec4 o;
+    layout(location=0) out vec4 sh0Out;
+    layout(location=1) out vec4 sh1Out;
     vec3 octDecodeRaw(vec2 e){
       e=e*2.-1.;
       vec3 v=vec3(e.xy,1.-abs(e.x)-abs(e.y));
@@ -1309,48 +1562,64 @@ try {
     }
     void main(){
       ivec2 q=ivec2(gl_FragCoord.xy);
-      ivec2 resI=textureSize(giSrc,0);
+      ivec2 resI=textureSize(giSH0Src,0);
       vec2 invRes2=2./vec2(resI);
-      vec2 hC=texelFetch(aoTex,q,0).xy;
-      vec4 hnC=texelFetch(aoNormalTex,q,0);
-      vec4 cFull=texelFetch(giSrc,q,0);
-      vec3 cC=cFull.rgb;
-      if(hC.y<=0.||hnC.w*255.<.5){o=cFull;return;}
-      vec3 nC=normalize(octDecodeRaw(hnC.xy));
+      float depthC=texelFetch(giDepthTex,q,0).r;
+      vec4 metaC=texelFetch(giMetaTex,q,0);
+      vec4 sh0C=texelFetch(giSH0Src,q,0);
+      vec4 sh1C=texelFetch(giSH1Src,q,0);
+      float pixFrames=metaC.z*255.;
+      if(depthC<=0.||pixFrames<.5){sh0Out=sh0C;sh1Out=sh1C;return;}
+      vec3 nC=normalize(octDecodeRaw(metaC.xy));
       vec3 vn=mat3(curView)*nC;
       vec2 ndcC=(vec2(q)+.5)*invRes2-1.;
-      vec3 vpC=vec3(ndcC*invProjXY*hC.y,-hC.y);
+      vec3 vpC=vec3(ndcC*invProjXY*depthC,-depthC);
       vec2 vnXY=vn.xy*invProjXY;
       float vpDotN=dot(vn,vpC);
-      float depthTol=.06*hC.y+.04;
-      float planeTol=(.0022*hC.y+.008)*float(stepSize);
-      float lumaC=dot(cC,vec3(.2126,.7152,.0722));
-      float lumaSigma=.22+.45*lumaC;
-      float relaxLuma=clamp(giSmoothFactor*1.25,0.,1.);
-      vec3 sum=cC;
+      // Hit-distance-guided blur radius (NVIDIA NRD REBLUR): tighten stride in contact crevices, widen on far open bounces.
+      float normHit=clamp(sh0C.w,0.,1.);
+      float hitScale=clamp(.35+.65*sqrt(normHit),.35,1.);
+      int effStep=max(1,int(floor(float(stepSize)*hitScale+.5)));
+      float scaleBoost=max(1.,640./max(float(resI.x),1.));
+      float depthTol=.06*depthC+.04;
+      float planeTol=(.0022*depthC+.008)*float(effStep)*scaleBoost;
+      float pixSmooth=max(giSmoothFactor,clamp((20.-pixFrames)/14.,0.,1.));
+      float relaxLuma=clamp(pixSmooth*1.25,0.,1.);
+      float lumaC=sh0C.x;
+      float lumaSigma=.20+.42*lumaC;
+      float hitSigma=.18+.38*normHit;
+      vec3 sum0=sh0C.rgb;
+      vec3 sumC1=(sh1C.rgb*2.-1.)*max(lumaC,0.);
       float wSum=1.;
       for(int dy=-1;dy<=1;dy++){
         for(int dx=-1;dx<=1;dx++){
           if(dx==0&&dy==0)continue;
-          ivec2 p=q+ivec2(dx,dy)*stepSize;
+          ivec2 p=q+ivec2(dx,dy)*effStep;
           if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,resI)))continue;
-          vec2 hP=texelFetch(aoTex,p,0).xy;
-          vec4 hnP=texelFetch(aoNormalTex,p,0);
-          if(hnP.w*255.<.5||abs(hP.y-hC.y)>depthTol)continue;
-          vec3 nv=octDecodeRaw(hnP.xy);
+          float depthP=texelFetch(giDepthTex,p,0).r;
+          vec4 metaP=texelFetch(giMetaTex,p,0);
+          if(metaP.z*255.<.5||abs(depthP-depthC)>depthTol)continue;
+          vec3 nv=octDecodeRaw(metaP.xy);
           float dn=dot(nv,nC);
           if(dn<=0.||dn*dn<.81*dot(nv,nv))continue;
           vec2 ndcP=(vec2(p)+.5)*invRes2-1.;
-          if(abs((dot(vnXY,ndcP)-vn.z)*hP.y-vpDotN)>planeTol)continue;
-          vec3 cP=texelFetch(giSrc,p,0).rgb;
+          if(abs((dot(vnXY,ndcP)-vn.z)*depthP-vpDotN)>planeTol)continue;
+          vec4 sh0P=texelFetch(giSH0Src,p,0);
+          vec4 sh1P=texelFetch(giSH1Src,p,0);
           float wK=(dx==0||dy==0)?.5:.25;
-          float wL=relaxLuma>.99?1.:mix(exp(-abs(dot(cP,vec3(.2126,.7152,.0722))-lumaC)/lumaSigma),1.,relaxLuma);
-          float w=wK*wL;
-          sum+=cP*w;
+          float wH=mix(exp(-abs(sh0P.w-normHit)/hitSigma),1.,pixSmooth*.45);
+          float wL=relaxLuma>.99?1.:mix(exp(-abs(sh0P.x-lumaC)/lumaSigma),1.,relaxLuma);
+          float w=wK*wH*wL;
+          sum0+=sh0P.rgb*w;
+          sumC1+=(sh1P.rgb*2.-1.)*max(sh0P.x,0.)*w;
           wSum+=w;
         }
       }
-      o=vec4(sum/wSum,cFull.a);
+      vec3 avg0=sum0/wSum;
+      vec3 avgD1=clamp((sumC1/wSum)/max(avg0.x,1e-4),-1.,1.);
+      // Preserve normHitDist (sh0C.w) and fastLuma (sh1C.w) unprocessed to avoid self-inference bias.
+      sh0Out=vec4(avg0,sh0C.w);
+      sh1Out=vec4(avgD1*.5+.5,sh1C.w);
     }`}));
   // Dedicated low-register half-res R8 shadow passes (peak Metal SIMD occupancy; run ONLY when sun/orb/camera moves).
   const sunShadowPass=new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,
@@ -1440,6 +1709,7 @@ try {
     if(historiesBent)for(const rt of historiesBent){renderer.setRenderTarget(rt);renderer.clear();}
     if(historiesGI)for(const rt of historiesGI){renderer.setRenderTarget(rt);renderer.clear();}
     renderer.setRenderTarget(null);
+    aoAccumFrames=0;giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;giGTargetValid=false;giHasRecurrent=false;sunShadowDirty=true;orbShadowDirty=true;
     return {triangles:next.triangles,nodes:next.nodes,bytes:next.bytes,gridDims:next.gridDims,maxTreeNodes:next.maxTreeNodes,range,bias,gridSize:next.gridSize,buildMs:contactResources.buildMs};
   }
   rebuildStaticContact();
@@ -1612,22 +1882,24 @@ try {
       const useBent=useGI||pbrMode.value;
       if(useGI){
         ensureGIHistories();
-        if(!aoPassGI.material.uniforms.radianceVol.value)ensureRadianceGrid();
+        if(!giPass.material.uniforms.radianceVol.value)ensureRadianceGrid();
       }else if(useBent){
         ensureBentHistories();
       }
-      const histPair=useGI?historiesGI:(useBent?historiesBent:histories);
-      const activePass=useGI?aoPassGI:(useBent?aoPassBent:aoPass);
-      const cur=histPair[histIndex],prev=histPair[1-histIndex],m=activePass.material.uniforms;
+      const histPair=useBent?historiesBent:histories;
+      const activePass=useBent?aoPassBent:aoPass;
       camera.updateMatrixWorld();
       const stillCamera=camera.matrixWorld.equals(lastCamera);
       traced.histMax.value=stillCamera?128:32;lastCamera.copy(camera.matrixWorld);
-      if(useGI&&stillCamera&&giSunCooldown===0&&!sunShadowDirty&&!orbShadowDirty&&dyn.dynCount.value===0&&traced.settleFrames.value>0&&giAccumFrames>=128&&giDenoiseCached){
-        // Fully settled static GI frame: reuse cached AO, bent-normal, half-res shadows & denoised GI targets directly.
-        const lastWritten=histPair[1-histIndex];
-        traced.aoTex.value=lastWritten.textures[0];traced.aoNormalTex.value=lastWritten.textures[1];
-        traced.aoBentTex.value=lastWritten.textures[2];
-        traced.aoGITex.value=giDenoiseTargets[giDenoiseLastIdx].texture;
+      if(!stillCamera){aoAccumFrames=0;giGTargetValid=false;}
+      const orbOn=emissiveMode.value&&activeScene==='gallery';
+      if(useGI&&stillCamera&&giSunCooldown===0&&!sunShadowDirty&&(!orbOn||!orbShadowDirty)&&dyn.dynCount.value===0&&traced.settleFrames.value>0&&aoAccumFrames>=traced.settleFrames.value&&giAccumFrames>=128&&giDenoiseCached){
+        // Fully settled static GI frame: reuse cached AO, bent-normal, half-res shadows & denoised L1-SH GI targets directly.
+        const lastAO=histPair[1-histIndex];
+        traced.aoTex.value=lastAO.textures[0];traced.aoNormalTex.value=lastAO.textures[1];
+        traced.aoBentTex.value=lastAO.textures[2];
+        traced.aoGITex.value=giDenoiseTargets[giDenoiseLastIdx].textures[0];
+        traced.aoGISH1Tex.value=giDenoiseTargets[giDenoiseLastIdx].textures[1];
         traced.sunShadowTex.value=sunShadowTarget.texture;
         traced.orbShadowTex.value=orbShadowTarget.texture;
         emissiveOrbMesh.visible=emissiveMode.value&&activeScene==='gallery'&&!mask.value&&!giMask.value;
@@ -1644,8 +1916,34 @@ try {
         scene.background=bg;renderer.setClearColor(cc,ca);setMaterial(material);
         giGTargetValid=useGI&&dyn.dynCount.value===0;
       }
+      traced.curViewProj.value.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
+      traced.curView.value.copy(camera.matrixWorldInverse);
+      traced.invProjXY.value.set(1/camera.projectionMatrix.elements[0],1/camera.projectionMatrix.elements[5]);
+      if(traced.contactMode.value>=1){
+        hizDownPass.material.uniforms.src.value=gTarget.textures[0];hizDownPass.material.uniforms.useAlpha.value=1;
+        renderer.setRenderTarget(hiz1);hizDownPass.render(renderer);
+        aoPass.material.uniforms.hizTex1.value=hiz1.texture;
+        aoPassBent.material.uniforms.hizTex1.value=hiz1.texture;
+        giPass.material.uniforms.hizTex1.value=hiz1.texture;
+      }
+      // Run AO (+ Bent Normals) pass at aoScale; skip completely once AO is settled on static camera in GI mode!
+      const skipAOPass=useGI&&stillCamera&&dyn.dynCount.value===0&&traced.settleFrames.value>0&&aoAccumFrames>=traced.settleFrames.value;
+      if(!skipAOPass){
+        const cur=histPair[histIndex],prev=histPair[1-histIndex],m=activePass.material.uniforms;
+        m.gPos.value=gTarget.textures[0];m.gNormal.value=gTarget.textures[1];
+        m.histTex.value=prev.textures[0];m.normalTex.value=prev.textures[1];
+        if(useBent)m.bentTex.value=prev.textures[2];
+        renderer.setRenderTarget(cur);activePass.render(renderer);
+        traced.aoTex.value=cur.textures[0];traced.aoNormalTex.value=cur.textures[1];
+        if(useBent)traced.aoBentTex.value=cur.textures[2];
+        histIndex=1-histIndex;
+        aoAccumFrames=Math.min(aoAccumFrames+1,255);
+      }else{
+        const lastAO=histPair[1-histIndex];
+        traced.aoTex.value=lastAO.textures[0];traced.aoNormalTex.value=lastAO.textures[1];
+        traced.aoBentTex.value=lastAO.textures[2];
+      }
       if(useGI){
-        const orbOn=emissiveMode.value&&activeScene==='gallery';
         if(!stillCamera||sunShadowDirty){
           sunShadowPass.material.uniforms.gPos.value=gTarget.textures[0];
           sunShadowPass.material.uniforms.gNormal.value=gTarget.textures[1];
@@ -1660,66 +1958,58 @@ try {
         }
         traced.sunShadowTex.value=sunShadowTarget.texture;
         traced.orbShadowTex.value=orbShadowTarget.texture;
-      }
-      m.gPos.value=gTarget.textures[0];m.gNormal.value=gTarget.textures[1];
-      m.histTex.value=prev.textures[0];m.normalTex.value=prev.textures[1];
-      if(useBent)m.bentTex.value=prev.textures[2];
-      let sunMoving=false,giSmooth=0,giFullySettled=false;
-      if(useGI){
-        sunMoving=giSunCooldown>0;
-        // True REBLUR-style stride-1 recurrent feedback during motion: giDenoiseTargets[1] holds Pass 1
-        // (stride=1, untouched by Pass 2/3) so spatial variance collapses without stride-3 over-blurring.
-        const useRecurrent=(!stillCamera||sunMoving)&&giHasRecurrent;
-        m.giTex.value=useRecurrent?giDenoiseTargets[1].texture:prev.textures[3];
+
+        const lightingMoving=giSunCooldown>0;
+        const gm=giPass.material.uniforms;
+        const curGI=historiesGI[giHistIndex],prevGI=historiesGI[1-giHistIndex];
+        // True REBLUR stride-1 recurrent feedback during motion: giDenoiseTargets[1] holds Pass-1 (stride=1)
+        // SH0 + SH1 with normHitDist & fastLuma preserved verbatim.
+        const useRecurrent=(!stillCamera||lightingMoving)&&giHasRecurrent;
+        gm.gPos.value=gTarget.textures[0];gm.gNormal.value=gTarget.textures[1];
+        gm.giSH0Tex.value=useRecurrent?giDenoiseTargets[1].textures[0]:prevGI.textures[0];
+        gm.giSH1Tex.value=useRecurrent?giDenoiseTargets[1].textures[1]:prevGI.textures[1];
+        gm.giMetaTex.value=prevGI.textures[2];
+        gm.giDepthTex.value=prevGI.textures[3];
         if(!stillCamera){
           giAccumFrames=Math.min(Math.max(giAccumFrames+1,1),32);
           giDenoiseCached=false;
-        }else if(sunMoving){
-          // Keep effective EMA history count ~10 so when motion stops, convergence 10->128 is seamless (no pop).
-          giAccumFrames=Math.min(Math.max(giAccumFrames,10),14);
+        }else if(lightingMoving){
+          giAccumFrames=Math.min(Math.max(giAccumFrames,10),24);
           giDenoiseCached=false;
         }else{
           giAccumFrames=Math.min(giAccumFrames+1,128);
         }
-        giSmooth=(!stillCamera||sunMoving||giAccumFrames<12)?1:Math.max(0,Math.min(1,(48-giAccumFrames)/36));
-        m.giFrames.value=giAccumFrames;
-        m.giAlphaFloor.value=sunMoving?.10:(!stillCamera?.11:0);
-        m.giSmoothFactor.value=giSmooth;
-        giFullySettled=stillCamera&&!sunMoving&&traced.settleFrames.value>0&&giAccumFrames>=128;
-      }
-      traced.curViewProj.value.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
-      traced.curView.value.copy(camera.matrixWorldInverse);
-      traced.invProjXY.value.set(1/camera.projectionMatrix.elements[0],1/camera.projectionMatrix.elements[5]);
-      if(traced.contactMode.value>=1){
-        hizDownPass.material.uniforms.src.value=gTarget.textures[0];hizDownPass.material.uniforms.useAlpha.value=1;
-        renderer.setRenderTarget(hiz1);hizDownPass.render(renderer);
-        m.hizTex1.value=hiz1.texture;
-      }
-      renderer.setRenderTarget(cur);activePass.render(renderer);
-      traced.aoTex.value=cur.textures[0];traced.aoNormalTex.value=cur.textures[1];
-      if(useBent)traced.aoBentTex.value=cur.textures[2];
-      if(useGI){
+        const giSmooth=(!stillCamera||lightingMoving||giAccumFrames<12)?1:Math.max(0,Math.min(1,(48-giAccumFrames)/36));
+        gm.giHistMax.value=stillCamera?128:32;
+        gm.giDynamic.value=(!stillCamera||lightingMoving)?1:0;
+        const giFullySettled=stillCamera&&!lightingMoving&&traced.settleFrames.value>0&&giAccumFrames>=128;
+
+        renderer.setRenderTarget(curGI);giPass.render(renderer);
+        giHistIndex=1-giHistIndex;
+
         if(giFullySettled&&giDenoiseCached){
-          traced.aoGITex.value=giDenoiseTargets[giDenoiseLastIdx].texture;
+          traced.aoGITex.value=giDenoiseTargets[giDenoiseLastIdx].textures[0];
+          traced.aoGISH1Tex.value=giDenoiseTargets[giDenoiseLastIdx].textures[1];
         }else{
           const du=giDenoisePass.material.uniforms;
-          du.aoTex.value=cur.textures[0];du.aoNormalTex.value=cur.textures[1];
+          du.giMetaTex.value=curGI.textures[2];du.giDepthTex.value=curGI.textures[3];
           du.giSmoothFactor.value=giSmooth;
-          // Pass 1 (stride=1) -> [1] (always preserved as true stride-1 REBLUR recurrent feedback),
+          // Pass 1 (stride=1) -> [1] (always preserved for true stride-1 REBLUR recurrent feedback),
           // Pass 2 (stride=3) -> [0], Pass 3 (stride=6, while moving/young) -> [2].
-          du.giSrc.value=cur.textures[3];du.stepSize.value=1;
+          du.giSH0Src.value=curGI.textures[0];du.giSH1Src.value=curGI.textures[1];du.stepSize.value=1;
           renderer.setRenderTarget(giDenoiseTargets[1]);giDenoisePass.render(renderer);
-          du.giSrc.value=giDenoiseTargets[1].texture;du.stepSize.value=3;
+          du.giSH0Src.value=giDenoiseTargets[1].textures[0];du.giSH1Src.value=giDenoiseTargets[1].textures[1];du.stepSize.value=3;
           renderer.setRenderTarget(giDenoiseTargets[0]);giDenoisePass.render(renderer);
-          if(!stillCamera||sunMoving||giAccumFrames<16){
-            du.giSrc.value=giDenoiseTargets[0].texture;du.stepSize.value=6;
+          if(!stillCamera||lightingMoving||giAccumFrames<16){
+            du.giSH0Src.value=giDenoiseTargets[0].textures[0];du.giSH1Src.value=giDenoiseTargets[0].textures[1];du.stepSize.value=6;
             renderer.setRenderTarget(giDenoiseTargets[2]);giDenoisePass.render(renderer);
             giDenoiseLastIdx=2;
           }else{
             giDenoiseLastIdx=0;
           }
           giHasRecurrent=true;
-          traced.aoGITex.value=giDenoiseTargets[giDenoiseLastIdx].texture;
+          traced.aoGITex.value=giDenoiseTargets[giDenoiseLastIdx].textures[0];
+          traced.aoGISH1Tex.value=giDenoiseTargets[giDenoiseLastIdx].textures[1];
           if(giFullySettled)giDenoiseCached=true;
         }
         if(giSunCooldown>0)giSunCooldown--;
@@ -1728,7 +2018,7 @@ try {
       renderer.setRenderTarget(null);renderer.render(scene,camera);
       traced.prevViewProj.value.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
       traced.prevView.value.copy(camera.matrixWorldInverse);
-      traced.frame.value++;histIndex=1-histIndex;
+      traced.frame.value++;
       return;
     }
     emissiveOrbMesh.visible=false;
@@ -1780,7 +2070,7 @@ try {
     if(historiesBent)for(const rt of historiesBent){renderer.setRenderTarget(rt);renderer.clear();}
     if(historiesGI)for(const rt of historiesGI){renderer.setRenderTarget(rt);renderer.clear();}
     renderer.setRenderTarget(null);
-    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;giGTargetValid=false;giHasRecurrent=false;sunShadowDirty=true;orbShadowDirty=true;
+    aoAccumFrames=0;giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;giGTargetValid=false;giHasRecurrent=false;sunShadowDirty=true;orbShadowDirty=true;
   }
   function setGI(on){
     giMode.value=!!on;
@@ -1804,8 +2094,8 @@ try {
     multiBounceCheckbox.checked=multiBounceGI.value;
     if(giMode.value&&radianceGrids[activeScene]){
       relightActiveRadianceGrid();
-      giSunCooldown=2;
-      giAccumFrames=1;
+      giSunCooldown=3;
+      giAccumFrames=Math.min(giAccumFrames,8);
       giDenoiseCached=false;
     }
     updateStatus();
@@ -1822,7 +2112,7 @@ try {
     orbShadowDirty=true;
     if(relight&&giMode.value&&radianceGrids[activeScene]){
       relightActiveRadianceGrid();
-      giSunCooldown=2;
+      giSunCooldown=3;
       giDenoiseCached=false;
     }
   }
@@ -1841,8 +2131,8 @@ try {
     orbShadowDirty=true;
     if(giMode.value&&radianceGrids[activeScene]){
       relightActiveRadianceGrid();
-      giSunCooldown=2;
-      giAccumFrames=1;
+      giSunCooldown=3;
+      giAccumFrames=Math.min(giAccumFrames,8);
       giDenoiseCached=false;
     }
     updateStatus();
@@ -1850,7 +2140,6 @@ try {
   }
   function setEmissiveTime(t){
     updateEmissiveOrb(t,true);
-    giAccumFrames=1;
     updateStatus();
   }
   function setSunAngle(deg){
@@ -1861,10 +2150,9 @@ try {
     if(giMode.value&&radianceGrids[activeScene]){
       relightActiveRadianceGrid();
     }
-    // Keep static AO & bent-normal history intact; only mark sun shadow & GI responsive.
+    // Keep static AO & bent-normal history intact; Dual Fast/Slow Anti-Lag adapts changed GI pixels per-pixel.
     sunShadowDirty=true;
-    giSunCooldown=2;
-    giAccumFrames=1;
+    giSunCooldown=3;
     giDenoiseCached=false;
     updateStatus();
     resetFps();
