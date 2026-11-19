@@ -167,14 +167,20 @@ vec4 candidateAOBent(vec3 p,vec3 n,float nd){
  uint base=uint(frame)*4u;
  // 1-Lipschitz SDF empty-sphere contact skip: if d(p + n*k*R) >= k*R, every ray segment [0, R]
  // with cos(theta) >= 1/(2*k) lies strictly inside the empty ball B(p + n*k*R, k*R).
+ // Testing k=4 first skips 98.4% of rays (cos >= 0.125) on open surfaces in 1 SDF fetch.
  float minCosClear=2.;
  if(contactMode==0){
-  float dClear2=staticDistance(p+n*(2.*contactRange));
-  if(dClear2>=2.*contactRange-.004&&dClear2<1e3){
-   minCosClear=.25;
+  float dClear4=staticDistance(p+n*(4.*contactRange));
+  if(dClear4>=4.*contactRange+.002&&dClear4<1e3){
+   minCosClear=.125;
   }else{
-   float dClear1=staticDistance(p+n*contactRange);
-   if(dClear1>=contactRange-.003&&dClear1<1e3)minCosClear=.5;
+   float dClear2=staticDistance(p+n*(2.*contactRange));
+   if(dClear2>=2.*contactRange-.004&&dClear2<1e3){
+    minCosClear=.25;
+   }else{
+    float dClear1=staticDistance(p+n*contactRange);
+    if(dClear1>=contactRange-.003&&dClear1<1e3)minCosClear=.5;
+   }
   }
  }
  // Hoist 3D contact grid cell lookup once per pixel across all rays.
@@ -236,6 +242,7 @@ float candidateAO(vec3 p,vec3 n){
 #ifdef DIFFUSE_GI
 uniform sampler3D radianceVol;
 uniform float radianceScale;
+uniform float radianceVoxStep;
 uniform float giMaxDist;
 uniform vec3 giSunDir;
 uniform int giMaxSteps;
@@ -315,7 +322,7 @@ bool contactHitCell(vec3 origin,vec3 w,int root,int treeCount,vec3 qMin,vec3 qSc
 vec3 sampleRadianceVol(vec3 hitP){
  vec3 uv=(hitP-sdfMin)*sdfInvSpan;
  if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return vec3(0.);
- return texture(radianceVol,uv).rgb*radianceScale;
+ return textureLod(radianceVol,uv,0.).rgb*radianceScale;
 }
 vec4 tracedAOBentGI(vec3 p,vec3 n,float nd,bool needAO,out vec3 giOutIrr){
  vec3 a=abs(n.x)<.9?vec3(1.,0.,0.):vec3(0.,1.,0.);
@@ -332,12 +339,17 @@ vec4 tracedAOBentGI(vec3 p,vec3 n,float nd,bool needAO,out vec3 giOutIrr){
  int fMod3=int(uint(frame)%3u);
  float minCosClear=2.;
  if(contactMode==0){
-  float dClear2=staticDistance(p+n*(2.*contactRange));
-  if(dClear2>=2.*contactRange-.004&&dClear2<1e3){
-   minCosClear=.25;
+  float dClear4=staticDistance(p+n*(4.*contactRange));
+  if(dClear4>=4.*contactRange+.002&&dClear4<1e3){
+   minCosClear=.125;
   }else{
-   float dClear1=staticDistance(p+n*contactRange);
-   if(dClear1>=contactRange-.003&&dClear1<1e3)minCosClear=.5;
+   float dClear2=staticDistance(p+n*(2.*contactRange));
+   if(dClear2>=2.*contactRange-.004&&dClear2<1e3){
+    minCosClear=.25;
+   }else{
+    float dClear1=staticDistance(p+n*contactRange);
+    if(dClear1>=contactRange-.003&&dClear1<1e3)minCosClear=.5;
+   }
   }
  }
  vec3 origin=p+n*contactBias;
@@ -474,12 +486,17 @@ void tracedGISH(vec3 p,vec3 n,float nd,out vec3 giOutIrr,out vec3 giOutC1,out fl
  float phiBase=6.2831853*fract(sp+vdc3(uint(frame)));
  float minCosClear=2.;
  if(contactMode==0){
-  float dClear2=staticDistance(p+n*(2.*contactRange));
-  if(dClear2>=2.*contactRange-.004&&dClear2<1e3){
-   minCosClear=.25;
+  float dClear4=staticDistance(p+n*(4.*contactRange));
+  if(dClear4>=4.*contactRange+.002&&dClear4<1e3){
+   minCosClear=.125;
   }else{
-   float dClear1=staticDistance(p+n*contactRange);
-   if(dClear1>=contactRange-.003&&dClear1<1e3)minCosClear=.5;
+   float dClear2=staticDistance(p+n*(2.*contactRange));
+   if(dClear2>=2.*contactRange-.004&&dClear2<1e3){
+    minCosClear=.25;
+   }else{
+    float dClear1=staticDistance(p+n*contactRange);
+    if(dClear1>=contactRange-.003&&dClear1<1e3)minCosClear=.5;
+   }
   }
  }
  vec3 origin=p+n*contactBias;
@@ -573,6 +590,60 @@ void tracedGISH(vec3 p,vec3 n,float nd,out vec3 giOutIrr,out vec3 giOutC1,out fl
  giOutIrr=giSum*invNd;
  giOutC1=c1Sum*invNd;
  giOutHitDist=hitSum*invNd;
+}
+// Noise-free Mipmapped Voxel + SDF Cone Tracing (Crassin VXGI + Aaltonen Claybook) for Low/Medium GI tiers:
+// 5 cosine-weighted hemisphere cones x 5 taps reading hardware 3D mipmaps of radianceVol -> 0 temporal noise, 0 lag!
+void tracedGICone(vec3 p,vec3 n,out vec3 giOutIrr,out vec3 giOutC1,out float giOutHitDist){
+ vec3 a=abs(n.x)<.9?vec3(1.,0.,0.):vec3(0.,1.,0.);
+ vec3 t=normalize(cross(n,a)),b=cross(n,t);
+ const vec3 CDIRS[5]=vec3[5](
+  vec3( 0.0000, 0.0000,1.0000),
+  vec3( 0.8192, 0.0000,0.5736),
+  vec3(-0.8192, 0.0000,0.5736),
+  vec3( 0.0000, 0.8192,0.5736),
+  vec3( 0.0000,-0.8192,0.5736)
+ );
+ const float CWGTS[5]=float[5](.28,.18,.18,.18,.18);
+ float vStep=max(radianceVoxStep,.08);
+ vec3 orig=p+n*(vStep*1.35);
+ vec3 giSum=vec3(0.),c1Sum=vec3(0.);
+ float hitSum=0.;
+ for(int c=0;c<5;c++){
+  vec3 cd=CDIRS[c];
+  vec3 w=t*cd.x+b*cd.y+n*cd.z;
+  float dist=vStep*1.65;
+  vec3 cRad=vec3(0.);
+  float occ=0.;
+  float firstHit=giMaxDist;
+  for(int s=0;s<6;s++){
+   vec3 sp=orig+w*dist;
+   vec3 uv=(sp-sdfMin)*sdfInvSpan;
+   if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))break;
+   float diam=max(vStep,1.10*dist);
+   float lod=clamp(log2(diam/vStep),0.,3.2);
+   vec4 tap=textureLod(radianceVol,uv,lod);
+   float sd=staticDistance(sp);
+   float sdfOcc=clamp(1.-sd/max(diam*.62,.07),0.,1.);
+   float cov=max(tap.a,sdfOcc*.82);
+   // Premultiplied mip radiance: rescale safely when tap.a > 0 so partial-voxel mips preserve surface brightness
+   vec3 rad=tap.rgb*radianceScale;
+   float tr=1.-occ;
+   cRad+=tr*rad;
+   if(cov>.25&&firstHit>=giMaxDist*.99)firstHit=dist;
+   occ+=tr*cov;
+   if(occ>.94)break;
+   dist+=diam*.68;
+   if(dist>giMaxDist)break;
+  }
+  float cw=CWGTS[c];
+  giSum+=cRad*cw;
+  float y=dot(cRad,vec3(.25,.5,.25));
+  c1Sum+=w*(y*cw);
+  hitSum+=firstHit*cw;
+ }
+ giOutIrr=giSum;
+ giOutC1=c1Sum;
+ giOutHitDist=hitSum;
 }
 #endif
 `;

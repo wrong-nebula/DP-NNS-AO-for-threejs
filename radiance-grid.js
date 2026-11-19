@@ -399,7 +399,8 @@ export function buildRadianceGrid(objects, T, sdfInfo, {
     const targetA = new T.WebGL3DRenderTarget(nx, ny, nz, { depthBuffer: false, stencilBuffer: false });
     targetA.texture.format = T.RGBAFormat;
     targetA.texture.type = T.UnsignedByteType;
-    targetA.texture.minFilter = targetA.texture.magFilter = T.LinearFilter;
+    targetA.texture.minFilter = T.LinearMipmapLinearFilter;
+    targetA.texture.magFilter = T.LinearFilter;
     targetA.texture.generateMipmaps = false;
 
     let targetB = null;
@@ -408,9 +409,21 @@ export function buildRadianceGrid(objects, T, sdfInfo, {
       targetB = new T.WebGL3DRenderTarget(nx, ny, nz, { depthBuffer: false, stencilBuffer: false });
       targetB.texture.format = T.RGBAFormat;
       targetB.texture.type = T.UnsignedByteType;
-      targetB.texture.minFilter = targetB.texture.magFilter = T.LinearFilter;
+      targetB.texture.minFilter = T.LinearMipmapLinearFilter;
+      targetB.texture.magFilter = T.LinearFilter;
       targetB.texture.generateMipmaps = false;
       return targetB;
+    }
+
+    function generate3DMipmaps(rt) {
+      const gl = renderer.getContext();
+      const props = renderer.properties.get(rt.texture);
+      const glTex = props && props.__webglTexture;
+      if (!glTex) return;
+      const prevTex = gl.getParameter(gl.TEXTURE_BINDING_3D);
+      gl.bindTexture(gl.TEXTURE_3D, glTex);
+      gl.generateMipmap(gl.TEXTURE_3D);
+      gl.bindTexture(gl.TEXTURE_3D, prevTex);
     }
 
     const relightMat = new T.ShaderMaterial({
@@ -613,7 +626,7 @@ export function buildRadianceGrid(objects, T, sdfInfo, {
             float d = texture(sdfField, uv).r;
             if(d < 0.065){
               vec3 hitUV = (p + w * max(d, 0.0) - sdfMin) * sdfInvSpan;
-              indirect += texture(srcVol, clamp(hitUV, vec3(0.0), vec3(1.0))).rgb * scale;
+              indirect += textureLod(srcVol, clamp(hitUV, vec3(0.0), vec3(1.0)), 0.0).rgb * scale;
               break;
             }
             t += max(d, 0.24);
@@ -636,6 +649,7 @@ export function buildRadianceGrid(objects, T, sdfInfo, {
       sunColor = [3.10, 2.90, 2.55],
       skyColor = [0.56, 0.64, 0.76],
       multiBounce = false,
+      bouncePasses = 1,
       bounceWeight = 0.72,
       emissive = null,
     } = {}) {
@@ -658,18 +672,24 @@ export function buildRadianceGrid(objects, T, sdfInfo, {
         renderer.setRenderTarget(targetA, z);
         relightQuad.render(renderer);
       }
+      generate3DMipmaps(targetA);
       if (multiBounce) {
         const dst = ensureTargetB();
         const bu = bounceMat.uniforms;
-        bu.srcVol.value = targetA.texture;
-        // Physically bound bounceWeight < 0.85 so recursive energy never explodes
         bu.bounceWeight.value = Math.max(0, Math.min(0.84, bounceWeight));
-        for (let z = 0; z < nz; z++) {
-          bu.layer.value = z;
-          renderer.setRenderTarget(dst, z);
-          bounceQuad.render(renderer);
+        const nPasses = Math.max(1, Math.min(2, bouncePasses | 0));
+        let srcRT = targetA, dstRT = dst;
+        for (let bp = 0; bp < nPasses; bp++) {
+          bu.srcVol.value = srcRT.texture;
+          for (let z = 0; z < nz; z++) {
+            bu.layer.value = z;
+            renderer.setRenderTarget(dstRT, z);
+            bounceQuad.render(renderer);
+          }
+          generate3DMipmaps(dstRT);
+          const tmp = srcRT; srcRT = dstRT; dstRT = tmp;
         }
-        activeTarget = dst;
+        activeTarget = srcRT;
         lastMultiBounce = true;
       } else {
         activeTarget = targetA;
@@ -684,6 +704,7 @@ export function buildRadianceGrid(objects, T, sdfInfo, {
       get texture() { return activeTarget.texture; },
       dims,
       scale,
+      voxStep: Math.max(voxX, voxY, voxZ),
       get bytes() { return totalVoxels * 4 * (targetB ? 2 : 1); },
       occupiedVoxels: surfCount,
       dilatedVoxels: dilCount,
@@ -772,6 +793,7 @@ export function buildRadianceGrid(objects, T, sdfInfo, {
     texture,
     dims,
     scale,
+    voxStep: Math.max(voxX, voxY, voxZ),
     bytes: texData.byteLength,
     occupiedVoxels: surfCount,
     dilatedVoxels: dilCount,
