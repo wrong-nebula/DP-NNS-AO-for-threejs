@@ -24,7 +24,8 @@
   "exports": {
     ".": "./src/index.js",
     "./contact-bvh": "./contact-bvh.js",
-    "./tsl": "./src/tsl.js"
+    "./tsl": "./src/tsl.js",
+    "./webgpu": "./src/webgpu.js"
   },
   "bin": {
     "bake-sdf": "./bin/bake-sdf.mjs"

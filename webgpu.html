@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="data:,">
+<title>Fast SDF AO · Unified WebGPU Compute Backend</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#121821;color:#f1f5f8;font:15px system-ui,sans-serif}
+main{max-width:1180px;margin:auto;padding:22px}
+.top{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:12px;margin-bottom:8px}
+h1{margin:0;font-size:clamp(22px,3.6vw,34px)}
+a.back{color:#7dd3fc;text-decoration:none;font-weight:600;border:1px solid #334155;padding:6px 12px;border-radius:6px;background:#1e293b}
+a.back:hover{background:#283548}
+p{color:#c4d0db;margin:0 0 12px}
+nav{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
+button,select{font:inherit;padding:7px 12px;color:inherit;background:#252f3d;border:1px solid #718095;border-radius:6px;cursor:pointer}
+button[aria-pressed=true]{background:#d4e9fb;color:#162433;font-weight:600}
+nav label{display:flex;align-items:center;gap:5px;padding:4px 6px}
+#view{position:relative;background:#17212e;border-radius:8px;overflow:hidden}
+canvas{display:block;width:100%;height:auto}
+#hud{position:absolute;top:12px;left:12px;margin:0;padding:8px 12px;background:#121821ec;border-radius:6px;pointer-events:none;font-variant-numeric:tabular-nums}
+#hud strong{font-size:19px}
+#hud small{display:block;color:#94a3b8}
+#status{display:block;margin-top:10px;color:#c4d0db;font-variant-numeric:tabular-nums}
+#err{display:none;padding:18px;background:#2a171c;border:1px solid #f43f5e;border-radius:8px;margin-bottom:14px;color:#fecdd3}
+</style>
+<main>
+  <div class="top">
+    <h1>Fast SDF AO · Unified WebGPU Compute</h1>
+    <a class="back" href="./index.html">← WebGL2 Viewer</a>
+  </div>
+  <p>Native WGSL compute pipeline: Storage-buffer Dual-Child SAH Contact BVH2 · 2×2 Shared-Memory Occlusion-Point Reuse · SHaRC World-Space Spatial Hash Cache · 0.2 ms GPU 2-Bounce Radiance Grid</p>
+  <div id="err"></div>
+  <nav aria-label="Scene and quality">
+    <button data-scene="gallery" aria-pressed="true">Gallery (Multi-Bounce GI)</button>
+    <button data-scene="atrium" aria-pressed="false">Atrium (Curved)</button>
+    <button data-scene="archive" aria-pressed="false">Archive (Boxes)</button>
+    <select id="quality" aria-label="Quality">
+      <option value="low">Quality: Low</option>
+      <option value="medium">Quality: Medium</option>
+      <option value="high" selected>Quality: High</option>
+      <option value="ultra">Quality: Ultra</option>
+    </select>
+    <select id="viewmode" aria-label="View mode">
+      <option value="0" selected>View: Shaded PBR + GI</option>
+      <option value="1">View: AO Mask</option>
+      <option value="2">View: GI Bounce Only</option>
+      <option value="3">View: SHaRC Hash Cache</option>
+    </select>
+    <label><input id="hash" type="checkbox" checked> SHaRC Hash</label>
+    <label><input id="reuse" type="checkbox" checked> 2×2 Reuse</label>
+    <label><input id="emissive" type="checkbox"> Emissive Orb</label>
+    <label>Sun <input id="sun" type="range" min="-65" max="65" value="22" step="1" style="width:90px"><span id="sun-val" style="min-width:32px">22°</span></label>
+    <button id="clear">Clear Cache</button>
+  </nav>
+  <div id="view">
+    <canvas id="c" width="1280" height="720"></canvas>
+    <output id="hud"><strong id="fps">— FPS</strong><small id="gpu-ms">GPU: — ms · Cache skip: —%</small></output>
+  </div>
+  <output id="status">Initializing WebGPU Compute…</output>
+</main>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
+<script type="module">
+import * as T from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { buildContactBVH } from './contact-bvh.js';
+import { WebGPUFastSDFAO, WEBGPU_QUALITY_PRESETS } from './src/webgpu.js';
+
+const statusEl = document.querySelector('#status');
+const errEl = document.querySelector('#err');
+const canvas = document.querySelector('#c');
+const fpsEl = document.querySelector('#fps');
+const gpuMsEl = document.querySelector('#gpu-ms');
+
+async function fetchGzipHalf(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw Error(`Failed to fetch ${url} (${resp.status})`);
+  const stream = resp.body.pipeThrough(new DecompressionStream('gzip'));
+  const buf = await new Response(stream).arrayBuffer();
+  return new Uint16Array(buf);
+}
+
+function buildArchiveMeshData(boxes) {
+  const pos = [], nor = [], col = [], idx = [];
+  const faces = [
+    [[ 1,0,0], [ [1,-1,-1],[1,1,-1],[1,1,1],[1,-1,1] ]],
+    [[-1,0,0], [ [-1,1,-1],[-1,-1,-1],[-1,-1,1],[-1,1,1] ]],
+    [[0, 1,0], [ [1,1,-1],[-1,1,-1],[-1,1,1],[1,1,1] ]],
+    [[0,-1,0], [ [-1,-1,-1],[1,-1,-1],[1,-1,1],[-1,-1,1] ]],
+    [[0,0, 1], [ [-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1] ]],
+    [[0,0,-1], [ [-1,1,-1],[1,1,-1],[1,-1,-1],[-1,-1,-1] ]],
+  ];
+  for (const [cx, cy, cz, hx, hy, hz] of boxes) {
+    for (const [n, corners] of faces) {
+      const base = pos.length / 3;
+      for (const [sx, sy, sz] of corners) {
+        const x = cx + sx * hx, y = cy + sy * hy, z = cz + sz * hz;
+        pos.push(x, y, z);
+        nor.push(n[0], n[1], n[2]);
+        if (z < 0.005) {
+          col.push(0.37, 0.41, 0.44);
+        } else {
+          const t = Math.max(0, Math.min(1, z / 4 + 0.14));
+          col.push(0.28 + 0.36 * t, 0.34 + 0.35 * t, 0.43 + 0.32 * t);
+        }
+      }
+      idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+  }
+  return {
+    positions: new Float32Array(pos),
+    normals: new Float32Array(nor),
+    colors: new Float32Array(col),
+    indices: new Uint32Array(idx),
+  };
+}
+
+function makeThreeMesh(data) {
+  const g = new T.BufferGeometry();
+  g.setAttribute('position', new T.BufferAttribute(data.positions, 3));
+  g.setAttribute('normal', new T.BufferAttribute(data.normals, 3));
+  g.setIndex(new T.BufferAttribute(data.indices, 1));
+  return new T.Mesh(g);
+}
+
+function sunDirFromDeg(deg) {
+  const rad = (deg * Math.PI) / 180;
+  const x = Math.sin(rad) * 0.92;
+  const y = -0.22;
+  const z = Math.cos(rad) * 0.96 + 0.32;
+  const l = Math.hypot(x, y, z) || 1;
+  return [x / l, y / l, z / l];
+}
+
+try {
+  const gpu = await WebGPUFastSDFAO.create(canvas);
+  const camera = new T.PerspectiveCamera(37, 1280 / 720, 0.1, 100);
+  camera.up.set(0, 0, 1);
+  const controls = new OrbitControls(camera, canvas);
+  controls.minDistance = 1.2;
+  controls.maxDistance = 45;
+
+  const sceneCache = {};
+  let activeScene = 'gallery';
+  let emissiveOn = false;
+  let sunDeg = 22;
+  let simTime = 0, lastNow = 0;
+
+  async function loadSceneData(name) {
+    if (sceneCache[name]) return sceneCache[name];
+    statusEl.value = `Loading ${name} mesh, FP16 SDF & SAH Contact BVH…`;
+    if (name === 'gallery') {
+      const [mod, sdfHalf] = await Promise.all([
+        import('./assets/gallery-scene.js'),
+        fetchGzipHalf('./assets/gallery.f16.gz'),
+      ]);
+      const data = mod.buildGalleryGeometryData();
+      const mesh = makeThreeMesh(data);
+      const contactRange = Math.max(0.18, 0.12 + 0.5 * Math.hypot(mod.GALLERY_SDF_SPAN[0] / mod.GALLERY_SDF_DIMS[0], mod.GALLERY_SDF_SPAN[1] / mod.GALLERY_SDF_DIMS[1], mod.GALLERY_SDF_SPAN[2] / mod.GALLERY_SDF_DIMS[2]));
+      const bvh = buildContactBVH([mesh], T, { gridSize: 'auto', range: contactRange + 0.0005 });
+      sceneCache[name] = { ...data, sdfHalf, sdfDims: mod.GALLERY_SDF_DIMS, sdfMin: mod.GALLERY_SDF_MIN, sdfSpan: mod.GALLERY_SDF_SPAN, bvh, contactRange, cam: mod.GALLERY_CAMERA, useGI: true };
+    } else if (name === 'atrium') {
+      const [mod, sdfHalf] = await Promise.all([
+        import('./assets/atrium-scene.js'),
+        fetchGzipHalf('./assets/atrium.f16.gz'),
+      ]);
+      const data = mod.buildAtriumGeometryData();
+      const mesh = makeThreeMesh(data);
+      const contactRange = Math.max(0.18, 0.12 + 0.5 * Math.hypot(mod.ATRIUM_SDF_SPAN[0] / mod.ATRIUM_SDF_DIMS[0], mod.ATRIUM_SDF_SPAN[1] / mod.ATRIUM_SDF_DIMS[1], mod.ATRIUM_SDF_SPAN[2] / mod.ATRIUM_SDF_DIMS[2]));
+      const bvh = buildContactBVH([mesh], T, { gridSize: 'auto', range: contactRange + 0.0005 });
+      sceneCache[name] = { ...data, sdfHalf, sdfDims: mod.ATRIUM_SDF_DIMS, sdfMin: mod.ATRIUM_SDF_MIN, sdfSpan: mod.ATRIUM_SDF_SPAN, bvh, contactRange, cam: mod.ATRIUM_CAMERA, useGI: true };
+    } else {
+      const [boxes, sdfHalf] = await Promise.all([
+        fetch('./benchmark/archive.json').then(r => r.json()),
+        fetchGzipHalf('./assets/archive.f16.gz'),
+      ]);
+      const data = buildArchiveMeshData(boxes);
+      const mesh = makeThreeMesh(data);
+      const contactRange = 0.24;
+      const bvh = buildContactBVH([mesh], T, { gridSize: 1, range: contactRange + 0.0005 });
+      sceneCache[name] = {
+        ...data, sdfHalf, sdfDims: [256, 176, 80], sdfMin: [-1, -1, -1], sdfSpan: [26, 18, 8], bvh, contactRange,
+        cam: { position: [18, -4, 7.3], target: [10.8, 8.8, 1.4] }, useGI: false,
+      };
+    }
+    return sceneCache[name];
+  }
+
+  async function selectScene(name) {
+    activeScene = name;
+    document.querySelectorAll('button[data-scene]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.scene === name)));
+    const sc = await loadSceneData(name);
+    gpu.sunDir = name === 'archive' ? [-0.33, -0.45, 0.83] : sunDirFromDeg(sunDeg);
+    gpu.emissiveCol = (emissiveOn && name === 'gallery') ? [3.6, 2.0, 0.6] : [0, 0, 0];
+    gpu.loadScene(sc);
+    camera.position.set(...sc.cam.position);
+    controls.target.set(...sc.cam.target);
+    controls.update();
+    const info = gpu.adapterInfo;
+    const devLabel = info.description || info.architecture || info.vendor || 'WebGPU';
+    statusEl.value = `${name.toUpperCase()} · ${devLabel} · ${(sc.indices.length / 3).toLocaleString()} tris · ${sc.bvh.nodes.toLocaleString()} BVH nodes · 262k SHaRC hash slots`;
+  }
+
+  document.querySelectorAll('button[data-scene]').forEach(b => { b.onclick = () => selectScene(b.dataset.scene); });
+  document.querySelector('#quality').onchange = e => { gpu.setQuality(e.target.value); };
+  document.querySelector('#viewmode').onchange = e => { gpu.viewMode = Number(e.target.value); };
+  document.querySelector('#hash').onchange = e => { gpu.useHash = e.target.checked; };
+  document.querySelector('#reuse').onchange = e => { gpu.reuseEnabled = e.target.checked; };
+  document.querySelector('#emissive').onchange = e => {
+    emissiveOn = e.target.checked;
+    gpu.emissiveCol = (emissiveOn && activeScene === 'gallery') ? [3.6, 2.0, 0.6] : [0, 0, 0];
+    gpu.relight(true);
+  };
+  document.querySelector('#sun').oninput = e => {
+    sunDeg = Number(e.target.value);
+    document.querySelector('#sun-val').textContent = `${sunDeg}°`;
+    gpu.sunDir = sunDirFromDeg(sunDeg);
+    gpu.relight(true);
+  };
+  document.querySelector('#clear').onclick = () => gpu.clearHash();
+
+  await selectScene('gallery');
+
+  let running = true, fCount = 0, fStart = performance.now();
+  function renderOnce() {
+    controls.update();
+    gpu.render(camera.position.toArray(), controls.target.toArray());
+  }
+
+  function loop(now) {
+    if (!running) return;
+    if (lastNow) simTime += Math.min(now - lastNow, 100) / 1000;
+    lastNow = now;
+    if (emissiveOn && activeScene === 'gallery') {
+      const a = simTime * 0.9;
+      gpu.emissivePos = [1.45 * Math.cos(a), 0.75 + 1.15 * Math.sin(a), 1.65 + 0.35 * Math.sin(a * 1.7)];
+      const m = 0.5 + 0.5 * Math.sin(a * 0.5);
+      gpu.emissiveCol = [3.6 * (1 - m) + 0.7 * m, 1.9 * (1 - m) + 2.9 * m, 0.5 * (1 - m) + 3.6 * m];
+      gpu.relight(true);
+    }
+    renderOnce();
+    fCount++;
+    const dt = now - fStart;
+    if (dt >= 500) {
+      fpsEl.textContent = `${Math.round((1000 * fCount) / dt)} FPS`;
+      const msTxt = gpu.hasTimestamp ? `${gpu.lastGpuMs.toFixed(2)} ms` : 'n/a';
+      gpuMsEl.textContent = `GPU: ${msTxt} · Cache skip: ${gpu.lastSkipPct.toFixed(1)}%`;
+      fCount = 0; fStart = now;
+    }
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  window.wgpuDemo = {
+    gpu, camera, controls, selectScene, renderOnce, WEBGPU_QUALITY_PRESETS,
+    stopLoop: () => { running = false; },
+    setSun: (deg) => { sunDeg = deg; gpu.sunDir = sunDirFromDeg(deg); gpu.relight(true); },
+    setEmissive: (on, t = 0.7) => {
+      emissiveOn = !!on;
+      if (emissiveOn) {
+        gpu.emissivePos = [1.45 * Math.cos(t), 0.75 + 1.15 * Math.sin(t), 1.65 + 0.35 * Math.sin(t * 1.7)];
+        gpu.emissiveCol = [3.6, 2.0, 0.6];
+      } else {
+        gpu.emissiveCol = [0, 0, 0];
+      }
+      gpu.relight(true);
+    },
+  };
+} catch (e) {
+  errEl.style.display = 'block';
+  errEl.innerHTML = `<strong>WebGPU unavailable:</strong> ${e.message} — <a href="./index.html" style="color:#7dd3fc">open the WebGL2 viewer instead</a>.`;
+  statusEl.value = e.message;
+  throw e;
+}
+</script>
+</html>

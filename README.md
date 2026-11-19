@@ -1,6 +1,16 @@
 # Fast SDF AO
 
-**[Live Interactive Demo](https://wrong-nebula.github.io/Fast-SDF-AO/)** · Switch between **Archive (Boxes + 11 Movers)**, **Atrium (Curved Meshes)**, and **Gallery (GI)**, choose a **Quality** preset (**Performance (Low)**, **Balanced (Medium)**, **High (Default)**, **Ultra**), compare 7 AO modes, toggle **Diffuse GI**, **Multi-bounce GI**, **Emissive orb**, **GI bounce only**, **PBR + Multi-Bounce + Bent Normals**, **Hi-Z contact**, **Smooth falloff**, or **AO mask**, and drag the **Sun** angle slider in real time.
+**[Live WebGL2 Demo](https://wrong-nebula.github.io/Fast-SDF-AO/)** · **[Live WebGPU Compute Demo](https://wrong-nebula.github.io/Fast-SDF-AO/webgpu.html)** · Switch between **Archive (Boxes + 11 Movers)**, **Atrium (Curved Meshes)**, and **Gallery (GI)**, choose a **Quality** preset (**Performance (Low)**, **Balanced (Medium)**, **High (Default)**, **Ultra**), compare 7 AO modes, toggle **Diffuse GI**, **Multi-bounce GI**, **Emissive orb**, **GI bounce only**, **PBR + Multi-Bounce + Bent Normals**, **Hi-Z contact**, **Smooth falloff**, or **AO mask**, and drag the **Sun** angle slider in real time.
+
+### Unified WebGPU Compute Backend (`src/webgpu.js`, `webgpu.html`)
+
+Exported as `fast-sdf-ao/webgpu` and live at **[webgpu.html](https://wrong-nebula.github.io/Fast-SDF-AO/webgpu.html)**: native WGSL compute pipeline combining direct storage-buffer **Dual-Child Quantized SAH Contact BVH2**, `8×8` workgroup shared-memory **2×2 Occlusion-Point Reuse** (Jin et al. 2026), a `262,144`-slot atomic **SHaRC World-Space Spatial Hash Cache** (AO + multi-bounce RGB GI, LRU eviction, soft decay on sun/orb motion, **100% converged-cell ray skip**), WGSL compute **2-bounce GPU radiance relighting**, and a 2-pass compute à-trous denoiser (`benchmark/bench_webgpu_unified.py`, Apple M1 Metal-3, 1280×720):
+
+| Apple M1 Metal-3 WebGPU (`high` preset) | Cold ms/f | Orbit 3°/f | Settled GPU ms | Camera-Cut Revisit Cache Skip |
+|---|---:|---:|---:|---:|
+| **Archive (Boxes, 1,908 tris)** | 3.04 ms | 2.04 ms | **1.97 ms** (1.45 ms wall) | **100.0%** |
+| **Gallery (Multi-Bounce GI, 9,272 tris)** | 6.41 ms | 4.83 ms | **2.75 ms** (`low`: 2.18 ms) | **100.0%** |
+| **Atrium (Curved + GI, 13,704 tris)** | 7.77 ms | 6.69 ms | **2.93 ms** | **100.0%** |
 
 Real-time ambient occlusion and **multi-bounce diffuse global illumination (color bleeding)** for Three.js from a baked signed distance field (SDF): a four-read formula, exact distances to moving objects, and an exact baker for meshes and point clouds. **Traced SDF (temporal)** combines exact near-surface triangle intersections (quantized SAH local BVH, or opt-in Hi-Z screen-space contact tracing) with an isotropic FP16 SDF for farther visibility, half-resolution tangent-plane-aware upsampling, variance-guided temporal accumulation, exact analytic/traced moving-object occlusion, and an opt-in **Multi-Bounce Diffuse GI** pass backed by a `64 × 64 × 40` GPU ping-pong 3D radiance voxel grid (`0.20 ms` GPU dynamic sun & emissive-orb relighting, `0.00 ms/f` when static). See [nextgen-log.md](benchmark/nextgen-log.md) for current Apple M1 GPU accuracy, perceptual, temporal, GI, and timing results (and [contact-results.md](benchmark/contact-results.md) for the earlier contact-repair baseline).
 
