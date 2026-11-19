@@ -6,10 +6,10 @@
 // - 2-Pass Compute Edge-Preserving Hit-Distance-Guided A-Trous Denoiser + Full-Res Tangent-Plane Composite
 
 export const WEBGPU_QUALITY_PRESETS = {
-  low:    { label: 'Performance (Low)', rays: 1, maxSamples: 32, denoisePasses: 1, giMaxDist: 6.5, shadowSteps: 32, multiBounce: false },
-  medium: { label: 'Balanced (Medium)', rays: 1, maxSamples: 48, denoisePasses: 2, giMaxDist: 7.5, shadowSteps: 44, multiBounce: true },
-  high:   { label: 'High (Default)',    rays: 2, maxSamples: 64, denoisePasses: 2, giMaxDist: 8.5, shadowSteps: 56, multiBounce: true },
-  ultra:  { label: 'Ultra',             rays: 4, maxSamples: 96, denoisePasses: 2, giMaxDist: 9.5, shadowSteps: 68, multiBounce: true },
+  low:    { label: 'Performance (Low)', rays: 1, maxSamples: 48,  denoisePasses: 2, giMaxDist: 6.5, shadowSteps: 32, multiBounce: false },
+  medium: { label: 'Balanced (Medium)', rays: 1, maxSamples: 64,  denoisePasses: 2, giMaxDist: 7.5, shadowSteps: 44, multiBounce: true },
+  high:   { label: 'High (Default)',    rays: 2, maxSamples: 128, denoisePasses: 3, giMaxDist: 8.5, shadowSteps: 56, multiBounce: true },
+  ultra:  { label: 'Ultra',             rays: 4, maxSamples: 192, denoisePasses: 3, giMaxDist: 9.5, shadowSteps: 68, multiBounce: true },
 };
 
 const HASH_SLOTS = 262144; // 2^18 entries x 28 B = 7.0 MiB
@@ -883,6 +883,79 @@ fn main(
 }
 `;
 
+const TEMPORAL_WGSL = /* wgsl */`
+struct TempU {
+  prevViewProj: mat4x4<f32>,
+  params: vec4<f32>, // x=W, y=H, z=alpha(0.06..0.14), w=validPrev(0/1)
+};
+@group(0) @binding(0) var<uniform> u: TempU;
+@group(0) @binding(1) var curAOGI: texture_2d<f32>;
+@group(0) @binding(2) var curPosDepth: texture_2d<f32>;
+@group(0) @binding(3) var curNormal: texture_2d<f32>;
+@group(0) @binding(4) var prevAOGI: texture_2d<f32>;
+@group(0) @binding(5) var prevPosDepth: texture_2d<f32>;
+@group(0) @binding(6) var prevNormal: texture_2d<f32>;
+@group(0) @binding(7) var outAOGI: texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let W = i32(u.params.x);
+  let H = i32(u.params.y);
+  let q = vec2<i32>(gid.xy);
+  if (q.x >= W || q.y >= H) { return; }
+
+  let cur = textureLoad(curAOGI, q, 0);
+  let pd = textureLoad(curPosDepth, q, 0);
+  let gn = textureLoad(curNormal, q, 0);
+  if (u.params.w < 0.5 || pd.w <= 0.0 || gn.w < 0.5) {
+    textureStore(outAOGI, q, cur);
+    return;
+  }
+
+  let p = pd.xyz;
+  let n = normalize(gn.xyz);
+  let clip = u.prevViewProj * vec4<f32>(p, 1.0);
+  if (clip.w <= 0.0) {
+    textureStore(outAOGI, q, cur);
+    return;
+  }
+  let ndc = clip.xy / clip.w;
+  let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+  let res = vec2<f32>(u.params.xy);
+  var f = uv * res - 0.5;
+  // Snap to texel center when camera is still to avoid recursive bilinear blur
+  f = select(f, round(f), abs(f - round(f)) < vec2<f32>(0.02));
+  let i0 = vec2<i32>(floor(f));
+  let fw = f - floor(f);
+
+  let planeTol = 0.0025 * pd.w + 0.012;
+  var acc = vec4<f32>(0.0);
+  var wSum = 0.0;
+  for (var k = 0; k < 4; k++) {
+    let o = vec2<i32>(k & 1, k >> 1);
+    let pq = i0 + o;
+    let bw = select(1.0 - fw.x, fw.x, o.x == 1) * select(1.0 - fw.y, fw.y, o.y == 1);
+    if (bw < 1e-4 || pq.x < 0 || pq.y < 0 || pq.x >= W || pq.y >= H) { continue; }
+    let ppd = textureLoad(prevPosDepth, pq, 0);
+    let pgn = textureLoad(prevNormal, pq, 0);
+    if (ppd.w <= 0.0 || pgn.w < 0.5) { continue; }
+    if (dot(normalize(pgn.xyz), n) < 0.9) { continue; }
+    if (abs(dot(n, ppd.xyz - p)) > planeTol) { continue; }
+    acc += textureLoad(prevAOGI, pq, 0) * bw;
+    wSum += bw;
+  }
+
+  if (wSum > 0.01) {
+    let prev = acc / wSum;
+    let blended = mix(prev, cur, u.params.z);
+    textureStore(outAOGI, q, blended);
+  } else {
+    // Disoccluded pixel: SHaRC world-space hash already gave a converged instant starting value!
+    textureStore(outAOGI, q, cur);
+  }
+}
+`;
+
 const DENOISE_WGSL = /* wgsl */`
 struct DenoiseU {
   params: vec4<u32>, // x=W, y=H, z=stepSize, w=filterAO(0/1)
@@ -1306,6 +1379,9 @@ export class WebGPUFastSDFAO {
     const trMod = d.createShaderModule({ code: TRACE_WGSL });
     this.tracePipe = d.createComputePipeline({ layout: 'auto', compute: { module: trMod, entryPoint: 'main' } });
 
+    const tmpMod = d.createShaderModule({ code: TEMPORAL_WGSL });
+    this.tempPipe = d.createComputePipeline({ layout: 'auto', compute: { module: tmpMod, entryPoint: 'main' } });
+
     const dnMod = d.createShaderModule({ code: DENOISE_WGSL });
     this.denoisePipe = d.createComputePipeline({ layout: 'auto', compute: { module: dnMod, entryPoint: 'main' } });
 
@@ -1327,16 +1403,20 @@ export class WebGPUFastSDFAO {
     const rw = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING;
     const rt = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT;
 
-    this.gPosDepth = mkTex(this.aoW, this.aoH, 'rgba32float', rt);
-    this.gNormal   = mkTex(this.aoW, this.aoH, 'rgba16float', rt);
+    this.gPosDepth = [mkTex(this.aoW, this.aoH, 'rgba32float', rt), mkTex(this.aoW, this.aoH, 'rgba32float', rt)];
+    this.gNormal   = [mkTex(this.aoW, this.aoH, 'rgba16float', rt), mkTex(this.aoW, this.aoH, 'rgba16float', rt)];
     this.gAlbedo   = mkTex(this.aoW, this.aoH, 'rgba8unorm', rt);
     this.gDepth    = mkTex(this.aoW, this.aoH, 'depth24plus', GPUTextureUsage.RENDER_ATTACHMENT);
     this.fullDepth = mkTex(this.width, this.height, 'depth24plus', GPUTextureUsage.RENDER_ATTACHMENT);
 
     this.rawAOGI   = mkTex(this.aoW, this.aoH, 'rgba16float', rw);
+    this.histAOGI  = [mkTex(this.aoW, this.aoH, 'rgba16float', rw), mkTex(this.aoW, this.aoH, 'rgba16float', rw)];
     this.denoiseA  = mkTex(this.aoW, this.aoH, 'rgba16float', rw);
     this.denoiseB  = mkTex(this.aoW, this.aoH, 'rgba16float', rw);
     this.metaTex   = mkTex(this.aoW, this.aoH, 'rgba16float', rw);
+    this.pingIdx   = 0;
+    this.hasPrev   = false;
+    this.prevVP    = new Float32Array(16);
 
     this.hashBuf = d.createBuffer({ size: HASH_SLOTS * 28, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     this.statsBuf = d.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
@@ -1346,8 +1426,10 @@ export class WebGPUFastSDFAO {
     this.relightUBuf = d.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.decayUBuf = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.traceUBuf = d.createBuffer({ size: 192, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.tempUBuf = d.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.denoiseUBuf1 = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.denoiseUBuf2 = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.denoiseUBuf3 = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.compUBuf = d.createBuffer({ size: 144, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
     this.radVolA = d.createTexture({ size: RAD_DIMS, dimension: '3d', format: 'rgba8unorm', usage: rw });
@@ -1474,12 +1556,12 @@ export class WebGPUFastSDFAO {
         { binding: 1, resource: { buffer: this.hashBuf } },
       ],
     });
-    const makeTraceBG = (radView) => d.createBindGroup({
+    const makeTraceBG = (radView, pIdx) => d.createBindGroup({
       layout: this.tracePipe.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.traceUBuf } },
-        { binding: 1, resource: this.gPosDepth.createView() },
-        { binding: 2, resource: this.gNormal.createView() },
+        { binding: 1, resource: this.gPosDepth[pIdx].createView() },
+        { binding: 2, resource: this.gNormal[pIdx].createView() },
         { binding: 3, resource: s.sdfTex.createView() },
         { binding: 4, resource: radView },
         { binding: 5, resource: this.linSamp },
@@ -1492,40 +1574,60 @@ export class WebGPUFastSDFAO {
         { binding: 12, resource: { buffer: this.statsBuf } },
       ],
     });
-    this.traceBG1B = makeTraceBG(this.radVolA.createView());
-    this.traceBG2B = makeTraceBG(this.radVolB.createView());
+    this.traceBG1B = [makeTraceBG(this.radVolA.createView(), 0), makeTraceBG(this.radVolA.createView(), 1)];
+    this.traceBG2B = [makeTraceBG(this.radVolB.createView(), 0), makeTraceBG(this.radVolB.createView(), 1)];
 
-    const makeDnBG = (ub, src, dst) => d.createBindGroup({
+    const makeTempBG = (curIdx) => {
+      const prevIdx = 1 - curIdx;
+      return d.createBindGroup({
+        layout: this.tempPipe.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.tempUBuf } },
+          { binding: 1, resource: this.rawAOGI.createView() },
+          { binding: 2, resource: this.gPosDepth[curIdx].createView() },
+          { binding: 3, resource: this.gNormal[curIdx].createView() },
+          { binding: 4, resource: this.histAOGI[prevIdx].createView() },
+          { binding: 5, resource: this.gPosDepth[prevIdx].createView() },
+          { binding: 6, resource: this.gNormal[prevIdx].createView() },
+          { binding: 7, resource: this.histAOGI[curIdx].createView() },
+        ],
+      });
+    };
+    this.tempBG = [makeTempBG(0), makeTempBG(1)];
+
+    const makeDnBG = (ub, src, dst, pIdx) => d.createBindGroup({
       layout: this.denoisePipe.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: ub } },
         { binding: 1, resource: src.createView() },
-        { binding: 2, resource: this.gPosDepth.createView() },
-        { binding: 3, resource: this.gNormal.createView() },
+        { binding: 2, resource: this.gPosDepth[pIdx].createView() },
+        { binding: 3, resource: this.gNormal[pIdx].createView() },
         { binding: 4, resource: this.metaTex.createView() },
         { binding: 5, resource: dst.createView() },
       ],
     });
-    this.denoiseBG1 = makeDnBG(this.denoiseUBuf1, this.rawAOGI, this.denoiseA);
-    this.denoiseBG2 = makeDnBG(this.denoiseUBuf2, this.denoiseA, this.denoiseB);
+    this.denoiseBG1 = [makeDnBG(this.denoiseUBuf1, this.histAOGI[0], this.denoiseA, 0), makeDnBG(this.denoiseUBuf1, this.histAOGI[1], this.denoiseA, 1)];
+    this.denoiseBG2 = [makeDnBG(this.denoiseUBuf2, this.denoiseA, this.denoiseB, 0), makeDnBG(this.denoiseUBuf2, this.denoiseA, this.denoiseB, 1)];
+    this.denoiseBG3 = [makeDnBG(this.denoiseUBuf3, this.denoiseB, this.denoiseA, 0), makeDnBG(this.denoiseUBuf3, this.denoiseB, this.denoiseA, 1)];
 
-    const makeCompBG = (tex) => d.createBindGroup({
+    const makeCompBG = (tex, pIdx) => d.createBindGroup({
       layout: this.compPipe.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.compUBuf } },
         { binding: 1, resource: tex.createView() },
-        { binding: 2, resource: this.gPosDepth.createView() },
-        { binding: 3, resource: this.gNormal.createView() },
+        { binding: 2, resource: this.gPosDepth[pIdx].createView() },
+        { binding: 3, resource: this.gNormal[pIdx].createView() },
         { binding: 4, resource: this.metaTex.createView() },
       ],
     });
-    this.compBGRaw = makeCompBG(this.rawAOGI);
-    this.compBGD1  = makeCompBG(this.denoiseA);
-    this.compBGD2  = makeCompBG(this.denoiseB);
+    this.compBGHist = [makeCompBG(this.histAOGI[0], 0), makeCompBG(this.histAOGI[1], 1)];
+    this.compBGD1   = [makeCompBG(this.denoiseA, 0), makeCompBG(this.denoiseA, 1)];
+    this.compBGD2   = [makeCompBG(this.denoiseB, 0), makeCompBG(this.denoiseB, 1)];
   }
 
   clearHash() {
     this.frame = 0;
+    this.hasPrev = false;
     const d = this.device;
     d.queue.writeBuffer(this.decayUBuf, 0, new Uint32Array([HASH_SLOTS, 0, 0, 1]));
     const enc = d.createCommandEncoder();
@@ -1604,8 +1706,18 @@ export class WebGPUFastSDFAO {
     tf.set([s.rootSpan[0], s.rootSpan[1], s.rootSpan[2], 0], 44);
     d.queue.writeBuffer(this.traceUBuf, 0, tBuf);
 
-    d.queue.writeBuffer(this.denoiseUBuf1, 0, new Uint32Array([this.aoW, this.aoH, 1, 0]));
+    const curIdx = this.pingIdx;
+    const tempData = new Float32Array(20);
+    tempData.set(this.prevVP, 0);
+    // Smooth hybrid EMA: 0.08 keeps moving orb/sun & orbiting camera completely flicker-free
+    // while SHaRC world hash gives instant converged starting values on camera cuts.
+    const alpha = this.frame < 4 ? (1 / (this.frame + 1)) : 0.08;
+    tempData.set([this.aoW, this.aoH, alpha, this.hasPrev ? 1 : 0], 16);
+    d.queue.writeBuffer(this.tempUBuf, 0, tempData);
+
+    d.queue.writeBuffer(this.denoiseUBuf1, 0, new Uint32Array([this.aoW, this.aoH, 1, 1]));
     d.queue.writeBuffer(this.denoiseUBuf2, 0, new Uint32Array([this.aoW, this.aoH, 3, 0]));
+    d.queue.writeBuffer(this.denoiseUBuf3, 0, new Uint32Array([this.aoW, this.aoH, 6, 0]));
 
     const cBuf = new Float32Array(36);
     cBuf.set(vp, 0);
@@ -1623,8 +1735,8 @@ export class WebGPUFastSDFAO {
     // Pass 1: Half-Res G-Buffer
     const gp = enc.beginRenderPass({
       colorAttachments: [
-        { view: this.gPosDepth.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' },
-        { view: this.gNormal.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' },
+        { view: this.gPosDepth[curIdx].createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' },
+        { view: this.gNormal[curIdx].createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' },
         { view: this.gAlbedo.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' },
       ],
       depthStencilAttachment: { view: this.gDepth.createView(), depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' },
@@ -1637,19 +1749,38 @@ export class WebGPUFastSDFAO {
     gp.drawIndexed(s.indexCount);
     gp.end();
 
-    // Pass 2 & 3: Trace (BVH2 + 2x2 Occlusion-Point Reuse + SHaRC Hash) + Denoise
+    // Pass 2 & 3: Trace (BVH2 + 2x2 Occlusion-Point Reuse + SHaRC Hash) + Temporal EMA + A-Trous Denoise
     const cp = enc.beginComputePass();
     cp.setPipeline(this.tracePipe);
-    cp.setBindGroup(0, q.multiBounce ? this.traceBG2B : this.traceBG1B);
+    cp.setBindGroup(0, (q.multiBounce ? this.traceBG2B : this.traceBG1B)[curIdx]);
     cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
-    if (this.useGI && q.denoisePasses >= 1) {
+
+    cp.setPipeline(this.tempPipe);
+    cp.setBindGroup(0, this.tempBG[curIdx]);
+    cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
+
+    let compBG = this.compBGHist[curIdx];
+    if (this.useGI) {
       cp.setPipeline(this.denoisePipe);
-      cp.setBindGroup(0, this.denoiseBG1);
+      cp.setBindGroup(0, this.denoiseBG1[curIdx]);
       cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
+      compBG = this.compBGD1[curIdx];
       if (q.denoisePasses >= 2) {
-        cp.setBindGroup(0, this.denoiseBG2);
+        cp.setBindGroup(0, this.denoiseBG2[curIdx]);
         cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
+        compBG = this.compBGD2[curIdx];
       }
+      if (q.denoisePasses >= 3) {
+        cp.setBindGroup(0, this.denoiseBG3[curIdx]);
+        cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
+        compBG = this.compBGD1[curIdx];
+      }
+    } else {
+      // Single stride-1 plane-aware AO polish dissolves SHaRC cell jitter while preserving sharp contacts
+      cp.setPipeline(this.denoisePipe);
+      cp.setBindGroup(0, this.denoiseBG1[curIdx]);
+      cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
+      compBG = this.compBGD1[curIdx];
     }
     cp.end();
 
@@ -1665,11 +1796,15 @@ export class WebGPUFastSDFAO {
       ...(this.hasTimestamp ? { timestampWrites: { querySet: this.tsQuery, endOfPassWriteIndex: 1 } } : {}),
     });
     fp.setPipeline(this.compPipe);
-    fp.setBindGroup(0, !this.useGI ? this.compBGRaw : (q.denoisePasses >= 2 ? this.compBGD2 : this.compBGD1));
+    fp.setBindGroup(0, compBG);
     fp.setVertexBuffer(0, s.vb);
     fp.setIndexBuffer(s.ib, 'uint32');
     fp.drawIndexed(s.indexCount);
     fp.end();
+
+    this.prevVP.set(vp);
+    this.hasPrev = true;
+    this.pingIdx = 1 - curIdx;
 
     if (!this._statsMapped) {
       enc.copyBufferToBuffer(this.statsBuf, 0, this.statsRead, 0, 16);
