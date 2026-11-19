@@ -124,7 +124,8 @@ float vdc3(uint n){
  for(int j=0;j<6;j++){f/=3.;r+=f*float(n%3u);n/=3u;}
  return r;
 }
-float candidateAO(vec3 p,vec3 n,float nd){
+uniform float smoothFalloff;
+vec4 candidateAOBent(vec3 p,vec3 n,float nd){
  vec3 a=abs(n.x)<.9?vec3(1.,0.,0.):vec3(0.,1.,0.);
  vec3 t=normalize(cross(n,a)),b=cross(n,t);
  // Cranley-Patterson spatial blue-noise shift (IGN, constant per pixel) + exact 2D Halton(2,3)
@@ -132,6 +133,7 @@ float candidateAO(vec3 p,vec3 n,float nd){
  float su=ign(gl_FragCoord.xy);
  float sp=ign(gl_FragCoord.xy+vec2(37.,17.));
  float vis=0.;
+ vec3 bent=vec3(0.);
  float fu=fract(su+vdc2(uint(frame)));
  uint base=uint(frame)*4u;
  for(int i=0;i<4;i++){
@@ -143,17 +145,25 @@ float candidateAO(vec3 p,vec3 n,float nd){
   float cosn=dot(w,n),s=contactRange,v=1.;
   for(int k=0;k<16;k++){
    float d=staticDistance(p+w*s),e=max(min(.025,.1*s*cosn),1e-6);
-   v=min(v,clamp((d+e)/(4.*e),0.,1.));
+   float stepVis=clamp((d+e)/(4.*e),0.,1.);
+   if(smoothFalloff>.5){
+    float fade=smoothstep(1.12,.72,s);
+    stepVis=mix(1.,stepVis,fade);
+   }
+   v=min(v,stepVis);
    if(v<.01)break;
    s+=max(d,.072);if(s>1.12)break;
   }
   vis+=v;
+  bent+=w*v;
  }
- return vis/nd;
+ float bl=length(bent);
+ return vec4(vis/nd,bl>1e-4?bent/bl:n);
 }
+float candidateAO(vec3 p,vec3 n,float nd){return candidateAOBent(p,n,nd).x;}
 float candidateAO(vec3 p,vec3 n){
  float nd=frame<8.?4.:(frame<16.?3.:2.);
- return candidateAO(p,n,nd);
+ return candidateAOBent(p,n,nd).x;
 }
 `;
 

@@ -120,3 +120,37 @@ Implemented a standalone WebGPU Compute (WGSL) prototype (`benchmark/webgpu-hash
 | Hash Table Memory | 4.0 MiB | — |
 
 **Engineering takeaway**: World-space caching delivers instant zero-lag disocclusion (`0.01126` on frame 1 of a camera cut, 100% ray skip, `0.619 ms/f` settled), while pixel-exact screen-space temporal accumulation achieves 2× lower converged MAE (`0.00593`) because it avoids world-cell quantization blur on 1–3 cm contacts.
+
+---
+
+## Phase 5 & 6 — Exact Dynamic Mover AO, PBR Realism Showcase & Final End-to-End Audit
+
+### Changes Implemented
+1. **Exact Analytic & Per-Frame Ray-Traced Mover AO (`index.html`)**:
+   - Replaced the `moverScale = 0.5` 4-tap formula hack in Traced SDF mode with Inigo Quilez's closed-form analytic cosine-weighted `sphOcclusion` for spheres + 24-ray stratified cosine-weighted exact ray-box / SDF-marched visibility (`dynamicVisibility`) evaluated fresh every frame on mover-affected pixels (`dynMask != 0`).
+   - Fixed the hemisphere culling bug in `TRACED` mode (previously used the normal-axis tap sphere `|p+n*1.12 - c| - rb < 1.12`, falsely culling grazing movers near the horizon).
+   - Fixed non-convex mover self-intersection (`t = max(0.015, -bq - sq)`) caught by visual audit of the torus, torus knot, and teapot.
+   - Result: Mover near-object MAE dropped **-46.6%** (`0.03778 → 0.02016` frozen, `0.03784 → 0.02025` continuous — zero temporal lag!).
+2. **Realism Showcase (`index.html`, `contact-bvh.js`)**:
+   - Temporally accumulated **Bent Normals** (`bentOut` 3rd `RGBA8` MRT attachment in `histories`) via `tracedAOBent()`.
+   - Opt-in `#pbr` toggle (`aoDemo.setPBR(on)`): **Jimenez Multi-Bounce Colored AO**, directional sky/ground hemisphere ambient along `bentNormal`, GGX sun specular with **Jimenez GTSO Specular Occlusion**, and Filmic ACES tone mapping + sRGB transfer.
+   - Opt-in `#smoothfalloff` toggle (`aoDemo.setSmoothFalloff(on)`): smooth `[0.72, 1.12] m` distance falloff vs exact hard `1.12 m` benchmark cutoff.
+   - `AO mask` remains 100% pure linear AO in `[0, 1]`.
+
+### Final End-to-End Comparison (`main` `e600a61` vs `feat/ao-next-gen`)
+
+| Metric | `main` (`e600a61`) | `feat/ao-next-gen` | Change |
+|---|---:|---:|---:|
+| Fit MAE (1 / 4 / 16 / 64) | 0.02389 / 0.01684 / 0.00913 / 0.00746 | **0.02234 / 0.01326 / 0.00844 / 0.00593** | -6.5% / **-21.3%** / -7.6% / **-20.5%** |
+| Held MAE (1 / 4 / 16 / 64) | 0.02209 / 0.01551 / 0.00836 / 0.00651 | **0.01966 / 0.01163 / 0.00737 / 0.00507** | -11.0% / **-25.0%** / -11.8% / **-22.1%** |
+| Contact@64 MAE / underOcc / overOcc | 0.02542 / 0.00601 / 0.01940 | **0.01891 / 0.00475 / 0.01416** | **-25.6%** / **-21.0%** / **-27.0%** |
+| Perceptual@64 Oklab / FLIP / p95 / GMSD | 0.00365 / 0.02772 / 0.1036 / 0.02093 | **0.00272 / 0.02221 / 0.0788 / 0.01052** | **-25.5%** / **-19.9%** / **-23.9%** / **-49.7%** |
+| Tail-Risk CVaR-5%@64 | 0.05175 | **0.03342** | **-35.4%** |
+| Temporal ConvAUC / Disocc(1..4) / Orbit3° | 0.00841 / 0.01826 / 0.01150 | **0.00771 / 0.01598 / 0.00978** | **-8.3%** / **-12.5%** / **-15.0%** |
+| Diag `pix416854` (ref 1.000) | 0.8314 | **1.0000** | Fixed (exact) |
+| Movers Frozen all/near | 0.01185 / 0.03778 | **0.00889 / 0.02016** | **-25.0% / -46.6%** |
+| Movers Continuous all/near | 0.01188 / 0.03784 | **0.00891 / 0.02025** | **-25.0% / -46.5%** |
+| ThinPlate meanMAE64 / Curved MAE | 0.01090 / 0.05125 | **0.00776 / 0.04030** | **-28.8% / -21.4%** |
+| Contact BVH Build / VRAM | 96.0 ms / 1429.1 KiB | **16.8–25.9 ms / 398.6 KiB** | **3.7–5.7× faster / 3.6× smaller** |
+| `index.html` SDF Payload | 924 KB (128³ f32.gz) | **715 KB (256×176×80 f16.gz)** | **-204.5 KB, 0 JS f16 loop** |
+| Exhaustive GL & Console Errors | 0 / 0 | **0 / 0** (all 7 modes × all toggles) | Pass |
