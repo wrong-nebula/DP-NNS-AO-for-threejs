@@ -47,26 +47,49 @@ bool contactBlocked(vec3 p,vec3 n,vec3 w){
  }
  return false;
 }
-float candidateAO(vec3 p,vec3 n){
+float vdc2(uint bits){
+ bits=(bits<<16u)|(bits>>16u);
+ bits=((bits&0x55555555u)<<1u)|((bits&0xAAAAAAAAu)>>1u);
+ bits=((bits&0x33333333u)<<2u)|((bits&0xCCCCCCCCu)>>2u);
+ bits=((bits&0x0F0F0F0Fu)<<4u)|((bits&0xF0F0F0F0u)>>4u);
+ bits=((bits&0x00FF00FFu)<<8u)|((bits&0xFF00FF00u)>>8u);
+ return float(bits)*2.3283064365386963e-10;
+}
+float vdc3(uint n){
+ float f=1.,r=0.;
+ for(int j=0;j<6;j++){f/=3.;r+=f*float(n%3u);n/=3u;}
+ return r;
+}
+float candidateAO(vec3 p,vec3 n,float nd){
  vec3 a=abs(n.x)<.9?vec3(1.,0.,0.):vec3(0.,1.,0.);
  vec3 t=normalize(cross(n,a)),b=cross(n,t);
- float rot=6.2831853*ign(gl_FragCoord.xy+5.588238*mod(frame,64.)),g1=fract(frame*.6180339887),g2=fract(frame*.7548776662);
- float nd=frame<8.?4.:(frame<16.?3.:2.),vis=0.;
+ // Cranley-Patterson spatial blue-noise shift (IGN, constant per pixel) + exact 2D Halton(2,3)
+ // over sample index k: optimal 2D stratification at every frame count, zero mod-64 wrap.
+ float su=ign(gl_FragCoord.xy);
+ float sp=ign(gl_FragCoord.xy+vec2(37.,17.));
+ float vis=0.;
+ float fu=fract(su+vdc2(uint(frame)));
+ uint base=uint(frame)*4u;
  for(int i=0;i<4;i++){
   if(float(i)>=nd)break;
-  float u=min((float(i)+g1)/nd,1.),phi=float(i)*2.39996323+6.2831853*g2+rot;
+  float u=clamp((float(i)+fu)/nd,1e-4,.9999);
+  float phi=6.2831853*fract(sp+vdc3(base+uint(i)));
   vec3 w=t*(sqrt(u)*cos(phi))+b*(sqrt(u)*sin(phi))+n*sqrt(1.-u);
   if(contactBlocked(p,n,w))continue;
-  float cosn=dot(w,n),s=.12,v=1.;
+  float cosn=dot(w,n),s=contactRange,v=1.;
   for(int k=0;k<16;k++){
    float d=staticDistance(p+w*s),e=max(min(.025,.1*s*cosn),1e-6);
    v=min(v,clamp((d+e)/(4.*e),0.,1.));
-   if(d<-e)break;
+   if(v<.01)break;
    s+=max(d,.072);if(s>1.12)break;
   }
   vis+=v;
  }
  return vis/nd;
+}
+float candidateAO(vec3 p,vec3 n){
+ float nd=frame<8.?4.:(frame<16.?3.:2.);
+ return candidateAO(p,n,nd);
 }
 `;
 // Prototype limits: at most 8192 nodes in one local tree, fewer than 2^21

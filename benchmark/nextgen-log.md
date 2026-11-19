@@ -32,3 +32,38 @@ Established `benchmark/judge_v2.py` (real Apple M1 Metal GPU via Playwright Chro
 | GPU ms/f (early / orbit / settled) | 5.863 / 4.006 / 1.478 |
 | Startup contactBuild / VRAM / moverBake | 96.0 ms / 1429.1 KiB / 34.3 ms |
 | GL errors (7 modes) / console errors | 0 / 0 |
+
+---
+
+## Phase 2 — Tangent-Plane Rejection, Halton(2,3)+IGN Sampling, Far-March Handoff & Variance-Guided Filtering
+
+### Changes Implemented
+1. **Zero-Bandwidth View-Space Tangent-Plane Distance Rejection** (`index.html`):
+   - Reconstructs exact view-space positions of half-res neighbors directly from `viewDepth` (`invProjXY * h.y, -h.y`) with zero extra render targets or texture fetches.
+   - Replaces raw depth thresholds in both `tracedAt()` and `history()` with `abs(dot(vn, vpQ - vp)) <= 0.0015 * viewDepth + 0.005` + grazing-friendly depth guard `0.08 * viewDepth + 0.05`.
+   - Eliminates offset-plane bleed (`pix416854`: `0.8314 → 1.0000` exact).
+2. **Cranley-Patterson IGN + 2D Halton(2,3) Sampling** (`contact-bvh.js`):
+   - Replaces the broken `g1/g2 + mod(frame,64)` IGN azimuth scrambling with per-pixel constant IGN spatial shifts in both `u` and `phi` + exact `vdc2(frame)` elevation stratification + `vdc3(4*frame+i)` azimuth sequence (zero wrap, 2×2 anti-correlated).
+3. **Far SDF March Handoff** (`contact-bvh.js`):
+   - Starts far SDF march at `s = contactRange` (eliminating redundant `[0.12, 0.2474]` overlap with exact BVH) + early exit `v < 0.01`.
+   - *Ablated & rejected*: Aaltonen 2-sphere soft visibility regressed MAE to `0.224` because `d > prevD` on rays leaving surfaces triggers false `h = 0` occlusion.
+4. **Variance Moments, Early Settling, Control-Variate Blend & Young-History Prefilter** (`index.html`):
+   - Upgraded `histTex` from `RG32F` to `RGBA32F` `(aoMean, viewDepth, aoM2, variance)`.
+   - Variance-guided early settling (`frames >= 24 && var < 0.00015`) and adaptive ray budget (`1` ray for low-variance pixels after frame 24).
+   - Variance-weighted Bayesian/control-variate blend `effK = clamp(blendK * (0.55 + 8 * var), 1.5, 4.5)`.
+   - Lightweight 4-neighbor cross-bilateral prefilter applied *only* to young noisy histories (`frames < 6 && var > 0.003`).
+
+### Phase 2 Results (`p2-final` vs `baseline-main`)
+
+| Metric | `baseline-main` | `p2-final` | Delta |
+|---|---:|---:|---:|
+| Fit MAE (1 / 4 / 16 / 64) | 0.02389 / 0.01684 / 0.00913 / 0.00746 | 0.02200 / 0.01347 / 0.00931 / 0.00718 | -7.9% / **-20.0%** / +2.0% / -3.8% |
+| Held MAE (1 / 4 / 16 / 64) | 0.02209 / 0.01551 / 0.00836 / 0.00651 | 0.01992 / 0.01177 / 0.00818 / 0.00628 | -9.8% / **-24.1%** / -2.2% / -3.5% |
+| Contact@64 MAE / underOcc / overOcc | 0.02542 / 0.00601 / 0.01940 | 0.01936 / 0.00601 / 0.01335 | **-23.8%** / 0.0% / **-31.2%** |
+| Perceptual@64 Oklab / FLIP / p95 / GMSD | 0.00365 / 0.02772 / 0.1036 / 0.02093 | 0.00335 / 0.02624 / 0.0932 / 0.01243 | -8.2% / -5.3% / **-10.0%** / **-40.6%** |
+| CVaR-5%@64 | 0.05175 | 0.04337 | **-16.2%** |
+| Temporal ConvAUC / Disocc(1..4) / Orbit3° | 0.00841 / 0.01826 / 0.01150 | 0.00824 / 0.01564 / 0.00997 | -2.0% / **-14.3%** / **-13.3%** |
+| Diag `pix416854` (ref 1.000) | 0.8314 | **1.0000** | Fixed |
+| ThinPlate meanMAE64 | 0.01090 | 0.00612 | **-43.9%** |
+| Curved (Sphere+Torus) MAE | 0.05125 | 0.03958 | **-22.8%** |
+| GL errors (7 modes) | 0 | 0 | Pass |

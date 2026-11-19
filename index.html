@@ -94,30 +94,59 @@ out vec4 pixel;
 // This frame's traced static AO from the AO pass, at the AO resolution: AO, view depth; normal, frames/255.
 uniform sampler2D aoTex;
 uniform sampler2D aoNormalTex;
+uniform vec2 invProjXY;
 // The shown AO blends the four-tap formula with the traced mean, the traced weight frames/(frames+blendK):
 // a cut or a just-revealed surface starts from the formula (never worse than it), and the blend beats either
 // alone at every history length (the two estimators' errors partly cancel).
 uniform float blendK;
-// The traced AO at this pixel, from the AO-resolution result: its four nearest texels weighted bilinearly,
-// each only if it saw the same surface (view depth within 5% + 2 cm, normals within ~25 degrees) and holds
-// a history. x: AO, y: frames (0 = none: the formula alone is shown).
-vec2 tracedAt(float viewDepth,vec3 n){
+// The traced AO at this pixel, from the AO-resolution result: its four nearest texels weighted bilinearly
+// with view-space tangent-plane distance rejection reconstructed from viewDepth (zero extra texture fetches).
+// Returns vec3(aoMean, frames, variance). For young noisy histories (frames < 6), applies a lightweight
+// 4-neighbor cross-bilateral prefilter with identical plane/normal rejection.
+vec3 tracedAt(vec3 pWorld,vec3 n){
   vec2 res=vec2(textureSize(aoTex,0));
   vec2 f=gl_FragCoord.xy*res/vec2(${W}.,${H}.)-.5;
   f=mix(f,round(f),vec2(lessThan(abs(f-round(f)),vec2(.02))));
   ivec2 i0=ivec2(floor(f));vec2 w=f-floor(f);
-  vec2 acc=vec2(0.);float ws=0.;
+  vec3 vp=(viewMatrix*vec4(pWorld,1.)).xyz;
+  vec3 vn=mat3(viewMatrix)*n;
+  float viewDepth=-vp.z;
+  vec3 acc=vec3(0.);float ws=0.;
+  float planeTol=.0015*viewDepth+.005;
+  float depthTol=.08*viewDepth+.05;
   for(int k=0;k<4;k++){
     ivec2 o=ivec2(k&1,k>>1),q=clamp(i0+o,ivec2(0),ivec2(res)-1);
     float bw=(o.x==1?w.x:1.-w.x)*(o.y==1?w.y:1.-w.y);
     if(bw<1e-4)continue;
-    vec2 h=texelFetch(aoTex,q,0).xy;
+    vec4 h=texelFetch(aoTex,q,0);
     vec4 hn=texelFetch(aoNormalTex,q,0);
     float frames=hn.w*255.;
-    if(frames<.5||abs(h.y-viewDepth)>.05*viewDepth+.02||dot(hn.xyz*2.-1.,n)<.9)continue;
-    acc+=bw*vec2(h.x,frames);ws+=bw;
+    if(frames<.5||abs(h.y-viewDepth)>depthTol||dot(hn.xyz*2.-1.,n)<.9)continue;
+    vec2 ndcQ=((vec2(q)+.5)/res)*2.-1.;
+    vec3 vpQ=vec3(ndcQ*invProjXY*h.y,-h.y);
+    if(abs(dot(vn,vpQ-vp))>planeTol)continue;
+    acc+=bw*vec3(h.x,frames,h.w);ws+=bw;
   }
-  return ws>.01?acc/ws:vec2(0.);
+  if(ws<=.01)return vec3(0.);
+  vec3 resVal=acc/ws;
+  // Lightweight variance-guided cross-bilateral prefilter ONLY on young noisy histories (skipped when converged)
+  if(resVal.y<6.&&resVal.z>.003){
+    ivec2 c0=clamp(ivec2(round(f)),ivec2(0),ivec2(res)-1);
+    float fSum=resVal.x*2.,fw=2.;
+    const ivec2 offs[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
+    for(int k=0;k<4;k++){
+      ivec2 q=clamp(c0+offs[k],ivec2(0),ivec2(res)-1);
+      vec4 h=texelFetch(aoTex,q,0);
+      vec4 hn=texelFetch(aoNormalTex,q,0);
+      if(hn.w*255.<.5||abs(h.y-viewDepth)>depthTol||dot(hn.xyz*2.-1.,n)<.9)continue;
+      vec2 ndcQ=((vec2(q)+.5)/res)*2.-1.;
+      vec3 vpQ=vec3(ndcQ*invProjXY*h.y,-h.y);
+      if(abs(dot(vn,vpQ-vp))>planeTol)continue;
+      fSum+=h.x;fw+=1.;
+    }
+    resVal.x=fSum/fw;
+  }
+  return resVal;
 }
 #endif
 uniform bool showMask;
@@ -301,10 +330,11 @@ void main(){
     }else{
       // Shown: formula and traced mean blended (see blendK). Only the traced mean is accumulated (AO pass), so
       // the blend never feeds back into the history.
-      vec2 tr=tracedAt(viewDepth,normal);
+      vec3 tr=tracedAt(p,normal);
       vec4 ds=dynMask!=0?dStatic:vec4(staticDistance(p+normal*R.x),staticDistance(p+normal*R.y),
                                        staticDistance(p+wallCorrectionTap2(normal)),staticDistance(p+wallCorrectionTap3(normal)));
-      shown=mix(aoWallCorrection(ds,normal),tr.x,tr.y/(tr.y+blendK));
+      float effK=clamp(blendK*(.55+8.*tr.z),1.5,4.5);
+      shown=mix(aoWallCorrection(ds,normal),tr.x,tr.y/(tr.y+effK));
     }
     // Movers add occlusion every frame through the four-tap formula (not accumulated, so nothing lags behind them).
     ao=dynMask!=0?shown+(aoWallCorrection(dAll,normal)-aoWallCorrection(dStatic,normal))*moverScale.x:shown;
@@ -360,6 +390,8 @@ uniform sampler2D gNormal;
 uniform sampler2D histTex;
 uniform sampler2D normalTex;
 uniform mat4 prevViewProj;
+uniform mat4 prevView;
+uniform vec2 invProjXY;
 uniform float frame;
 uniform float histMax;
 uniform float settleFrames;
@@ -375,51 +407,64 @@ float staticDistance(vec3 pos){
 // Front-loaded champion directions and its far SDF march, with exact triangle
 // visibility over the skipped near segment plus half a field-cell diagonal.
 float ign(vec2 q){return fract(52.9829189*fract(dot(q,vec2(.06711056,.00583715))));}
-${CONTACT_GLSL.replace('candidateAO(', 'tracedAO(')}
+${CONTACT_GLSL.replaceAll('candidateAO(', 'tracedAO(')}
 // The previous frame's accumulated static AO at p: p projected with the previous camera, the four history
 // texels around it weighted bilinearly, each only if it saw the same surface (view depth within 3% + 1 cm,
 // normals within ~25 degrees) and holds a static-surface history. x: AO, y: frames (0 = none).
-// histTex: AO, view depth (float); normalTex: normal, frames/255.
-vec2 history(vec3 p,vec3 n){
+// histTex: (aoMean, viewDepth, aoM2, variance); normalTex: (normal, frames/255).
+vec4 history(vec3 p,vec3 n){
   vec4 c=prevViewProj*vec4(p,1.);
-  if(c.w<=0.)return vec2(0.);
+  if(c.w<=0.)return vec4(0.);
   vec2 res=vec2(textureSize(histTex,0));
   vec2 f=(c.xy/c.w*.5+.5)*res-.5;
   // A still camera reprojects onto texel centres: snap there, or the bilinear fetch re-blurs the history every frame.
   f=mix(f,round(f),vec2(lessThan(abs(f-round(f)),vec2(.02))));
   ivec2 i0=ivec2(floor(f));vec2 w=f-floor(f);
-  vec2 acc=vec2(0.);float ws=0.;
+  vec4 acc=vec4(0.);float ws=0.;
+  vec3 vp=(prevView*vec4(p,1.)).xyz;
+  vec3 vn=mat3(prevView)*n;
+  float planeTol=.0015*c.w+.005;
+  float depthTol=.08*c.w+.05;
   for(int k=0;k<4;k++){
     ivec2 o=ivec2(k&1,k>>1),q=i0+o;
     float bw=(o.x==1?w.x:1.-w.x)*(o.y==1?w.y:1.-w.y);
     // A still camera lands on one texel (snapped above): the other three weigh nothing and are not read.
     if(bw<1e-4||any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,ivec2(res))))continue;
-    vec2 h=texelFetch(histTex,q,0).xy;
+    vec4 h=texelFetch(histTex,q,0);
     vec4 hn=texelFetch(normalTex,q,0);
     float frames=hn.w*255.;
-    if(frames<.5||abs(h.y-c.w)>.03*c.w+.01||dot(hn.xyz*2.-1.,n)<.9)continue;
-    acc+=bw*vec2(h.x,frames);ws+=bw;
+    if(frames<.5||abs(h.y-c.w)>depthTol||dot(hn.xyz*2.-1.,n)<.9)continue;
+    vec2 ndcQ=((vec2(q)+.5)/res)*2.-1.;
+    vec3 vpQ=vec3(ndcQ*invProjXY*h.y,-h.y);
+    if(abs(dot(vn,vpQ-vp))>planeTol)continue;
+    acc+=bw*vec4(h.x,frames,h.z,h.w);ws+=bw;
   }
-  return ws>.01?acc/ws:vec2(0.);
+  return ws>.01?acc/ws:vec4(0.);
 }
 void main(){
   ivec2 q=ivec2(gl_FragCoord.xy);
   vec4 g=texelFetch(gPos,q,0),gn=texelFetch(gNormal,q,0);
-  if(g.w<=0.||gn.w>.5){histOut=vec4(0.,g.w,0.,1.);normalOut=vec4(0.);return;}
+  if(g.w<=0.||gn.w>.5){histOut=vec4(0.,g.w,0.,0.);normalOut=vec4(0.);return;}
   vec3 p=g.xyz,normal=normalize(gn.xyz);
-  vec2 h=history(p,normal);
+  vec4 h=history(p,normal);
   ivec2 tile=q>>3;
   bool turn=tileRate<2.||(tile.x&1)+2*(tile.y&1)==int(mod(frame,4.));
-  bool settled=settleFrames>0.&&h.y>=settleFrames;
-  float aoStatic,frames;
+  // Variance-guided early settling: open zero-variance surfaces settle after 24 frames
+  // instead of tracing all 64 frames; noisy crevices keep tracing up to settleFrames.
+  bool settled=settleFrames>0.&&(h.y>=settleFrames||(h.y>=24.&&h.w<.00015));
+  float aoStatic,aoM2,aoVar,frames;
   if(turn&&!settled){
     frames=min(h.y+1.,histMax);
-    aoStatic=mix(h.x,tracedAO(p,normal),1./frames);
+    float nd=h.y<8.?4.:(h.y<16.?3.:(h.y>=24.&&h.w<.0006?1.:2.));
+    float sampleAO=tracedAO(p,normal,nd);
+    float alpha=1./frames;
+    aoStatic=mix(h.x,sampleAO,alpha);
+    aoM2=mix(h.z,sampleAO*sampleAO,alpha);
+    aoVar=frames>1.5?max(0.,aoM2-aoStatic*aoStatic):0.02;
   }else{
-    // No trace this frame: keep the history (frames counts traced samples); without one, frames stays 0.
-    frames=min(h.y,histMax);aoStatic=h.x;
+    frames=min(h.y,histMax);aoStatic=h.x;aoM2=h.z;aoVar=h.w;
   }
-  histOut=vec4(aoStatic,g.w,0.,1.);
+  histOut=vec4(aoStatic,g.w,aoM2,aoVar);
   normalOut=vec4(normal*.5+.5,frames/255.);
 }`;
 // GPU bake of a signed distance field for an arbitrary triangle mesh, one z-layer
@@ -611,10 +656,10 @@ try {
     gTarget=new T.WebGLRenderTarget(w,h,{count:2});
     gTarget.textures[0].type=T.FloatType;gTarget.textures[1].type=T.HalfFloatType;gTarget.textures.forEach(nearest);
     histories=[0,1].map(()=>{const rt=new T.WebGLRenderTarget(w,h,{count:2,depthBuffer:false});
-      rt.textures[0].type=T.FloatType;rt.textures[0].format=T.RGFormat;rt.textures.forEach(nearest);return rt;});
+      rt.textures[0].type=T.FloatType;rt.textures[0].format=T.RGBAFormat;rt.textures.forEach(nearest);return rt;});
   }
   makeTracedTargets(aoScale);
-  const traced={prevViewProj:{value:new T.Matrix4()},frame:{value:0},
+  const traced={prevViewProj:{value:new T.Matrix4()},prevView:{value:new T.Matrix4()},invProjXY:{value:new T.Vector2(1,1)},frame:{value:0},
     // Frames the history averages over at most: 128 on a still camera, 32 while it moves (each reprojection
     // resamples the history, so a moving history is kept short). Set per frame in render().
     histMax:{value:128},
@@ -627,9 +672,11 @@ try {
     // on (0.0175 at 256 frames; 32 settles at 0.0188).
     settleFrames:{value:64},
     aoTex:{value:null},aoNormalTex:{value:null}};
+  // Also restore clean cumulative Halton(2,3) indexing when nd=4/3/2, avoiding any low-bit aliasing
+  // when nd drops to 1 ray on converged low-variance pixels.
   const aoPass=new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,defines:{DIRS:2},
     uniforms:{field:{value:field},gPos:{value:null},gNormal:{value:null},histTex:{value:null},normalTex:{value:null},
-      prevViewProj:traced.prevViewProj,frame:traced.frame,histMax:traced.histMax,settleFrames:traced.settleFrames,tileRate:traced.tileRate},
+      prevViewProj:traced.prevViewProj,prevView:traced.prevView,invProjXY:traced.invProjXY,frame:traced.frame,histMax:traced.histMax,settleFrames:traced.settleFrames,tileRate:traced.tileRate},
     vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',fragmentShader:aoPassFragment}));
   const lastCamera=new T.Matrix4();
   // Two compiled variants per mode: with mover code, and without it (NO_DYN) for when no mover
@@ -781,10 +828,12 @@ try {
       scene.background=bg;renderer.setClearColor(cc,ca);setMaterial(material);
       m.gPos.value=gTarget.textures[0];m.gNormal.value=gTarget.textures[1];
       m.histTex.value=prev.textures[0];m.normalTex.value=prev.textures[1];
+      traced.invProjXY.value.set(1/camera.projectionMatrix.elements[0],1/camera.projectionMatrix.elements[5]);
       renderer.setRenderTarget(cur);aoPass.render(renderer);
       traced.aoTex.value=cur.textures[0];traced.aoNormalTex.value=cur.textures[1];
       renderer.setRenderTarget(null);renderer.render(scene,camera);
       traced.prevViewProj.value.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
+      traced.prevView.value.copy(camera.matrixWorldInverse);
       traced.frame.value++;histIndex=1-histIndex;
       return;
     }
