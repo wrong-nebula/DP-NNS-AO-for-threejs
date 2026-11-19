@@ -1,0 +1,46 @@
+{
+  "name": "fast-sdf-ao",
+  "version": "1.0.0",
+  "description": "Real-time ambient occlusion for Three.js from baked signed distance fields (4-tap inline, WebGPU TSL node, and traced SDF + quantized SAH contact BVH).",
+  "type": "module",
+  "author": "wrong-nebula",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wrong-nebula/Fast-SDF-AO.git"
+  },
+  "homepage": "https://wrong-nebula.github.io/Fast-SDF-AO/",
+  "keywords": [
+    "threejs",
+    "ambient-occlusion",
+    "sdf",
+    "signed-distance-field",
+    "webgl2",
+    "webgpu",
+    "tsl",
+    "bvh",
+    "graphics"
+  ],
+  "exports": {
+    ".": "./src/index.js",
+    "./contact-bvh": "./contact-bvh.js",
+    "./tsl": "./src/tsl.js"
+  },
+  "bin": {
+    "bake-sdf": "./bin/bake-sdf.mjs"
+  },
+  "files": [
+    "src/",
+    "bin/",
+    "tools/bake_sdf.cpp",
+    "contact-bvh.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "three": ">=0.170.0"
+  },
+  "scripts": {
+    "test": "node test/package.test.mjs"
+  }
+}
