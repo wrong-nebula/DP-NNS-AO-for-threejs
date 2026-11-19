@@ -390,12 +390,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = normalize(gn.xyz);
   let planeTol = 0.0025 * pd.w + 0.012;
 
+  // Roughness-guided spatial pre-filter with strict roughness edge-stopping
+  // (keeps mirror/brushed meridian seam razor sharp, makes brushed chrome velvety smooth!)
   let isSkipped = c0.w < -0.5;
   var spSum = select(c0, vec4<f32>(0.0), isSkipped);
   var spW = select(1.0, 0.0, isSkipped);
-  let spGain = smoothstep(0.06, 0.30, rough);
+  let spGain = smoothstep(0.08, 0.30, rough);
   if (spGain > 0.02 || isSkipped) {
-    let stepS = select(1, 2, rough > 0.26 && !isSkipped);
+    let stepS = select(1, 2, rough > 0.24 && !isSkipped);
     for (var dy = -1; dy <= 1; dy++) {
       for (var dx = -1; dx <= 1; dx++) {
         if (dx == 0 && dy == 0) { continue; }
@@ -404,11 +406,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let npd = textureLoad(curPosDepth, nq, 0);
         let ngn = textureLoad(curNormal, nq, 0);
         if (npd.w <= 0.0 || ngn.w < 0.5) { continue; }
-        if (dot(normalize(ngn.xyz), n) < 0.88) { continue; }
-        if (abs(dot(n, npd.xyz - p)) > planeTol * f32(stepS)) { continue; }
+        if (dot(normalize(ngn.xyz), n) < 0.85) { continue; }
+        if (abs(dot(n, npd.xyz - p)) > planeTol * f32(stepS) * 1.5) { continue; }
+        let nar = textureLoad(gAlbedoRough, nq, 0);
+        if (abs(nar.a - rough) > 0.12) { continue; }
         let nr = textureLoad(curRefl, nq, 0);
         if (nr.w < -0.5) { continue; }
-        let w = select(0.35, 0.65, dx == 0 || dy == 0) * max(spGain, select(0.0, 1.0, isSkipped));
+        let w = select(0.45, 0.75, dx == 0 || dy == 0) * max(spGain, select(0.0, 1.0, isSkipped));
         spSum += nr * w;
         spW += w;
       }
@@ -416,9 +420,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   let filtered = select(c0, spSum / spW, spW > 1e-4);
 
-  // Mirror chrome uses faster temporal alpha (0.35); rough chrome uses tighter EMA (0.08);
+  // Mirror chrome uses faster temporal alpha (0.35); rough chrome uses tighter EMA (0.07);
   // checkerboard-skipped pixels keep 95% temporal history for rock-solid zero-flicker stability!
-  let effAlpha = select(mix(max(u.params.z, 0.35), min(u.params.z, 0.08), spGain), 0.05, isSkipped);
+  let effAlpha = select(mix(max(u.params.z, 0.35), min(u.params.z, 0.07), spGain), 0.05, isSkipped);
 
   if (u.params.w < 0.5) {
     textureStore(outRefl, q, filtered);
@@ -448,8 +452,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ppd = textureLoad(prevPosDepth, pq, 0);
     let pgn = textureLoad(prevNormal, pq, 0);
     if (ppd.w <= 0.0 || pgn.w < 0.5) { continue; }
-    if (dot(normalize(pgn.xyz), n) < 0.92) { continue; }
+    if (dot(normalize(pgn.xyz), n) < 0.90) { continue; }
     if (abs(dot(n, ppd.xyz - p)) > planeTol) { continue; }
+    // Also reject across smooth/rough meridian seam
+    let par = textureLoad(gAlbedoRough, pq, 0);
+    if (abs(par.a - rough) > 0.14) { continue; }
     acc += textureLoad(prevRefl, pq, 0) * bw;
     wSum += bw;
   }

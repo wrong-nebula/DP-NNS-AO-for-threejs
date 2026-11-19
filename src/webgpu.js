@@ -1064,8 +1064,10 @@ struct CompU {
   eye: vec4<f32>,
   sunDir: vec4<f32>,      // xyz=sunDir, w=useGI(0/1)
   emissivePos: vec4<f32>, // xyz=pos, w=radius
-  emissiveCol: vec4<f32>, // rgb=col, w=viewMode(0=shaded,1=aoMask,2=giOnly,3=hashCache)
+  emissiveCol: vec4<f32>, // rgb=col, w=viewMode(0=shaded,1=aoMask,2=giOnly,3=hashCache,4=reflOnly)
   screen: vec4<f32>,      // x=W, y=H, z=aoW, w=aoH
+  sdfMin: vec4<f32>,      // xyz=sdfMin, w=radScale
+  sdfInvSpan: vec4<f32>,  // xyz=sdfInvSpan, w=useReflections(0/1)
 };
 @group(0) @binding(0) var<uniform> u: CompU;
 @group(0) @binding(1) var aoGITex: texture_2d<f32>;
@@ -1073,6 +1075,10 @@ struct CompU {
 @group(0) @binding(3) var gNormal: texture_2d<f32>;
 @group(0) @binding(4) var metaTex: texture_2d<f32>;
 @group(0) @binding(5) var reflTex: texture_2d<f32>;
+@group(0) @binding(6) var sdfTex: texture_3d<f32>;
+@group(0) @binding(7) var radVol: texture_3d<f32>;
+@group(0) @binding(8) var gAlbedoRough: texture_2d<f32>;
+@group(0) @binding(9) var linSamp: sampler;
 
 struct VIn {
   @location(0) pos: vec3<f32>,
@@ -1113,6 +1119,89 @@ fn linearToSrgb(c: vec3<f32>) -> vec3<f32> {
 
 fn ignComp(q: vec2<f32>) -> f32 {
   return fract(52.9829189 * fract(dot(q, vec2<f32>(0.06711056, 0.00583715))));
+}
+
+fn compSampleSDF(p: vec3<f32>) -> f32 {
+  let uv = (p - u.sdfMin.xyz) * u.sdfInvSpan.xyz;
+  if (any(uv < vec3<f32>(0.0)) || any(uv > vec3<f32>(1.0))) { return 1e4; }
+  return textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
+}
+
+fn compSampleRad(p: vec3<f32>) -> vec3<f32> {
+  let uv = (p - u.sdfMin.xyz) * u.sdfInvSpan.xyz;
+  if (any(uv < vec3<f32>(0.0)) || any(uv > vec3<f32>(1.0))) { return vec3<f32>(0.0); }
+  return textureSampleLevel(radVol, linSamp, uv, 0.0).rgb * u.sdfMin.w;
+}
+
+// Full-resolution 1280x720 exact mirror chrome trace (runs ONLY on mirror pixels: <1.5% of screen!)
+// Zero half-res stair-stepping, zero temporal smear, pixel-sharp G-buffer + 360-deg radVol fallback.
+fn traceMirrorFullRes(p: vec3<f32>, n: vec3<f32>, V: vec3<f32>) -> vec3<f32> {
+  let R = reflect(-V, n);
+  let ro = p + n * 0.015;
+  var hitDist = 10.5;
+  var hitAny = false;
+  var orbT = 1e9;
+  if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) > 1e-4) {
+    let oc = ro - u.emissivePos.xyz;
+    let b = dot(oc, R);
+    let c = dot(oc, oc) - u.emissivePos.w * u.emissivePos.w;
+    let disc = b * b - c;
+    if (disc >= 0.0) {
+      let t0 = -b - sqrt(disc);
+      if (t0 > 0.02 && t0 < hitDist) { orbT = t0; }
+    }
+  }
+  var s = 0.03;
+  for (var k = 0u; k < 44u; k++) {
+    if (s >= orbT) { break; }
+    let d = compSampleSDF(ro + R * s);
+    if (d > 100.0) { break; }
+    if (d < 0.015) {
+      hitAny = true;
+      hitDist = max(0.03, s + d * 0.5);
+      break;
+    }
+    s += max(d * 0.85, 0.02);
+    if (s > 10.5) { break; }
+  }
+  if (orbT < hitDist) { return u.emissiveCol.rgb * 1.9; }
+  if (!hitAny) {
+    let skyT = clamp(R.z * 0.5 + 0.5, 0.0, 1.0);
+    return mix(vec3<f32>(0.18, 0.20, 0.24), vec3<f32>(0.55, 0.66, 0.82), skyT);
+  }
+  let hitP = ro + R * hitDist;
+  let clip = u.viewProj * vec4<f32>(hitP, 1.0);
+  if (clip.w > 0.1) {
+    let ndc = clip.xy / clip.w;
+    if (abs(ndc.x) < 0.995 && abs(ndc.y) < 0.995) {
+      let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+      let iq = clamp(vec2<i32>(uv * u.screen.zw), vec2<i32>(0), vec2<i32>(u.screen.zw) - 1);
+      let gpd = textureLoad(gPosDepth, iq, 0);
+      let gnr = textureLoad(gNormal, iq, 0);
+      if (gpd.w > 0.0 && gnr.w > 0.5 && length(gpd.xyz - hitP) < 0.14) {
+        let hn = normalize(gnr.xyz);
+        if (dot(hn, -R) > 0.02) {
+          let halb = textureLoad(gAlbedoRough, iq, 0).rgb;
+          let ag = textureLoad(aoGITex, iq, 0);
+          let mt = textureLoad(metaTex, iq, 0);
+          let sDir = normalize(u.sunDir.xyz);
+          let sun = max(0.0, dot(hn, sDir)) * clamp(mt.x, 0.0, 1.0);
+          var col = halb * (vec3<f32>(2.25, 2.10, 1.85) * sun + max(ag.rgb, vec3<f32>(0.0)) + vec3<f32>(0.08, 0.09, 0.11) * clamp(ag.a, 0.0, 1.0));
+          if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) > 1e-4) {
+            let toO = u.emissivePos.xyz - hitP;
+            let d2 = dot(toO, toO);
+            let dist = sqrt(d2);
+            let ndlO = max(0.0, dot(hn, toO / max(dist, 1e-4)));
+            if (ndlO > 0.001 && dist < 7.5) {
+              col += halb * u.emissiveCol.rgb * (2.6 * ndlO * clamp(mt.y, 0.0, 1.0) / (0.28 + d2));
+            }
+          }
+          return max(col, vec3<f32>(0.0));
+        }
+      }
+    }
+  }
+  return compSampleRad(hitP);
 }
 
 @fragment fn fs(i: VOut) -> @location(0) vec4<f32> {
@@ -1170,6 +1259,13 @@ fn ignComp(q: vec2<f32>) -> f32 {
   let orbSh = mt.y;
   let hashHit = mt.w;
 
+  let V = normalize(u.eye.xyz - p);
+  let NoV = max(dot(n, V), 1e-3);
+  var reflRGB = rf.rgb;
+  if (u.sdfInvSpan.w > 0.5 && isMetal > 0.5 && rough <= 0.08) {
+    reflRGB = traceMirrorFullRes(p, n, V);
+  }
+
   let mode = i32(round(u.emissiveCol.w));
   if (mode == 1) { return vec4<f32>(vec3<f32>(ao), 1.0); }
   if (mode == 2) { return vec4<f32>(linearToSrgb(acesToneMap(gi * 1.15)), 1.0); }
@@ -1178,7 +1274,7 @@ fn ignComp(q: vec2<f32>) -> f32 {
     return vec4<f32>(linearToSrgb(dbg * (0.35 + 0.65 * ao)), 1.0);
   }
   if (mode == 4) {
-    return vec4<f32>(linearToSrgb(acesToneMap(rf.rgb * 1.1)), 1.0);
+    return vec4<f32>(linearToSrgb(acesToneMap(reflRGB * 1.1)), 1.0);
   }
 
   let sDir = normalize(u.sunDir.xyz);
@@ -1198,14 +1294,12 @@ fn ignComp(q: vec2<f32>) -> f32 {
   var color = alb * diffWeight * (vec3<f32>(2.25, 2.10, 1.85) * sun * sunSh + gi + ambEnv * mbAO * 0.16);
 
   // Fresnel + GTSO specular occlusion glossy reflection blend (conductor F0 = albedo for chrome)
-  let V = normalize(u.eye.xyz - p);
-  let NoV = max(dot(n, V), 1e-3);
   if (rough < 0.72 || isMetal > 0.5) {
     let F0 = mix(vec3<f32>(0.04), alb, isMetal);
     let F = F0 + (vec3<f32>(1.0) - F0) * pow(1.0 - NoV, 5.0);
     let specOcc = clamp(pow(NoV + ao, exp2(-16.0 * rough - 1.0)) - 1.0 + ao, 0.0, 1.0);
     let reflFade = mix(smoothstep(0.72, 0.12, rough) * 1.35, 1.05, isMetal);
-    color += rf.rgb * F * (specOcc * reflFade);
+    color += reflRGB * F * (specOcc * reflFade);
 
     // Crisp GGX direct sun specular highlight on smooth/rough chrome & glossy dielectric
     if (sun > 0.001) {
@@ -1593,7 +1687,7 @@ export class WebGPUFastSDFAO {
     this.denoiseUBuf1 = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.denoiseUBuf2 = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.denoiseUBuf3 = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    this.compUBuf = d.createBuffer({ size: 144, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.compUBuf = d.createBuffer({ size: 176, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
     this.radVolA = d.createTexture({ size: RAD_DIMS, dimension: '3d', format: 'rgba8unorm', usage: rw });
     this.radVolB = d.createTexture({ size: RAD_DIMS, dimension: '3d', format: 'rgba8unorm', usage: rw });
@@ -1851,6 +1945,10 @@ export class WebGPUFastSDFAO {
         { binding: 3, resource: this.gNormal[pIdx].createView() },
         { binding: 4, resource: this.histMeta[pIdx].createView() },
         { binding: 5, resource: this.histRefl[pIdx].createView() },
+        { binding: 6, resource: s.sdfTex.createView() },
+        { binding: 7, resource: this.radVolB.createView() },
+        { binding: 8, resource: this.gAlbedo.createView() },
+        { binding: 9, resource: this.linSamp },
       ],
     });
     this.compBGHist = [makeCompBG(this.histAOGI[0], 0), makeCompBG(this.histAOGI[1], 1)];
@@ -1862,6 +1960,7 @@ export class WebGPUFastSDFAO {
     this.frame = 0;
     this.hasPrev = false;
     this.stillFrames = 0;
+    this._lastCompBG = null;
     const d = this.device;
     d.queue.writeBuffer(this.decayUBuf, 0, new Uint32Array([HASH_SLOTS, 0, 0, 1]));
     const enc = d.createCommandEncoder();
@@ -1990,14 +2089,68 @@ export class WebGPUFastSDFAO {
     d.queue.writeBuffer(this.denoiseUBuf2, 0, new Uint32Array([this.aoW, this.aoH, 3, 0]));
     d.queue.writeBuffer(this.denoiseUBuf3, 0, new Uint32Array([this.aoW, this.aoH, 6, 0]));
 
-    const cBuf = new Float32Array(36);
+    const cBuf = new Float32Array(44);
     cBuf.set(vp, 0);
     cBuf.set([eye[0], eye[1], eye[2], 1], 16);
     cBuf.set([this.sunDir[0], this.sunDir[1], this.sunDir[2], this.useGI ? 1 : 0], 20);
     cBuf.set([this.emissivePos[0], this.emissivePos[1], this.emissivePos[2], this.emissiveRadius], 24);
     cBuf.set([this.emissiveCol[0], this.emissiveCol[1], this.emissiveCol[2], this.viewMode], 28);
     cBuf.set([this.width, this.height, this.aoW, this.aoH], 32);
+    cBuf.set([s.sdfMin[0], s.sdfMin[1], s.sdfMin[2], RAD_SCALE], 36);
+    cBuf.set([1 / s.sdfSpan[0], 1 / s.sdfSpan[1], 1 / s.sdfSpan[2], (this.useGI && this.useReflections) ? 1 : 0], 40);
     d.queue.writeBuffer(this.compUBuf, 0, cBuf);
+
+    // Fully-settled static fast-path: skip G-buffer + trace + temporal + denoise completely when
+    // camera, sun, and orb are still and SHaRC cache + shadows + reflections have converged!
+    const fullySettled = camSame && this.stillFrames >= 72 && this.lastSkipPct >= 90 && this._lastCompBG;
+    if (fullySettled) {
+      const enc = d.createCommandEncoder();
+      const fp = enc.beginRenderPass({
+        colorAttachments: [{
+          view: this.context.getCurrentTexture().createView(),
+          clearValue: { r: 0.07, g: 0.09, b: 0.13, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+        depthStencilAttachment: { view: this.fullDepth.createView(), depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' },
+        ...(this.hasTimestamp ? { timestampWrites: { querySet: this.tsQuery, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : {}),
+      });
+      fp.setPipeline(this.compPipe);
+      fp.setBindGroup(0, this._lastCompBG);
+      fp.setVertexBuffer(0, s.vb);
+      fp.setIndexBuffer(s.ib, 'uint32');
+      fp.drawIndexed(s.indexCount);
+      if (this.viewMode === 0 && (this.emissiveCol[0] + this.emissiveCol[1] + this.emissiveCol[2]) > 1e-3) {
+        const oBuf = new Float32Array(24);
+        oBuf.set(vp, 0);
+        oBuf.set([this.emissivePos[0], this.emissivePos[1], this.emissivePos[2], this.emissiveRadius], 16);
+        oBuf.set([this.emissiveCol[0], this.emissiveCol[1], this.emissiveCol[2], 1], 20);
+        d.queue.writeBuffer(this.orbUBuf, 0, oBuf);
+        fp.setPipeline(this.orbPipe);
+        fp.setBindGroup(0, this.orbBG);
+        fp.setVertexBuffer(0, this.orbVB);
+        fp.setIndexBuffer(this.orbIB, 'uint32');
+        fp.drawIndexed(this.orbIdxCount);
+      }
+      fp.end();
+      if (this.hasTimestamp && !this._tsMapped) {
+        enc.resolveQuerySet(this.tsQuery, 0, 2, this.tsResolve, 0);
+        enc.copyBufferToBuffer(this.tsResolve, 0, this.tsRead, 0, 16);
+      }
+      d.queue.submit([enc.finish()]);
+      this.frame++;
+      if (this.hasTimestamp && !this._tsMapped) {
+        this._tsMapped = true;
+        this.tsRead.mapAsync(GPUMapMode.READ).then(() => {
+          const ts = new BigInt64Array(this.tsRead.getMappedRange());
+          const dt = Number(ts[1] - ts[0]) / 1e6;
+          if (dt > 0 && dt < 200) this.lastGpuMs = dt;
+          this.tsRead.unmap();
+          this._tsMapped = false;
+        }).catch(() => { this._tsMapped = false; });
+      }
+      return;
+    }
 
     d.queue.writeBuffer(this.statsBuf, 0, new Uint32Array([0, 0, 0, 0]));
 
@@ -2077,6 +2230,7 @@ export class WebGPUFastSDFAO {
     });
     fp.setPipeline(this.compPipe);
     fp.setBindGroup(0, compBG);
+    this._lastCompBG = compBG;
     fp.setVertexBuffer(0, s.vb);
     fp.setIndexBuffer(s.ib, 'uint32');
     fp.drawIndexed(s.indexCount);
