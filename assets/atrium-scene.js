@@ -317,7 +317,7 @@ class MeshBuilder {
     }
     for (let i = 0; i < uSegs; i++) {
       for (let j = 0; j < vSegs; j++) {
-        this.addQuad(grid[i][j], grid[i + 1][j], grid[i + 1][j + 1], grid[i][j + 1]);
+        this.addQuad(grid[i][j], grid[i][j + 1], grid[i + 1][j + 1], grid[i + 1][j]);
       }
     }
     if (!closedLoop) {
