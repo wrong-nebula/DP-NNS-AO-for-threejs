@@ -506,7 +506,7 @@ fn sdfSunShadow(pos: vec3<f32>, nor: vec3<f32>, sDir: vec3<f32>) -> f32 {
   let ro = pos + nor * 0.03 + sDir * 0.02;
   var t = 0.02;
   var res = 1.0;
-  let steps = u.extra.x;
+  let steps = max(u.extra.x, 72u);
   for (var s = 0u; s < steps; s++) {
     let d = sampleSDF(ro + sDir * t);
     if (d > 100.0) { break; }
@@ -515,8 +515,7 @@ fn sdfSunShadow(pos: vec3<f32>, nor: vec3<f32>, sDir: vec3<f32>) -> f32 {
     if (dc <= 0.0) { return 0.0; }
     res = min(res, 8.0 * dc / t);
     if (res < 0.005) { return 0.0; }
-    let k = mix(0.4, 0.8, smoothstep(0.40, 0.85, d));
-    t += max(d * k, 0.014);
+    t += max(d * 0.4, 0.012);
     if (t > 10.5) { break; }
   }
   res = clamp(res, 0.0, 1.0);
@@ -1068,6 +1067,10 @@ fn linearToSrgb(c: vec3<f32>) -> vec3<f32> {
   return select(lo, hi, c >= vec3<f32>(0.0031308));
 }
 
+fn ignComp(q: vec2<f32>) -> f32 {
+  return fract(52.9829189 * fract(dot(q, vec2<f32>(0.06711056, 0.00583715))));
+}
+
 @fragment fn fs(i: VOut) -> @location(0) vec4<f32> {
   let p = i.wPos;
   let n = normalize(i.wNor);
@@ -1150,9 +1153,59 @@ fn linearToSrgb(c: vec3<f32>) -> vec3<f32> {
       color += alb * u.emissiveCol.rgb * (2.6 * att * ndlO * orbSh);
     }
   }
-  return vec4<f32>(linearToSrgb(acesToneMap(color * 0.88)), 1.0);
+  let srgb = linearToSrgb(acesToneMap(color * 0.88)) + (ignComp(i.clip.xy) - 0.5) / 255.0;
+  return vec4<f32>(clamp(srgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 `;
+
+const ORB_WGSL = /* wgsl */`
+struct OrbU {
+  viewProj: mat4x4<f32>,
+  posRad: vec4<f32>, // xyz=pos, w=radius
+  col: vec4<f32>,    // rgb=emissiveColor
+};
+@group(0) @binding(0) var<uniform> u: OrbU;
+
+struct VOut {
+  @builtin(position) clip: vec4<f32>,
+  @location(0) nor: vec3<f32>,
+};
+@vertex fn vs(@location(0) p: vec3<f32>) -> VOut {
+  var o: VOut;
+  let wp = u.posRad.xyz + p * u.posRad.w;
+  o.clip = u.viewProj * vec4<f32>(wp, 1.0);
+  o.nor = p;
+  return o;
+}
+@fragment fn fs(i: VOut) -> @location(0) vec4<f32> {
+  let glow = u.col.rgb * 1.1 + vec3<f32>(0.45);
+  let mapped = clamp((glow * (2.51 * glow + 0.03)) / (glow * (2.43 * glow + 0.59) + 0.14), vec3<f32>(0.0), vec3<f32>(1.0));
+  let lo = 12.92 * mapped;
+  let hi = 1.055 * pow(max(mapped, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055;
+  return vec4<f32>(select(lo, hi, mapped >= vec3<f32>(0.0031308)), 1.0);
+}
+`;
+
+function makeUnitSphereMesh(uSegs = 20, vSegs = 14) {
+  const pos = [], idx = [];
+  for (let j = 0; j <= vSegs; j++) {
+    const phi = (j / vSegs) * Math.PI;
+    const sp = Math.sin(phi), cp = Math.cos(phi);
+    for (let i = 0; i <= uSegs; i++) {
+      const th = (i / uSegs) * Math.PI * 2;
+      pos.push(sp * Math.cos(th), sp * Math.sin(th), cp);
+    }
+  }
+  const stride = uSegs + 1;
+  for (let j = 0; j < vSegs; j++) {
+    for (let i = 0; i < uSegs; i++) {
+      const a = j * stride + i, b = a + 1, c = a + stride, d = c + 1;
+      if (j > 0) idx.push(a, c, b);
+      if (j < vSegs - 1) idx.push(b, c, d);
+    }
+  }
+  return { pos: new Float32Array(pos), idx: new Uint32Array(idx) };
+}
 
 // Minimal CPU triangle splatting into 64x64x40 albedo + normal (with 1-voxel dilation offset code in normal.a)
 function buildStaticVoxelAttributes(positions, normals, colors, indices, sdfMin, sdfSpan, dims = RAD_DIMS) {
@@ -1393,6 +1446,23 @@ export class WebGPUFastSDFAO {
       primitive: { topology: 'triangle-list', cullMode: 'back' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
     });
+
+    const orbMod = d.createShaderModule({ code: ORB_WGSL });
+    this.orbPipe = d.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module: orbMod, entryPoint: 'vs', buffers: [{ arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] }] },
+      fragment: { module: orbMod, entryPoint: 'fs', targets: [{ format: this.format }] },
+      primitive: { topology: 'triangle-list', cullMode: 'back' },
+      depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+    });
+    const sph = makeUnitSphereMesh(20, 14);
+    this.orbVB = d.createBuffer({ size: sph.pos.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    d.queue.writeBuffer(this.orbVB, 0, sph.pos);
+    this.orbIB = d.createBuffer({ size: sph.idx.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+    d.queue.writeBuffer(this.orbIB, 0, sph.idx);
+    this.orbIdxCount = sph.idx.length;
+    this.orbUBuf = d.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.orbBG = d.createBindGroup({ layout: this.orbPipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: this.orbUBuf } }] });
 
     this.linSamp = d.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge' });
   }
@@ -1800,6 +1870,18 @@ export class WebGPUFastSDFAO {
     fp.setVertexBuffer(0, s.vb);
     fp.setIndexBuffer(s.ib, 'uint32');
     fp.drawIndexed(s.indexCount);
+    if (this.viewMode === 0 && (this.emissiveCol[0] + this.emissiveCol[1] + this.emissiveCol[2]) > 1e-3) {
+      const oBuf = new Float32Array(24);
+      oBuf.set(vp, 0);
+      oBuf.set([this.emissivePos[0], this.emissivePos[1], this.emissivePos[2], this.emissiveRadius], 16);
+      oBuf.set([this.emissiveCol[0], this.emissiveCol[1], this.emissiveCol[2], 1], 20);
+      d.queue.writeBuffer(this.orbUBuf, 0, oBuf);
+      fp.setPipeline(this.orbPipe);
+      fp.setBindGroup(0, this.orbBG);
+      fp.setVertexBuffer(0, this.orbVB);
+      fp.setIndexBuffer(this.orbIB, 'uint32');
+      fp.drawIndexed(this.orbIdxCount);
+    }
     fp.end();
 
     this.prevVP.set(vp);
