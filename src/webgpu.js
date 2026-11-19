@@ -3,7 +3,13 @@
 // - 8x8 Workgroup Shared-Memory 2x2 Occlusion-Point Reuse (Jin et al. 2026)
 // - SHaRC World-Space Spatial Hash Cache (262,144 atomic slots caching AO + Multi-Bounce GI, LRU eviction, converged-cell skip)
 // - WGSL Compute GPU 64x64x40 Radiance Grid Relight + 2-Bounce Propagation + Floating Emissive Orb
-// - 2-Pass Compute Edge-Preserving Hit-Distance-Guided A-Trous Denoiser + Full-Res Tangent-Plane Composite
+// - Real-Time Glossy / Rough SDF Specular Reflections (GGX BVH2 -> SDF -> radVol + direct Emissive Orb hit)
+// - Live In-Browser WebGPU Compute Exact-BVH SDF Baker (pack2x16float -> r16float 3D texture)
+
+import { bakeSDFOnGPU } from './webgpu-bake.js';
+import { REFL_TRACE_WGSL, REFL_FILTER_WGSL } from './webgpu-refl.js';
+
+export { bakeSDFOnGPU };
 
 export const WEBGPU_QUALITY_PRESETS = {
   low:    { label: 'Performance (Low)', rays: 1, maxSamples: 48,  denoisePasses: 2, giMaxDist: 6.5, shadowSteps: 32, multiBounce: false },
@@ -27,13 +33,13 @@ struct CamU {
 struct VIn {
   @location(0) pos: vec3<f32>,
   @location(1) nor: vec3<f32>,
-  @location(2) col: vec3<f32>,
+  @location(2) colRough: vec4<f32>,
 };
 struct VOut {
   @builtin(position) clip: vec4<f32>,
   @location(0) wPos: vec3<f32>,
   @location(1) wNor: vec3<f32>,
-  @location(2) col: vec3<f32>,
+  @location(2) colRough: vec4<f32>,
   @location(3) viewZ: f32,
 };
 @vertex fn vs(v: VIn) -> VOut {
@@ -42,7 +48,7 @@ struct VOut {
   o.clip = cam.viewProj * wp;
   o.wPos = v.pos;
   o.wNor = v.nor;
-  o.col = v.col;
+  o.colRough = v.colRough;
   o.viewZ = -(cam.view * wp).z;
   return o;
 }
@@ -55,7 +61,7 @@ struct GOut {
   var o: GOut;
   o.posDepth = vec4<f32>(i.wPos, i.viewZ);
   o.normal = vec4<f32>(normalize(i.wNor), 1.0);
-  o.albedo = vec4<f32>(i.col, 1.0);
+  o.albedo = i.colRough;
   return o;
 }
 `;
@@ -1029,24 +1035,25 @@ struct CompU {
 @group(0) @binding(2) var gPosDepth: texture_2d<f32>;
 @group(0) @binding(3) var gNormal: texture_2d<f32>;
 @group(0) @binding(4) var metaTex: texture_2d<f32>;
+@group(0) @binding(5) var reflTex: texture_2d<f32>;
 
 struct VIn {
   @location(0) pos: vec3<f32>,
   @location(1) nor: vec3<f32>,
-  @location(2) col: vec3<f32>,
+  @location(2) colRough: vec4<f32>,
 };
 struct VOut {
   @builtin(position) clip: vec4<f32>,
   @location(0) wPos: vec3<f32>,
   @location(1) wNor: vec3<f32>,
-  @location(2) col: vec3<f32>,
+  @location(2) colRough: vec4<f32>,
 };
 @vertex fn vs(v: VIn) -> VOut {
   var o: VOut;
   o.clip = u.viewProj * vec4<f32>(v.pos, 1.0);
   o.wPos = v.pos;
   o.wNor = v.nor;
-  o.col = v.col;
+  o.colRough = v.colRough;
   return o;
 }
 
@@ -1074,7 +1081,8 @@ fn ignComp(q: vec2<f32>) -> f32 {
 @fragment fn fs(i: VOut) -> @location(0) vec4<f32> {
   let p = i.wPos;
   let n = normalize(i.wNor);
-  let alb = i.col;
+  let alb = i.colRough.rgb;
+  let rough = clamp(i.colRough.a, 0.05, 1.0);
   let aoRes = u.screen.zw;
   let f = i.clip.xy * (aoRes / u.screen.xy) - 0.5;
   let i0 = vec2<i32>(floor(f));
@@ -1086,9 +1094,11 @@ fn ignComp(q: vec2<f32>) -> f32 {
 
   var agSum = vec4<f32>(0.0);
   var mSum = vec4<f32>(0.0);
+  var rSum = vec4<f32>(0.0);
   var wSum = 0.0;
   var bestAG = vec4<f32>(0.0, 0.0, 0.0, 1.0);
   var bestM = vec4<f32>(1.0, 1.0, 1.0, 0.0);
+  var bestR = vec4<f32>(0.0);
   var bestScore = 1e9;
 
   for (var k = 0; k < 4; k++) {
@@ -1103,16 +1113,19 @@ fn ignComp(q: vec2<f32>) -> f32 {
     let pDist = abs(dot(n, pd.xyz - p));
     let ag = textureLoad(aoGITex, q, 0);
     let mt = textureLoad(metaTex, q, 0);
+    let rf = textureLoad(reflTex, q, 0);
     let score = pDist + (1.0 - max(dn, 0.0)) * 0.5;
-    if (score < bestScore) { bestScore = score; bestAG = ag; bestM = mt; }
+    if (score < bestScore) { bestScore = score; bestAG = ag; bestM = mt; bestR = rf; }
     if (dn >= 0.88 && pDist <= planeTol) {
       agSum += ag * bw;
       mSum += mt * bw;
+      rSum += rf * bw;
       wSum += bw;
     }
   }
   let ag = select(bestAG, agSum / wSum, wSum > 0.01);
   let mt = select(bestM, mSum / wSum, wSum > 0.01);
+  let rf = select(bestR, rSum / wSum, wSum > 0.01);
   let gi = ag.rgb;
   let ao = clamp(ag.a, 0.0, 1.0);
   let sunSh = mt.x;
@@ -1126,6 +1139,9 @@ fn ignComp(q: vec2<f32>) -> f32 {
     let dbg = mix(vec3<f32>(0.90, 0.20, 0.65), vec3<f32>(0.12, 0.85, 0.52), hashHit);
     return vec4<f32>(linearToSrgb(dbg * (0.35 + 0.65 * ao)), 1.0);
   }
+  if (mode == 4) {
+    return vec4<f32>(linearToSrgb(acesToneMap(rf.rgb * 1.1)), 1.0);
+  }
 
   let sDir = normalize(u.sunDir.xyz);
   let sun = max(0.0, dot(n, sDir));
@@ -1135,12 +1151,22 @@ fn ignComp(q: vec2<f32>) -> f32 {
     return vec4<f32>(pow(max(col, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)), 1.0);
   }
 
-  // PBR + Multi-Bounce GI + Dynamic Emissive Orb
+  // PBR + Multi-Bounce GI + Real-Time Glossy SDF Reflections + Dynamic Emissive Orb
   let mbAO = multiBounceAO(ao, alb);
   let skyCol = vec3<f32>(0.68, 0.79, 0.96);
   let gndCol = vec3<f32>(0.30, 0.27, 0.24);
   let ambEnv = mix(gndCol, skyCol, n.z * 0.5 + 0.5);
   var color = alb * (vec3<f32>(2.25, 2.10, 1.85) * sun * sunSh + gi + ambEnv * mbAO * 0.16);
+
+  // Fresnel + GTSO specular occlusion glossy reflection blend
+  if (rough < 0.72) {
+    let V = normalize(u.eye.xyz - p);
+    let NoV = max(dot(n, V), 1e-3);
+    let F = 0.04 + 0.96 * pow(1.0 - NoV, 5.0);
+    let specOcc = clamp(pow(NoV + ao, exp2(-16.0 * rough - 1.0)) - 1.0 + ao, 0.0, 1.0);
+    let reflFade = smoothstep(0.72, 0.12, rough);
+    color += rf.rgb * (F * specOcc * reflFade * 1.35);
+  }
 
   if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) > 1e-4) {
     let toO = u.emissivePos.xyz - p;
@@ -1364,7 +1390,8 @@ export class WebGPUFastSDFAO {
     this.useGI = true;
     this.useHash = true;
     this.reuseEnabled = true;
-    this.viewMode = 0; // 0=shaded, 1=aoMask, 2=giOnly, 3=hashCache
+    this.useReflections = true;
+    this.viewMode = 0; // 0=shaded, 1=aoMask, 2=giOnly, 3=hashCache, 4=reflectionsOnly
     this.frame = 0;
     this.sunDir = [0.35, -0.25, 0.90];
     this.emissivePos = [1.2, 1.0, 1.8];
@@ -1401,11 +1428,11 @@ export class WebGPUFastSDFAO {
   _initPipelines() {
     const d = this.device;
     const vLayout = {
-      arrayStride: 36,
+      arrayStride: 40,
       attributes: [
         { shaderLocation: 0, offset: 0, format: 'float32x3' },
         { shaderLocation: 1, offset: 12, format: 'float32x3' },
-        { shaderLocation: 2, offset: 24, format: 'float32x3' },
+        { shaderLocation: 2, offset: 24, format: 'float32x4' },
       ],
     };
 
@@ -1437,6 +1464,12 @@ export class WebGPUFastSDFAO {
 
     const dnMod = d.createShaderModule({ code: DENOISE_WGSL });
     this.denoisePipe = d.createComputePipeline({ layout: 'auto', compute: { module: dnMod, entryPoint: 'main' } });
+
+    const rTrMod = d.createShaderModule({ code: REFL_TRACE_WGSL });
+    this.reflTracePipe = d.createComputePipeline({ layout: 'auto', compute: { module: rTrMod, entryPoint: 'main' } });
+
+    const rFlMod = d.createShaderModule({ code: REFL_FILTER_WGSL });
+    this.reflFiltPipe = d.createComputePipeline({ layout: 'auto', compute: { module: rFlMod, entryPoint: 'main' } });
 
     const cpMod = d.createShaderModule({ code: COMPOSITE_WGSL });
     this.compPipe = d.createRenderPipeline({
@@ -1481,6 +1514,8 @@ export class WebGPUFastSDFAO {
 
     this.rawAOGI   = mkTex(this.aoW, this.aoH, 'rgba16float', rw);
     this.histAOGI  = [mkTex(this.aoW, this.aoH, 'rgba16float', rw), mkTex(this.aoW, this.aoH, 'rgba16float', rw)];
+    this.rawRefl   = mkTex(this.aoW, this.aoH, 'rgba16float', rw);
+    this.histRefl  = [mkTex(this.aoW, this.aoH, 'rgba16float', rw), mkTex(this.aoW, this.aoH, 'rgba16float', rw)];
     this.denoiseA  = mkTex(this.aoW, this.aoH, 'rgba16float', rw);
     this.denoiseB  = mkTex(this.aoW, this.aoH, 'rgba16float', rw);
     this.metaTex   = mkTex(this.aoW, this.aoH, 'rgba16float', rw);
@@ -1496,6 +1531,8 @@ export class WebGPUFastSDFAO {
     this.relightUBuf = d.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.decayUBuf = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.traceUBuf = d.createBuffer({ size: 192, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.reflUBuf = d.createBuffer({ size: 176, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.reflFiltUBuf = d.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.tempUBuf = d.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.denoiseUBuf1 = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.denoiseUBuf2 = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -1514,12 +1551,16 @@ export class WebGPUFastSDFAO {
     this._tsMapped = false;
   }
 
-  loadScene({ positions, normals, colors, indices, sdfHalf, sdfDims, sdfMin, sdfSpan, bvh, contactRange = 0.24, useGI = true }) {
+  async bakeSDF(globalBvh, opts) {
+    return bakeSDFOnGPU(this.device, globalBvh, opts);
+  }
+
+  loadScene({ positions, normals, colors, roughness = null, indices, sdfHalf = null, sdfTex: gpuSdfTex = null, sdfDims, sdfMin, sdfSpan, bvh, contactRange = 0.24, useGI = true }) {
     const d = this.device;
     if (this.sceneRes) {
       this.sceneRes.vb.destroy();
       this.sceneRes.ib.destroy();
-      this.sceneRes.sdfTex.destroy();
+      if (this.sceneRes.ownsSdfTex) this.sceneRes.sdfTex.destroy();
       this.sceneRes.albVol.destroy();
       this.sceneRes.norVol.destroy();
       this.sceneRes.bvhNodes.destroy();
@@ -1528,17 +1569,34 @@ export class WebGPUFastSDFAO {
     }
 
     const vCount = positions.length / 3;
-    const inter = new Float32Array(vCount * 9);
+    const inter = new Float32Array(vCount * 10);
     for (let i = 0; i < vCount; i++) {
-      inter[i * 9]     = positions[i * 3];
-      inter[i * 9 + 1] = positions[i * 3 + 1];
-      inter[i * 9 + 2] = positions[i * 3 + 2];
-      inter[i * 9 + 3] = normals[i * 3];
-      inter[i * 9 + 4] = normals[i * 3 + 1];
-      inter[i * 9 + 5] = normals[i * 3 + 2];
-      inter[i * 9 + 6] = colors[i * 3];
-      inter[i * 9 + 7] = colors[i * 3 + 1];
-      inter[i * 9 + 8] = colors[i * 3 + 2];
+      const px = positions[i * 3], py = positions[i * 3 + 1], pz = positions[i * 3 + 2];
+      const nx = normals[i * 3], ny = normals[i * 3 + 1], nz = normals[i * 3 + 2];
+      inter[i * 10]     = px;
+      inter[i * 10 + 1] = py;
+      inter[i * 10 + 2] = pz;
+      inter[i * 10 + 3] = nx;
+      inter[i * 10 + 4] = ny;
+      inter[i * 10 + 5] = nz;
+      inter[i * 10 + 6] = colors[i * 3];
+      inter[i * 10 + 7] = colors[i * 3 + 1];
+      inter[i * 10 + 8] = colors[i * 3 + 2];
+      // Default procedural PBR roughness if caller didn't pass per-vertex roughness:
+      // polished floors/pedestals/curved sculptures (0.14-0.24), matte walls (0.78).
+      let r = 0.45;
+      if (roughness) {
+        r = roughness[i];
+      } else if (pz < 0.02 && nz > 0.85) {
+        r = 0.16; // polished stone/marble floor
+      } else if (Math.abs(nz) < 0.15 && (Math.abs(px) > 3.2 || Math.abs(py) > 3.2)) {
+        r = 0.80; // matte room walls
+      } else if (pz < 2.2) {
+        r = 0.22; // polished pedestal & hero sculptures
+      } else {
+        r = 0.55;
+      }
+      inter[i * 10 + 9] = r;
     }
     const vb = d.createBuffer({ size: inter.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
     d.queue.writeBuffer(vb, 0, inter);
@@ -1546,10 +1604,15 @@ export class WebGPUFastSDFAO {
     const ib = d.createBuffer({ size: Math.ceil(idxArr.byteLength / 4) * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
     d.queue.writeBuffer(ib, 0, idxArr);
 
-    // Upload FP16 3D SDF texture
-    const [snx, sny, snz] = sdfDims;
-    const sdfTex = d.createTexture({ size: [snx, sny, snz], dimension: '3d', format: 'r16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-    d.queue.writeTexture({ texture: sdfTex }, sdfHalf, { bytesPerRow: snx * 2, rowsPerImage: sny }, [snx, sny, snz]);
+    // Use GPU-baked SDF texture directly if provided, else upload FP16 3D SDF texture
+    let sdfTex = gpuSdfTex;
+    let ownsSdfTex = false;
+    if (!sdfTex) {
+      const [snx, sny, snz] = sdfDims;
+      sdfTex = d.createTexture({ size: [snx, sny, snz], dimension: '3d', format: 'r16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      d.queue.writeTexture({ texture: sdfTex }, sdfHalf, { bytesPerRow: snx * 2, rowsPerImage: sny }, [snx, sny, snz]);
+      ownsSdfTex = true;
+    }
 
     // Build static 64x64x40 albedo + normal volumes for GPU relight
     const vox = buildStaticVoxelAttributes(positions, normals, colors, idxArr, sdfMin, sdfSpan, RAD_DIMS);
@@ -1578,7 +1641,7 @@ export class WebGPUFastSDFAO {
     const rootSpan = bvh.uniforms.contactRootSpan.value;
 
     this.sceneRes = {
-      vb, ib, indexCount: idxArr.length, sdfTex, albVol, norVol, bvhNodes, bvhTris, bvhGrid,
+      vb, ib, indexCount: idxArr.length, sdfTex, ownsSdfTex, albVol, norVol, bvhNodes, bvhTris, bvhGrid,
       sdfMin, sdfSpan, sdfDims, contactRange,
       gridMin: [gridMin.x, gridMin.y, gridMin.z],
       gridSize: bvh.uniforms.contactGridSize.value,
@@ -1680,6 +1743,44 @@ export class WebGPUFastSDFAO {
     this.denoiseBG2 = [makeDnBG(this.denoiseUBuf2, this.denoiseA, this.denoiseB, 0), makeDnBG(this.denoiseUBuf2, this.denoiseA, this.denoiseB, 1)];
     this.denoiseBG3 = [makeDnBG(this.denoiseUBuf3, this.denoiseB, this.denoiseA, 0), makeDnBG(this.denoiseUBuf3, this.denoiseB, this.denoiseA, 1)];
 
+    const makeReflTraceBG = (radView, pIdx) => d.createBindGroup({
+      layout: this.reflTracePipe.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.reflUBuf } },
+        { binding: 1, resource: this.gPosDepth[pIdx].createView() },
+        { binding: 2, resource: this.gNormal[pIdx].createView() },
+        { binding: 3, resource: this.gAlbedo.createView() },
+        { binding: 4, resource: s.sdfTex.createView() },
+        { binding: 5, resource: radView },
+        { binding: 6, resource: this.linSamp },
+        { binding: 7, resource: { buffer: s.bvhNodes } },
+        { binding: 8, resource: { buffer: s.bvhTris } },
+        { binding: 9, resource: { buffer: s.bvhGrid } },
+        { binding: 10, resource: this.rawRefl.createView() },
+      ],
+    });
+    this.reflTraceBG1B = [makeReflTraceBG(this.radVolA.createView(), 0), makeReflTraceBG(this.radVolA.createView(), 1)];
+    this.reflTraceBG2B = [makeReflTraceBG(this.radVolB.createView(), 0), makeReflTraceBG(this.radVolB.createView(), 1)];
+
+    const makeReflFiltBG = (curIdx) => {
+      const prevIdx = 1 - curIdx;
+      return d.createBindGroup({
+        layout: this.reflFiltPipe.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.reflFiltUBuf } },
+          { binding: 1, resource: this.rawRefl.createView() },
+          { binding: 2, resource: this.gPosDepth[curIdx].createView() },
+          { binding: 3, resource: this.gNormal[curIdx].createView() },
+          { binding: 4, resource: this.gAlbedo.createView() },
+          { binding: 5, resource: this.histRefl[prevIdx].createView() },
+          { binding: 6, resource: this.gPosDepth[prevIdx].createView() },
+          { binding: 7, resource: this.gNormal[prevIdx].createView() },
+          { binding: 8, resource: this.histRefl[curIdx].createView() },
+        ],
+      });
+    };
+    this.reflFiltBG = [makeReflFiltBG(0), makeReflFiltBG(1)];
+
     const makeCompBG = (tex, pIdx) => d.createBindGroup({
       layout: this.compPipe.getBindGroupLayout(0),
       entries: [
@@ -1688,6 +1789,7 @@ export class WebGPUFastSDFAO {
         { binding: 2, resource: this.gPosDepth[pIdx].createView() },
         { binding: 3, resource: this.gNormal[pIdx].createView() },
         { binding: 4, resource: this.metaTex.createView() },
+        { binding: 5, resource: this.histRefl[pIdx].createView() },
       ],
     });
     this.compBGHist = [makeCompBG(this.histAOGI[0], 0), makeCompBG(this.histAOGI[1], 1)];
@@ -1776,6 +1878,26 @@ export class WebGPUFastSDFAO {
     tf.set([s.rootSpan[0], s.rootSpan[1], s.rootSpan[2], 0], 44);
     d.queue.writeBuffer(this.traceUBuf, 0, tBuf);
 
+    const rBuf = new ArrayBuffer(176);
+    const rf = new Float32Array(rBuf), ru = new Uint32Array(rBuf);
+    rf.set([s.sdfMin[0], s.sdfMin[1], s.sdfMin[2], 0], 0);
+    rf.set([1 / s.sdfSpan[0], 1 / s.sdfSpan[1], 1 / s.sdfSpan[2], 0], 4);
+    rf.set([s.gridMin[0], s.gridMin[1], s.gridMin[2], s.gridSize], 8);
+    rf.set([s.gridDims[0], s.gridDims[1], s.gridDims[2], s.contactRange], 12);
+    rf.set([eye[0], eye[1], eye[2], this.frame], 16);
+    rf.set([this.emissivePos[0], this.emissivePos[1], this.emissivePos[2], this.emissiveRadius], 20);
+    rf.set([this.emissiveCol[0], this.emissiveCol[1], this.emissiveCol[2], RAD_SCALE], 24);
+    rf.set([this.aoW, this.aoH, 0.0005, 10.0], 28);
+    rf.set([s.rootMin[0], s.rootMin[1], s.rootMin[2], 0], 32);
+    rf.set([s.rootSpan[0], s.rootSpan[1], s.rootSpan[2], 0], 36);
+    ru.set([s.nodeCount, (this.useGI && this.useReflections) ? 1 : 0, 0, 0], 40);
+    d.queue.writeBuffer(this.reflUBuf, 0, rBuf);
+
+    const rfData = new Float32Array(20);
+    rfData.set(this.prevVP, 0);
+    rfData.set([this.aoW, this.aoH, this.frame < 4 ? (1 / (this.frame + 1)) : 0.12, this.hasPrev ? 1 : 0], 16);
+    d.queue.writeBuffer(this.reflFiltUBuf, 0, rfData);
+
     const curIdx = this.pingIdx;
     const tempData = new Float32Array(20);
     tempData.set(this.prevVP, 0);
@@ -1828,6 +1950,15 @@ export class WebGPUFastSDFAO {
     cp.setPipeline(this.tempPipe);
     cp.setBindGroup(0, this.tempBG[curIdx]);
     cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
+
+    if (this.useGI) {
+      cp.setPipeline(this.reflTracePipe);
+      cp.setBindGroup(0, (q.multiBounce ? this.reflTraceBG2B : this.reflTraceBG1B)[curIdx]);
+      cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
+      cp.setPipeline(this.reflFiltPipe);
+      cp.setBindGroup(0, this.reflFiltBG[curIdx]);
+      cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
+    }
 
     let compBG = this.compBGHist[curIdx];
     if (this.useGI) {

@@ -2,9 +2,14 @@
 
 **[Live WebGL2 Demo](https://wrong-nebula.github.io/Fast-SDF-AO/)** · **[Live WebGPU Compute Demo](https://wrong-nebula.github.io/Fast-SDF-AO/webgpu.html)** · Switch between **Archive (Boxes + 11 Movers)**, **Atrium (Curved Meshes)**, and **Gallery (GI)**, choose a **Quality** preset (**Performance (Low)**, **Balanced (Medium)**, **High (Default)**, **Ultra**), compare 7 AO modes, toggle **Diffuse GI**, **Multi-bounce GI**, **Emissive orb**, **GI bounce only**, **PBR + Multi-Bounce + Bent Normals**, **Hi-Z contact**, **Smooth falloff**, or **AO mask**, and drag the **Sun** angle slider in real time.
 
-### Unified WebGPU Compute Backend (`src/webgpu.js`, `webgpu.html`)
+### Unified WebGPU Compute Backend (`src/webgpu.js`, `src/webgpu-refl.js`, `src/webgpu-bake.js`, `webgpu.html`)
 
-Exported as `fast-sdf-ao/webgpu` and live at **[webgpu.html](https://wrong-nebula.github.io/Fast-SDF-AO/webgpu.html)**: native WGSL compute pipeline combining direct storage-buffer **Dual-Child Quantized SAH Contact BVH2**, `8×8` workgroup shared-memory **2×2 Occlusion-Point Reuse** (Jin et al. 2026), a `262,144`-slot atomic **SHaRC World-Space Spatial Hash Cache** (AO + multi-bounce RGB GI, LRU eviction, soft decay on sun/orb motion, **100% converged-cell ray skip**), WGSL compute **2-bounce GPU radiance relighting**, and a 2-pass compute à-trous denoiser (`benchmark/bench_webgpu_unified.py`, Apple M1 Metal-3, 1280×720):
+Exported as `fast-sdf-ao/webgpu` and live at **[webgpu.html](https://wrong-nebula.github.io/Fast-SDF-AO/webgpu.html)**: native WGSL compute pipeline combining:
+- Direct storage-buffer **Dual-Child Quantized SAH Contact BVH2** + 1-Lipschitz empty-sphere skip
+- `8×8` workgroup shared-memory **2×2 Occlusion-Point Reuse** (Jin et al. 2026)
+- `262,144`-slot atomic **SHaRC World-Space Spatial Hash Cache** (AO + multi-bounce RGB GI, **100% converged-cell skip** on camera cuts) + hybrid screen-space temporal EMA & 3-pass hit-distance-guided à-trous denoiser
+- **Real-Time Glossy / Rough SDF Reflections** (`src/webgpu-refl.js`): GGX importance-sampled reflection ray tracing against storage-buffer BVH2 → FP16 SDF → 2-bounce `radVol` + direct Emissive Orb hits, Fresnel + GTSO specular occlusion, and roughness-guided spatiotemporal filtering (`Reflections` toggle + `Glossy Reflections` debug view)
+- **Live Drag-and-Drop `.glb` / `.obj` + In-Browser GPU SDF Baker** (`src/webgpu-bake.js`): drop any `.glb`, `.gltf`, or `.obj` onto `webgpu.html` to bake an exact `96 × 96 × 56` FP16 SDF directly on the WebGPU GPU (`~2–20 ms`, zero CPU readback) with instant Contact BVH, Multi-Bounce GI, and Glossy Reflections (`benchmark/bench_webgpu_unified.py`, Apple M1 Metal-3, 1280×720):
 
 | Apple M1 Metal-3 WebGPU (`high` preset) | Cold ms/f | Orbit 3°/f | Settled GPU ms | Camera-Cut Revisit Cache Skip |
 |---|---:|---:|---:|---:|
