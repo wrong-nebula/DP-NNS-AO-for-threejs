@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>WebGPU World-Space Spatial Hash AO Cache</title>
+<body style="margin:0;background:#121821;color:#f1f5f8;font:14px system-ui,sans-serif;padding:16px">
+<h2>WebGPU Compute · World-Space Spatial Hash AO Cache (GI-1.0 / Anagnostou 2025)</h2>
+<pre id="log">Initializing WebGPU...</pre>
+<script type="module">
+const logEl = document.querySelector('#log');
+const log = s => { logEl.textContent += '\n' + s; };
+
+const WGSL_SHADER = /* wgsl */`
+struct Uniforms {
+  eye: vec4<f32>,
+  forward: vec4<f32>,
+  right: vec4<f32>,
+  up: vec4<f32>,
+  params: vec4<f32>, // x=width, y=height, z=tanHalfFov, w=frame
+  flags: vec4<u32>,  // x=boxCount, y=mode(0=hash,1=direct), z=maxSamples, w=tableMask
+};
+
+struct Box {
+  center: vec4<f32>,
+  half: vec4<f32>,
+};
+
+struct HashEntry {
+  key: atomic<u32>,
+  aoSum: atomic<u32>,
+  count: atomic<u32>,
+  lastFrame: atomic<u32>,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read> boxes: array<Box>;
+@group(0) @binding(2) var sdfTex: texture_3d<f32>;
+@group(0) @binding(3) var sdfSamp: sampler;
+@group(0) @binding(4) var<storage, read_write> hashTable: array<HashEntry>;
+@group(0) @binding(5) var<storage, read_write> outAO: array<f32>;
+@group(0) @binding(6) var<storage, read_write> stats: array<atomic<u32>>; // 0=traced, 1=skipped, 2=collisions, 3=inserted
+
+fn ign(q: vec2<f32>) -> f32 {
+  return fract(52.9829189 * fract(dot(q, vec2<f32>(0.06711056, 0.00583715))));
+}
+
+fn vdc2(bits_in: u32) -> f32 {
+  var b = bits_in;
+  b = (b << 16u) | (b >> 16u);
+  b = ((b & 0x55555555u) << 1u) | ((b & 0xAAAAAAAAu) >> 1u);
+  b = ((b & 0x33333333u) << 2u) | ((b & 0xCCCCCCCCu) >> 2u);
+  b = ((b & 0x0F0F0F0Fu) << 4u) | ((b & 0xF0F0F0F0u) >> 4u);
+  b = ((b & 0x00FF00FFu) << 8u) | ((b & 0xFF00FF00u) >> 8u);
+  return f32(b) * 2.3283064365386963e-10;
+}
+
+fn vdc3(n_in: u32) -> f32 {
+  var n = n_in;
+  var f = 1.0;
+  var r = 0.0;
+  for (var j = 0u; j < 6u; j++) {
+    f /= 3.0;
+    r += f * f32(n % 3u);
+    n /= 3u;
+  }
+  return r;
+}
+
+fn pcg(v_in: u32) -> u32 {
+  var state = v_in * 747796405u + 2891336453u;
+  let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+
+fn hashCell(cx: i32, cy: i32, cz: i32, nCode: u32, lod: u32) -> vec2<u32> {
+  let ux = bitcast<u32>(cx);
+  let uy = bitcast<u32>(cy);
+  let uz = bitcast<u32>(cz);
+  var h1 = pcg(ux ^ pcg(uy ^ pcg(uz ^ pcg((nCode << 5u) | lod))));
+  var h2 = pcg(uz ^ pcg(ux ^ pcg(uy ^ pcg(((lod << 12u) | nCode) ^ 0x9e3779b9u))));
+  if (h2 == 0u) { h2 = 1u; }
+  return vec2<u32>(h1, h2);
+}
+
+fn sampleSDF(p: vec3<f32>) -> f32 {
+  let uv = (p + vec3<f32>(1.0)) / vec3<f32>(26.0, 18.0, 8.0);
+  if (any(uv < vec3<f32>(0.0)) || any(uv > vec3<f32>(1.0))) { return 1e4; }
+  return textureSampleLevel(sdfTex, sdfSamp, uv, 0.0).r;
+}
+
+fn contactHitBoxes(origin: vec3<f32>, dir: vec3<f32>, tmax: f32) -> bool {
+  let inv = vec3<f32>(1.0) / (dir + vec3<f32>(1e-20));
+  let nb = u.flags.x;
+  for (var i = 0u; i < nb; i++) {
+    let c = boxes[i].center.xyz;
+    let h = boxes[i].half.xyz;
+    if (any(abs(origin - c) > h + vec3<f32>(tmax))) { continue; }
+    let a = (c - h - origin) * inv;
+    let b = (c + h - origin) * inv;
+    let nearT = max(0.0, max(min(a.x, b.x), max(min(a.y, b.y), min(a.z, b.z))));
+    let farT = min(tmax, min(max(a.x, b.x), min(max(a.y, b.y), max(a.z, b.z))));
+    if (farT >= nearT) { return true; }
+  }
+  return false;
+}
+
+fn traceAO(p: vec3<f32>, n: vec3<f32>, px: vec2<f32>, frame: u32, nd: u32) -> f32 {
+  let a = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.x) < 0.9);
+  let t = normalize(cross(n, a));
+  let b = cross(n, t);
+  let su = ign(px);
+  let sp = ign(px + vec2<f32>(37.0, 17.0));
+  let fu = fract(su + vdc2(frame));
+  let base = frame * 4u;
+  var vis = 0.0;
+  let origin = p + n * 0.0005;
+  for (var i = 0u; i < nd; i++) {
+    let uu = clamp((f32(i) + fu) / f32(nd), 1e-4, 0.9999);
+    let phi = 6.2831853 * fract(sp + vdc3(base + i));
+    let w = t * (sqrt(uu) * cos(phi)) + b * (sqrt(uu) * sin(phi)) + n * sqrt(1.0 - uu);
+    if (contactHitBoxes(origin, w, 0.24)) { continue; }
+    let cosn = dot(w, n);
+    var s = 0.24;
+    var v = 1.0;
+    for (var k = 0u; k < 16u; k++) {
+      let d = sampleSDF(p + w * s);
+      let e = max(min(0.025, 0.1 * s * cosn), 1e-6);
+      v = min(v, clamp((d + e) / (4.0 * e), 0.0, 1.0));
+      if (v < 0.01) { break; }
+      s += max(d, 0.072);
+      if (s > 1.12) { break; }
+    }
+    vis += v;
+  }
+  return vis / f32(nd);
+}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let W = u32(u.params.x);
+  let H = u32(u.params.y);
+  if (gid.x >= W || gid.y >= H) { return; }
+  let outIdx = gid.y * W + gid.x;
+
+  // Primary ray matching Archive camera (37 deg vertical FOV)
+  let px = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
+  let aspect = u.params.x / u.params.y;
+  let sx = (px.x / u.params.x * 2.0 - 1.0) * aspect * u.params.z;
+  let sy = (1.0 - px.y / u.params.y * 2.0) * u.params.z;
+  let dir = normalize(u.forward.xyz + sx * u.right.xyz + sy * u.up.xyz);
+  let inv = vec3<f32>(1.0) / (dir + vec3<f32>(1e-20));
+
+  var bestT = 1e9;
+  var bestN = vec3<f32>(0.0, 0.0, 1.0);
+  var hit = false;
+  let nb = u.flags.x;
+  for (var i = 0u; i < nb; i++) {
+    let c = boxes[i].center.xyz;
+    let h = boxes[i].half.xyz;
+    let a = (c - h - u.eye.xyz) * inv;
+    let b = (c + h - u.eye.xyz) * inv;
+    let tmin3 = min(a, b);
+    let tmax3 = max(a, b);
+    let nearT = max(tmin3.x, max(tmin3.y, tmin3.z));
+    let farT = min(tmax3.x, min(tmax3.y, tmax3.z));
+    if (nearT >= 0.1 && farT >= nearT && nearT < bestT) {
+      bestT = nearT;
+      hit = true;
+      let pHit = u.eye.xyz + dir * nearT - c;
+      let rel = abs(pHit) / h;
+      if (rel.x >= rel.y && rel.x >= rel.z) { bestN = vec3<f32>(sign(pHit.x), 0.0, 0.0); }
+      else if (rel.y >= rel.z) { bestN = vec3<f32>(0.0, sign(pHit.y), 0.0); }
+      else { bestN = vec3<f32>(0.0, 0.0, sign(pHit.z)); }
+    }
+  }
+  if (!hit) {
+    outAO[outIdx] = -1.0;
+    return;
+  }
+
+  let p = u.eye.xyz + dir * bestT;
+  let n = bestN;
+  let frame = u32(u.params.w);
+
+  if (u.flags.y == 1u) {
+    // Direct baseline (no cache)
+    let ao = traceAO(p, n, px, frame, 2u);
+    atomicAdd(&stats[0], 1u);
+    outAO[outIdx] = ao;
+    return;
+  }
+
+  // Distance-adaptive LOD cell size + tangent-plane jitter to prevent voxel blockiness
+  let lod = u32(clamp(floor(log2(max(bestT * 0.25, 0.5))), 0.0, 4.0));
+  let cellSize = 0.025 * exp2(f32(lod));
+  let ax = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.x) < 0.9);
+  let tang = normalize(cross(n, ax));
+  let bitang = cross(n, tang);
+  let jx = (ign(px + vec2<f32>(11.0, 23.0)) - 0.5) * cellSize;
+  let jy = (ign(px + vec2<f32>(41.0, 7.0)) - 0.5) * cellSize;
+  let pj = p + tang * jx + bitang * jy;
+
+  let cx = i32(floor(pj.x / cellSize));
+  let cy = i32(floor(pj.y / cellSize));
+  let cz = i32(floor(pj.z / cellSize));
+  let nCode = u32(round((n.x + 1.0) * 1.5)) + u32(round((n.y + 1.0) * 1.5)) * 4u + u32(round((n.z + 1.0) * 1.5)) * 16u;
+  let hh = hashCell(cx, cy, cz, nCode, lod);
+  let mask = u.flags.w;
+  let maxSamples = u.flags.z;
+
+  // Open-addressed linear probe (up to 8 slots) with LRU eviction (>240 frames old)
+  var slot = hh.x & mask;
+  var found = false;
+  for (var probe = 0u; probe < 8u; probe++) {
+    let idx = (slot + probe) & mask;
+    let curKey = atomicLoad(&hashTable[idx].key);
+    if (curKey == hh.y) {
+      slot = idx; found = true; break;
+    }
+    if (curKey == 0u) {
+      let cas = atomicCompareExchangeWeak(&hashTable[idx].key, 0u, hh.y);
+      if (cas.exchanged || cas.old_value == hh.y) {
+        if (cas.exchanged) { atomicAdd(&stats[3], 1u); }
+        slot = idx; found = true; break;
+      }
+    } else {
+      let age = frame - atomicLoad(&hashTable[idx].lastFrame);
+      if (age > 240u) {
+        let cas = atomicCompareExchangeWeak(&hashTable[idx].key, curKey, hh.y);
+        if (cas.exchanged) {
+          atomicStore(&hashTable[idx].aoSum, 0u);
+          atomicStore(&hashTable[idx].count, 0u);
+          slot = idx; found = true; break;
+        }
+      }
+      atomicAdd(&stats[2], 1u);
+    }
+  }
+
+  if (!found) {
+    let ao = traceAO(p, n, px, frame, 2u);
+    atomicAdd(&stats[0], 1u);
+    outAO[outIdx] = ao;
+    return;
+  }
+
+  atomicStore(&hashTable[slot].lastFrame, frame);
+  let prevCnt = atomicLoad(&hashTable[slot].count);
+  var outVal = 0.0;
+  if (prevCnt < maxSamples) {
+    let nd = select(2u, 4u, prevCnt < 8u);
+    let ao = traceAO(p, n, px, frame, nd);
+    let q = u32(clamp(ao, 0.0, 1.0) * 65535.0 + 0.5);
+    let newSum = atomicAdd(&hashTable[slot].aoSum, q) + q;
+    let newCnt = atomicAdd(&hashTable[slot].count, 1u) + 1u;
+    atomicAdd(&stats[0], 1u);
+    outVal = f32(newSum) / (f32(newCnt) * 65535.0);
+  } else {
+    atomicAdd(&stats[1], 1u);
+    let sum = atomicLoad(&hashTable[slot].aoSum);
+    outVal = f32(sum) / (f32(max(prevCnt, 1u)) * 65535.0);
+  }
+  outAO[outIdx] = outVal;
+}
+`;
+
+async function init() {
+  if (!navigator.gpu) throw new Error('WebGPU unavailable');
+  const adapter = await navigator.gpu.requestAdapter();
+  const hasTimestamp = adapter.features.has('timestamp-query');
+  const device = await adapter.requestDevice({ requiredFeatures: hasTimestamp ? ['timestamp-query'] : [] });
+  log(`Adapter: ${adapter.info?.vendor} / ${adapter.info?.architecture} (timestamp-query=${hasTimestamp})`);
+
+  const boxesRaw = await (await fetch('/benchmark/archive.json')).json();
+  const sdfBytes = await (await fetch('/output/nextgen/archive_iso256.f16')).arrayBuffer();
+
+  // Upload boxes storage buffer
+  const boxData = new Float32Array(boxesRaw.length * 8);
+  boxesRaw.forEach((b, i) => {
+    boxData.set([b[0], b[1], b[2], 0, b[3], b[4], b[5], 0], i * 8);
+  });
+  const boxBuf = device.createBuffer({ size: boxData.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(boxBuf, 0, boxData);
+
+  // Upload 256x176x80 r16float 3D SDF texture
+  const sdfTex = device.createTexture({
+    size: [256, 176, 80], dimension: '3d', format: 'r16float',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+  device.queue.writeTexture(
+    { texture: sdfTex }, sdfBytes,
+    { bytesPerRow: 256 * 2, rowsPerImage: 176 },
+    [256, 176, 80]
+  );
+  const sdfSamp = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+
+  const TABLE_SIZE = 262144; // 262,144 slots x 16 B = 4.0 MiB
+  const hashBuf = device.createBuffer({
+    size: TABLE_SIZE * 16,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+
+  const uniformBuf = device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const statsBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+  const statsRead = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+  const module = device.createShaderModule({ code: WGSL_SHADER });
+  const info = await module.getCompilationInfo();
+  for (const m of info.messages) { if (m.type === 'error') throw new Error(`WGSL L${m.lineNum}:${m.linePos} ${m.message}`); }
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+
+  function makeCamera(eye, target) {
+    const f = [target[0]-eye[0], target[1]-eye[1], target[2]-eye[2]];
+    const fl = Math.hypot(...f); f[0]/=fl; f[1]/=fl; f[2]/=fl;
+    const r = [f[1]*1 - f[2]*0, f[2]*0 - f[0]*1, f[0]*0 - f[1]*0]; // cross(f, [0,0,1])
+    const rl = Math.hypot(...r); r[0]/=rl; r[1]/=rl; r[2]/=rl;
+    const up = [r[1]*f[2]-r[2]*f[1], r[2]*f[0]-r[0]*f[2], r[0]*f[1]-r[1]*f[0]];
+    return { eye, f, r, up };
+  }
+
+  window.webgpuHashDemo = {
+    tableBytes: TABLE_SIZE * 16,
+    adapterInfo: { vendor: adapter.info?.vendor, arch: adapter.info?.architecture },
+    async runBenchmark(mainRef) {
+      const W = 320, H = 180; // exact 4-stride reference grid!
+      const outBuf = device.createBuffer({ size: W * H * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+      const outRead = device.createBuffer({ size: W * H * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const bindGroup = device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuf } },
+          { binding: 1, resource: { buffer: boxBuf } },
+          { binding: 2, resource: sdfTex.createView() },
+          { binding: 3, resource: sdfSamp },
+          { binding: 4, resource: { buffer: hashBuf } },
+          { binding: 5, resource: { buffer: outBuf } },
+          { binding: 6, resource: { buffer: statsBuf } },
+        ],
+      });
+
+      const tanHalf = Math.tan(18.5 * Math.PI / 180);
+      const uF32 = new Float32Array(24);
+      const uU32 = new Uint32Array(uF32.buffer);
+      const zeroStats = new Uint32Array(4);
+
+      function writeCam(eye, target, frame, mode = 0, maxSamples = 64) {
+        const c = makeCamera(eye, target);
+        uF32.set([...c.eye, 0, ...c.f, 0, ...c.r, 0, ...c.up, 0, W, H, tanHalf, frame], 0);
+        uU32.set([boxesRaw.length, mode, maxSamples, TABLE_SIZE - 1], 20);
+        device.queue.writeBuffer(uniformBuf, 0, uF32);
+      }
+
+      async function dispatchAndSync(nFrames, camFn, startFrame, mode = 0, maxSamples = 64) {
+        device.queue.writeBuffer(statsBuf, 0, zeroStats);
+        const t0 = performance.now();
+        for (let i = 0; i < nFrames; i++) {
+          const { eye, target } = camFn(i);
+          writeCam(eye, target, startFrame + i, mode, maxSamples);
+          const enc = device.createCommandEncoder();
+          const pass = enc.beginComputePass();
+          pass.setPipeline(pipeline);
+          pass.setBindGroup(0, bindGroup);
+          pass.dispatchWorkgroups(Math.ceil(W / 8), Math.ceil(H / 8));
+          pass.end();
+          device.queue.submit([enc.finish()]);
+        }
+        await device.queue.onSubmittedWorkDone();
+        const ms = (performance.now() - t0) / nFrames;
+        const enc = device.createCommandEncoder();
+        enc.copyBufferToBuffer(statsBuf, 0, statsRead, 0, 16);
+        device.queue.submit([enc.finish()]);
+        await statsRead.mapAsync(GPUMapMode.READ);
+        const st = Array.from(new Uint32Array(statsRead.getMappedRange()));
+        statsRead.unmap();
+        return { ms, traced: st[0], skipped: st[1], collisions: st[2], inserted: st[3] };
+      }
+
+      async function readAO() {
+        const enc = device.createCommandEncoder();
+        enc.copyBufferToBuffer(outBuf, 0, outRead, 0, W * H * 4);
+        device.queue.submit([enc.finish()]);
+        await outRead.mapAsync(GPUMapMode.READ);
+        const arr = new Float32Array(outRead.getMappedRange()).slice();
+        outRead.unmap();
+        return arr;
+      }
+
+      function orbitCam(deg) {
+        const ang = deg * Math.PI / 180;
+        const x = mainRef.eye[0] - mainRef.target[0], y = mainRef.eye[1] - mainRef.target[1];
+        return {
+          eye: [mainRef.target[0] + x * Math.cos(ang) - y * Math.sin(ang),
+                mainRef.target[1] + x * Math.sin(ang) + y * Math.cos(ang), mainRef.eye[2]],
+          target: mainRef.target,
+        };
+      }
+
+      function maeVsRef(aoArr) {
+        let sum = 0, cnt = 0;
+        for (let i = 0; i < mainRef.indices.length; i++) {
+          const idx = mainRef.indices[i];
+          const y = 719 - Math.floor(idx / 1280);
+          const x = idx % 1280;
+          const iy = (y - 2) >> 2, ix = (x - 2) >> 2;
+          const v = aoArr[iy * W + ix];
+          if (v >= 0) { sum += Math.abs(v - mainRef.ref[i]); cnt++; }
+        }
+        return sum / cnt;
+      }
+
+      // Clear hash table
+      const clearEnc = device.createCommandEncoder();
+      clearEnc.clearBuffer(hashBuf);
+      device.queue.submit([clearEnc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+
+      // 1. Cold-start convergence on main (frames 1, 4, 16, 64)
+      const cold = {};
+      let frame = 0;
+      const e1 = await dispatchAndSync(1, () => ({ eye: mainRef.eye, target: mainRef.target }), frame); frame += 1;
+      cold.f1 = maeVsRef(await readAO());
+      const e4 = await dispatchAndSync(3, () => ({ eye: mainRef.eye, target: mainRef.target }), frame); frame += 3;
+      cold.f4 = maeVsRef(await readAO());
+      const e16 = await dispatchAndSync(12, () => ({ eye: mainRef.eye, target: mainRef.target }), frame); frame += 12;
+      cold.f16 = maeVsRef(await readAO());
+      const e64 = await dispatchAndSync(48, () => ({ eye: mainRef.eye, target: mainRef.target }), frame); frame += 48;
+      cold.f64 = maeVsRef(await readAO());
+
+      // 2. Settled timing on main (converged-cell skip!)
+      const settled = await dispatchAndSync(16, () => ({ eye: mainRef.eye, target: mainRef.target }), frame); frame += 16;
+
+      // 3. Orbit 32 frames at 3 deg/frame (populates world cache along orbit)
+      const orbit = await dispatchAndSync(32, i => orbitCam((i + 1) * 3), frame); frame += 32;
+
+      // 4. Instant camera cut BACK to main (1 single frame!) — tests zero-lag disocclusion!
+      const revisit = await dispatchAndSync(1, () => ({ eye: mainRef.eye, target: mainRef.target }), frame); frame += 1;
+      const revisitMAE = maeVsRef(await readAO());
+
+      // 5. Compare against direct (uncached) 1-frame cut timing
+      const direct = await dispatchAndSync(16, () => ({ eye: mainRef.eye, target: mainRef.target }), frame, 1);
+
+      outBuf.destroy(); outRead.destroy();
+      const skipRate = settled.skipped / Math.max(1, settled.traced + settled.skipped);
+      const revisitSkip = revisit.skipped / Math.max(1, revisit.traced + revisit.skipped);
+      return {
+        cold,
+        revisit_frame1_mae: revisitMAE,
+        revisit_skip_rate: revisitSkip,
+        settled_skip_rate: skipRate,
+        ms: {
+          cold_early_ms: e16.ms,
+          orbit_3deg_ms: orbit.ms,
+          settled_ms: settled.ms,
+          direct_uncached_ms: direct.ms,
+        },
+        table_bytes: TABLE_SIZE * 16,
+      };
+    }
+  };
+  log('WebGPU Spatial Hash AO Cache ready.');
+}
+init().catch(e => log('ERROR: ' + e.message));
+</script>
+</body></html>

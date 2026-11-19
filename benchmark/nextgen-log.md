@@ -99,3 +99,24 @@ Established `benchmark/judge_v2.py` (real Apple M1 Metal GPU via Playwright Chro
 | Temporal ConvAUC / Orbit3° / Settle4 | 0.00841 / 0.01150 / 0.01060 | 0.00978 / 0.01107 / 0.01084 | 0.00771 / 0.00978 / 0.00930 | **-8.3%** / **-15.0%** / **-12.3%** |
 | ThinPlate meanMAE64 / Curved MAE | 0.01090 / 0.05125 | — | 0.00776 / 0.04030 | **-28.8%** / **-21.4%** |
 | Startup contactBuild / BVH VRAM | 96.0 ms / 1429.1 KiB | 0 ms / 0 KiB | **16.8 ms** / **398.6 KiB** | **5.7× faster** / **3.6× smaller** |
+
+---
+
+## Phase 4 — WebGPU Compute World-Space Spatial Hash AO Cache
+
+Implemented a standalone WebGPU Compute (WGSL) prototype (`benchmark/webgpu-hash-ao.html` + `benchmark/bench_webgpu_hash.py`) running natively on **Apple M1 Metal-3**:
+- Distance-adaptive LOD cell size (`0.025 * 2^lod` m) keyed on `(quantized_pos, quantized_normal, lod)` with tangent-plane IGN jitter (Boissé GI-1.0 / Anagnostou 2025).
+- `262,144`-slot open-addressed atomic hash table (`4.0 MiB`, 16 B/entry) with linear probing, LRU age eviction (>240 frames), and **converged-cell skip** (`count >= 64` stops tracing permanently).
+- Uses the exact `256×176×80` isotropic FP16 3D SDF (`r16float`) + Archive boxes on `main`.
+
+### Phase 4 Results (Apple M1 Metal-3 WebGPU)
+
+| Metric | WebGPU World-Space Hash Cache | Screen-Space Temporal (`p3-final`) |
+|---|---:|---:|
+| Cold MAE (1 / 4 / 16 / 64) | 0.04831 / 0.02273 / 0.01631 / 0.01126 | 0.02234 / 0.01326 / 0.00844 / 0.00593 |
+| **Camera-Cut Revisit Frame-1 MAE** | **0.01126** (**2× lower disocclusion error**) | 0.02234 (history wiped on cut) |
+| Revisit / Settled Skip Rate | **100.0% / 100.0%** | — |
+| GPU Time (cold / orbit 3°/f / settled / uncached) | 1.967 / 2.338 / **0.619** / 1.356 ms/f | 6.260 / 4.853 / 2.318 ms/f |
+| Hash Table Memory | 4.0 MiB | — |
+
+**Engineering takeaway**: World-space caching delivers instant zero-lag disocclusion (`0.01126` on frame 1 of a camera cut, 100% ray skip, `0.619 ms/f` settled), while pixel-exact screen-space temporal accumulation achieves 2× lower converged MAE (`0.00593`) because it avoids world-cell quantization blur on 1–3 cm contacts.
