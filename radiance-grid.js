@@ -1,8 +1,8 @@
 // 3D Direct-Lit Radiance Voxel Grid for 1-Bounce Real-Time Diffuse GI.
 // Area-weighted triangle splatting (albedo + normal) with 1-voxel surface dilation
-// onto a 64 x 64 x 40 RGBA8 Data3DTexture (640 KiB VRAM).
-// Supports < 2 ms CPU relighting when sun direction changes using fast sphere-traced
-// shadows against the scene's baked SDF on occupied surface voxels + 1-voxel dilation.
+// onto a 64 x 64 x 40 RGBA8 3D volume (640 KiB VRAM).
+// Supports < 0.3 ms GPU relighting (WebGL2 WebGL3DRenderTarget) when sun direction
+// changes, with automatic CPU fallback when no renderer is passed (e.g. Node tests).
 
 export const RADIANCE_DIMS = [64, 64, 40];
 export const RADIANCE_SCALE = 3.5;
@@ -44,7 +44,12 @@ function archiveAlbedoAt(z) {
   ];
 }
 
-export function buildRadianceGrid(objects, T, sdfInfo, { dims = RADIANCE_DIMS, scale = RADIANCE_SCALE } = {}) {
+export function buildRadianceGrid(objects, T, sdfInfo, {
+  dims = RADIANCE_DIMS,
+  scale = RADIANCE_SCALE,
+  renderer = null,
+  FullScreenQuad = null,
+} = {}) {
   const t0 = performance.now();
   const [nx, ny, nz] = dims;
   const totalVoxels = nx * ny * nz;
@@ -55,9 +60,10 @@ export function buildRadianceGrid(objects, T, sdfInfo, { dims = RADIANCE_DIMS, s
   const minVox = Math.min(voxX, voxY, voxZ);
   const voxDiag = Math.hypot(voxX, voxY, voxZ);
   const sceneId = sdfInfo.sceneId || 0;
+  const useGPU = Boolean(renderer && FullScreenQuad && sdfInfo.field && T.WebGL3DRenderTarget);
 
-  // Decode baked SDF once for fast CPU sun shadow queries during relight
-  const sdfF32 = sdfInfo.floatData || decodeHalfVolume(sdfInfo.halfData);
+  // Decode baked SDF on CPU only when falling back to CPU relighting
+  const sdfF32 = useGPU ? null : (sdfInfo.floatData || decodeHalfVolume(sdfInfo.halfData));
   const [snx, sny, snz] = sdfInfo.dims;
   const sdfStrideY = snx, sdfStrideZ = snx * sny;
   const sdfSx = invSpanX * snx, sdfSy = invSpanY * sny, sdfSz = invSpanZ * snz;
@@ -328,6 +334,188 @@ export function buildRadianceGrid(objects, T, sdfInfo, { dims = RADIANCE_DIMS, s
     if (s >= 0) { dilDstArr[dk] = i; dilSrcArr[dk] = s; dk++; }
   }
 
+  let lastRelightMs = 0;
+
+  if (useGPU) {
+    // Pack static dilated albedo (.a = occupied/dilated mask) & normal (.a = source-voxel offset code 0..26)
+    // so GPU relight evaluates both occupied surface voxels and exact 1-voxel dilated copies in ONE 40-slice pass.
+    const albData = new Uint8Array(totalVoxels * 4);
+    const norData = new Uint8Array(totalVoxels * 4);
+    for (let i = 0; i < surfCount; i++) {
+      const o3 = i * 3;
+      const o4 = surfIdx[i] * 4;
+      const ar = surfAlb[o3] * 255, ag = surfAlb[o3 + 1] * 255, ab = surfAlb[o3 + 2] * 255;
+      albData[o4] = ar >= 255 ? 255 : (ar <= 0 ? 0 : (ar + 0.5) | 0);
+      albData[o4 + 1] = ag >= 255 ? 255 : (ag <= 0 ? 0 : (ag + 0.5) | 0);
+      albData[o4 + 2] = ab >= 255 ? 255 : (ab <= 0 ? 0 : (ab + 0.5) | 0);
+      albData[o4 + 3] = 255;
+      const nxu = (surfNor[o3] * 0.5 + 0.5) * 255;
+      const nyu = (surfNor[o3 + 1] * 0.5 + 0.5) * 255;
+      const nzu = (surfNor[o3 + 2] * 0.5 + 0.5) * 255;
+      norData[o4] = nxu >= 255 ? 255 : (nxu <= 0 ? 0 : (nxu + 0.5) | 0);
+      norData[o4 + 1] = nyu >= 255 ? 255 : (nyu <= 0 ? 0 : (nyu + 0.5) | 0);
+      norData[o4 + 2] = nzu >= 255 ? 255 : (nzu <= 0 ? 0 : (nzu + 0.5) | 0);
+      norData[o4 + 3] = 13; // dx=0, dy=0, dz=0 => (0+1) + (0+1)*3 + (0+1)*9
+    }
+    for (let i = 0; i < dilCount; i++) {
+      const dst = dilDstArr[i];
+      const src = dilSrcArr[i];
+      const dzD = (dst / strideZ) | 0;
+      const remD = dst - dzD * strideZ;
+      const dyD = (remD / strideY) | 0;
+      const dxD = remD - dyD * strideY;
+      const dzS = (src / strideZ) | 0;
+      const remS = src - dzS * strideZ;
+      const dyS = (remS / strideY) | 0;
+      const dxS = remS - dyS * strideY;
+      const code = (dxS - dxD + 1) + (dyS - dyD + 1) * 3 + (dzS - dzD + 1) * 9;
+      const d4 = dst * 4, s4 = src * 4;
+      albData[d4] = albData[s4];
+      albData[d4 + 1] = albData[s4 + 1];
+      albData[d4 + 2] = albData[s4 + 2];
+      albData[d4 + 3] = 255;
+      norData[d4] = norData[s4];
+      norData[d4 + 1] = norData[s4 + 1];
+      norData[d4 + 2] = norData[s4 + 2];
+      norData[d4 + 3] = code;
+    }
+
+    const albedoTex = new T.Data3DTexture(albData, nx, ny, nz);
+    albedoTex.format = T.RGBAFormat;
+    albedoTex.type = T.UnsignedByteType;
+    albedoTex.minFilter = albedoTex.magFilter = T.NearestFilter;
+    albedoTex.generateMipmaps = false;
+    albedoTex.unpackAlignment = 1;
+    albedoTex.needsUpdate = true;
+
+    const normalTex = new T.Data3DTexture(norData, nx, ny, nz);
+    normalTex.format = T.RGBAFormat;
+    normalTex.type = T.UnsignedByteType;
+    normalTex.minFilter = normalTex.magFilter = T.NearestFilter;
+    normalTex.generateMipmaps = false;
+    normalTex.unpackAlignment = 1;
+    normalTex.needsUpdate = true;
+
+    const target = new T.WebGL3DRenderTarget(nx, ny, nz, { depthBuffer: false, stencilBuffer: false });
+    target.texture.format = T.RGBAFormat;
+    target.texture.type = T.UnsignedByteType;
+    target.texture.minFilter = target.texture.magFilter = T.LinearFilter;
+    target.texture.generateMipmaps = false;
+
+    const relightMat = new T.ShaderMaterial({
+      glslVersion: T.GLSL3,
+      depthTest: false,
+      depthWrite: false,
+      uniforms: {
+        albedoTex: { value: albedoTex },
+        normalTex: { value: normalTex },
+        sdfField: { value: sdfInfo.field },
+        sdfMin: { value: new T.Vector3(minX, minY, minZ) },
+        sdfInvSpan: { value: new T.Vector3(invSpanX, invSpanY, invSpanZ) },
+        voxSize: { value: new T.Vector3(voxX, voxY, voxZ) },
+        sunDir: { value: new T.Vector3(0, 0, 1) },
+        sunColor: { value: new T.Vector3(3.10, 2.90, 2.55) },
+        skyColor: { value: new T.Vector3(0.56, 0.64, 0.76) },
+        invScale: { value: 1 / scale },
+        voxOff: { value: Math.max(0.11, voxDiag * 0.72) },
+        layer: { value: 0 },
+      },
+      vertexShader: 'void main(){gl_Position=vec4(position.xy,0.,1.);}',
+      fragmentShader: `precision highp float;
+      precision highp sampler3D;
+      uniform sampler3D albedoTex;
+      uniform sampler3D normalTex;
+      uniform sampler3D sdfField;
+      uniform vec3 sdfMin;
+      uniform vec3 sdfInvSpan;
+      uniform vec3 voxSize;
+      uniform vec3 sunDir;
+      uniform vec3 sunColor;
+      uniform vec3 skyColor;
+      uniform float invScale;
+      uniform float voxOff;
+      uniform int layer;
+      out vec4 o;
+      void main(){
+        ivec3 v = ivec3(gl_FragCoord.xy, layer);
+        vec4 alb = texelFetch(albedoTex, v, 0);
+        if(alb.a < 0.5){ o = vec4(0.); return; }
+        vec4 nSample = texelFetch(normalTex, v, 0);
+        vec3 nor = normalize(nSample.rgb * 2.0 - 1.0);
+        float ndotl = dot(nor, sunDir);
+        float sh = 0.0;
+        if(ndotl > 0.001){
+          int code = int(floor(nSample.a * 255.0 + 0.5));
+          int dxi = (code % 3) - 1;
+          int dyi = ((code / 3) % 3) - 1;
+          int dzi = (code / 9) - 1;
+          vec3 srcPos = sdfMin + (vec3(gl_FragCoord.xy, float(layer) + 0.5) + vec3(float(dxi), float(dyi), float(dzi))) * voxSize;
+          vec3 ro = srcPos + nor * voxOff + sunDir * 0.05;
+          float t = 0.04;
+          float res = 1.0;
+          for(int s = 0; s < 16; s++){
+            vec3 uv = (ro + sunDir * t - sdfMin) * sdfInvSpan;
+            if(any(lessThan(uv, vec3(0.))) || any(greaterThan(uv, vec3(1.)))) break;
+            float d = texture(sdfField, uv).r;
+            if(d < 0.015){ res = 0.0; break; }
+            res = min(res, (8.0 * d) / t);
+            if(res < 0.005){ res = 0.0; break; }
+            t += max(d, 0.065);
+            if(t > 8.5) break;
+          }
+          sh = clamp(res, 0.0, 1.0);
+        }
+        float dSun = max(0.0, ndotl) * sh;
+        float skyF = 0.42 + 0.32 * max(0.0, nor.z);
+        vec3 irr = sunColor * dSun + skyColor * skyF;
+        o = vec4(clamp(alb.rgb * irr * invScale, 0.0, 1.0), 1.0);
+      }`,
+    });
+    const relightQuad = new FullScreenQuad(relightMat);
+    const buildMs = performance.now() - t0;
+
+    function relight(sunDir, {
+      sunColor = [3.10, 2.90, 2.55],
+      skyColor = [0.56, 0.64, 0.76],
+    } = {}) {
+      const rt0 = performance.now();
+      const u = relightMat.uniforms;
+      u.sunDir.value.set(sunDir[0], sunDir[1], sunDir[2]);
+      u.sunColor.value.set(sunColor[0], sunColor[1], sunColor[2]);
+      u.skyColor.value.set(skyColor[0], skyColor[1], skyColor[2]);
+      const prevRT = renderer.getRenderTarget();
+      for (let z = 0; z < nz; z++) {
+        u.layer.value = z;
+        renderer.setRenderTarget(target, z);
+        relightQuad.render(renderer);
+      }
+      renderer.setRenderTarget(prevRT);
+      lastRelightMs = performance.now() - rt0;
+      return lastRelightMs;
+    }
+
+    return {
+      texture: target.texture,
+      dims,
+      scale,
+      bytes: totalVoxels * 4,
+      occupiedVoxels: surfCount,
+      dilatedVoxels: dilCount,
+      buildMs,
+      gpu: true,
+      get relightMs() { return lastRelightMs; },
+      relight,
+      dispose() {
+        target.dispose();
+        albedoTex.dispose();
+        normalTex.dispose();
+        relightMat.dispose();
+        relightQuad.dispose();
+      },
+    };
+  }
+
+  // CPU fallback (for Node unit tests or when no WebGL2 renderer is passed)
   const texData = new Uint8Array(totalVoxels * 4);
   const texture = new T.Data3DTexture(texData, nx, ny, nz);
   texture.format = T.RGBAFormat;
@@ -337,7 +525,6 @@ export function buildRadianceGrid(objects, T, sdfInfo, { dims = RADIANCE_DIMS, s
   texture.unpackAlignment = 1;
 
   const buildMs = performance.now() - t0;
-  let lastRelightMs = 0;
 
   function relight(sunDir, {
     sunColor = [3.10, 2.90, 2.55],
@@ -399,6 +586,7 @@ export function buildRadianceGrid(objects, T, sdfInfo, { dims = RADIANCE_DIMS, s
     occupiedVoxels: surfCount,
     dilatedVoxels: dilCount,
     buildMs,
+    gpu: false,
     get relightMs() { return lastRelightMs; },
     relight,
     dispose() { texture.dispose(); },

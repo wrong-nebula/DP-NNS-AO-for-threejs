@@ -243,3 +243,30 @@ Fixed 5 verified visual defects on the Sunlit Gallery 1-Bounce GI renderer witho
 - **Archive Regression (`judge_v2.py --tag post-gi-polish`)**: Fit@64 **0.00585**, Held@64 **0.00497** (**bit-exact**), Wall early/orbit/settled 3.125 / 2.594 / 1.337 ms, 0 errors.
 - **Atrium Regression (`bench_atrium.py`)**: MAE@64 **0.01050** (**bit-exact**), Wall settled **1.80 ms**, 0 errors.
 - **Tests**: `npm test` + `python3 test/webgl2-smoke.py` pass with 0 errors.
+
+---
+
+## Smooth Moving-Sun GI & Performance Optimization Pass (`post-gi-opt`)
+
+### Changes Implemented (`radiance-grid.js`, `contact-bvh.js`, `index.html`, `benchmark/bench_gallery_gi.py`)
+1. **Zero-Flicker Moving-Sun Temporal GI (`index.html`)**:
+   - Removed `resetHistory()` and `traced.frame.value = 0` from `setSunAngle()`: static AO and bent normals depend only on geometry and remain completely intact while moving the sun.
+   - Added independent `giAccumFrames` / `giSunCooldown` / `giAlphaFloor` (`0.16` while sun moves, decaying to `0.0` when still for 128-frame convergence) plus soft firefly suppression gated strictly to moving/initial frames (`giAlphaFloor > 0.01 || giFrames < 6`, zero converged energy bias).
+2. **History-Aware 3-Pass / 2-Pass À-Trous GI Denoiser (`index.html`)**:
+   - Added `giSmoothFactor` (`1.0` while moving or `giFrames < 12`, ramping to `0.0` by frame 48) that relaxes luma edge-stopping (`wL -> 1.0`) so Monte Carlo noise is never locked into blotches, running 3 passes (`stride = 1, 3, 6`) while young/moving and 2 passes (`stride = 1, 3`) as GI converges.
+3. **GPU 3D Radiance Grid Relighting (`radiance-grid.js`)**:
+   - Moved `radianceGrid.relight()` to WebGL2 (`WebGL3DRenderTarget` `64 × 64 × 40` `RGBA8`) using two static `Data3DTexture`s (`albedoTex` + `normalTex` with packed 1-voxel dilation source-offset codes in `.a`), evaluating both occupied surface voxels and exact 1-voxel dilated neighbors in a single 40-slice GPU pass (**0.20 ms**, 10× faster than CPU `2.00 ms`, with automatic CPU fallback for Node tests).
+4. **Gallery Performance Optimizations (`index.html`, `contact-bvh.js`)**:
+   - Smooth hybrid step schedule in `sdfSunShadow()` (`mix(0.4, 0.8, smoothstep(0.40, 0.85, d))`, 68 steps max): leaps open air while preserving identical `0.4 * d` penumbra smoothness at `±65°`.
+   - Faster far GI ray march past `1.12 m` in `contact-bvh.js` (`d > 0.30 ? d * 1.15 : max(d, 0.08)`, 14 steps max).
+   - Cached half-res sun shadow in unused `giOut.a` (preserved through `giDenoisePass`, refined at full-res only on penumbra edges `0.005 < sh < 0.995` and silhouettes) + settled static GI pass/denoise cache skip (`giAccumFrames >= 128`).
+
+### Verified Apple M1 Chrome WebGL2 Results (`post-gi-opt`)
+- **Gallery 1-Bounce GI (`bench_gallery_gi.py`)**:
+  - **Settled Wall ms/f**: **2.90 ms/f** (down from `8.10–8.50 ms/f`, **2.9× faster**, and faster than Gallery AO-only `3.80 ms/f`); frame-70 **6.50 ms/f**, early **11.70 ms/f**, moving-sun **13.80 ms/f**.
+  - **GPU Relight**: **0.20 ms** median (10× faster than CPU `2.00 ms`).
+  - **Accuracy**: AO MAE@64 **0.01152**, Bounce-only MAE **0.05786**, RGB MAE **0.04112** (**9.0× lower** than AO-only `0.37133`), PSNR **23.86 dB** (**+16.2 dB**).
+  - **Visual Verification**: `gallery_sun_moving.png` (mid-sweep `2°/frame` `10° → 40°`, frame 15) silky-smooth with zero blotches & zero AO flicker; `gallery_sun_pos65.png` & `gallery_sun_neg65.png` zero banding/sawtooth regressions.
+- **Archive Regression (`judge_v2.py --tag post-gi-opt`)**: Fit@64 **0.00585**, Held@64 **0.00497**, Contact@64 **0.01877**, FLIP **0.02193**, GMSD **0.01051** (**bit-exact**), 0 errors.
+- **Atrium Regression (`bench_atrium.py`)**: MAE@64 **0.01050** (**bit-exact**), 0 errors.
+- **Tests**: `npm test` + `python3 test/webgl2-smoke.py` pass with 0 WebGL / console / page errors.

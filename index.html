@@ -177,8 +177,9 @@ vec3 tracedAt(vec3 pWorld,vec3 n){
   return resVal;
 }
 #ifdef DIFFUSE_GI
-vec3 tracedAtGI(vec3 pWorld,vec3 n,out vec3 giOutIrr){
+vec3 tracedAtGI(vec3 pWorld,vec3 n,out vec3 giOutIrr,out float cachedSunSh){
   giOutIrr=vec3(0.);
+  cachedSunSh=-1.;
   vec2 res=vec2(textureSize(aoTex,0));
   vec2 invRes2=2./res;
   vec2 f=gl_FragCoord.xy*res/vec2(${W}.,${H}.)-.5;
@@ -189,7 +190,7 @@ vec3 tracedAtGI(vec3 pWorld,vec3 n,out vec3 giOutIrr){
   float viewDepth=-vp.z;
   vec2 vnXY=vn.xy*invProjXY;
   float vpDotN=dot(vn,vp);
-  vec3 acc=vec3(0.);vec3 gAcc=vec3(0.);float ws=0.;
+  vec3 acc=vec3(0.);vec3 gAcc=vec3(0.);float shAcc=0.;float ws=0.;
   float bestScore=1e9;vec3 bestGI=vec3(0.);
   float planeTol=.0015*viewDepth+.005;
   float depthTol=.08*viewDepth+.05;
@@ -204,14 +205,16 @@ vec3 tracedAtGI(vec3 pWorld,vec3 n,out vec3 giOutIrr){
     float nv2=dot(nv,nv);
     float nCos=dn*inversesqrt(max(nv2,1e-6));
     float sc=abs(h.y-viewDepth)/(viewDepth+.1)+(1.-max(0.,nCos))*.5;
-    if(sc<bestScore){bestScore=sc;bestGI=texelFetch(aoGITex,q,0).rgb;}
+    vec4 gTap=texelFetch(aoGITex,q,0);
+    if(sc<bestScore){bestScore=sc;bestGI=gTap.rgb;}
     if(bw<1e-4||abs(h.y-viewDepth)>depthTol)continue;
     if(dn<=0.||dn*dn<.81*nv2)continue;
     vec2 ndcQ=(vec2(q)+.5)*invRes2-1.;
     if(abs((dot(vnXY,ndcQ)-vn.z)*h.y-vpDotN)>planeTol)continue;
     float sig=hn.z*.25;
     acc+=bw*vec3(h.x,frames,sig*sig);
-    gAcc+=bw*texelFetch(aoGITex,q,0).rgb;
+    gAcc+=bw*gTap.rgb;
+    shAcc+=bw*gTap.a;
     ws+=bw;
   }
   if(ws<=.01){
@@ -221,7 +224,8 @@ vec3 tracedAtGI(vec3 pWorld,vec3 n,out vec3 giOutIrr){
   }
   vec3 resVal=acc/ws;
   giOutIrr=gAcc/ws;
-  // Lightweight 4-tap axial edge-preserving polish (aoGITex is already denoised by 2-pass half-res a-trous)
+  cachedSunSh=shAcc/ws;
+  // Lightweight 4-tap axial edge-preserving polish (aoGITex is already denoised by 2/3-pass half-res a-trous)
   ivec2 c0=clamp(ivec2(round(f)),ivec2(0),ivec2(res)-1);
   float fSum=resVal.x*2.,fw=2.;
   vec3 gSum=giOutIrr*2.;float gw=2.;
@@ -294,7 +298,7 @@ float sdfSunShadow(vec3 pos,vec3 nor,vec3 sDir){
   vec3 ro=pos+nor*.03+sDir*.02;
   float ndl=max(dot(nor,sDir),.15);
   float t=.02,res=1.;
-  for(int s=0;s<80;s++){
+  for(int s=0;s<68;s++){
     float d=staticDistance(ro+sDir*t);
     if(d>100.)break;
     float tol=min(.012,.22*t*ndl);
@@ -302,7 +306,8 @@ float sdfSunShadow(vec3 pos,vec3 nor,vec3 sDir){
     if(dc<=0.)return 0.;
     res=min(res,8.*dc/t);
     if(res<.005)return 0.;
-    t+=max(d*.4,.012);
+    float stepMul=mix(.4,.8,smoothstep(.40,.85,d));
+    t+=max(d*stepMul,.012);
     if(t>10.5)break;
   }
   res=clamp(res,0.,1.);
@@ -555,6 +560,7 @@ void main(){
     float shown;
     #ifdef DIFFUSE_GI
     vec3 giIrr=vec3(0.);
+    float cachedSunSh=-1.;
     #endif
     if(movingFace>.5){
       // Moving surfaces: the four-tap static formula every frame (their history would be another surface's).
@@ -565,7 +571,7 @@ void main(){
       // Shown: formula and traced mean blended (see blendK). Only the traced mean is accumulated (AO pass), so
       // the blend never feeds back into the history. Settled pixels skip the 4 full-res SDF reads completely.
       #ifdef DIFFUSE_GI
-      vec3 tr=tracedAtGI(p,normal,giIrr);
+      vec3 tr=tracedAtGI(p,normal,giIrr,cachedSunSh);
       #else
       vec3 tr=tracedAt(p,normal);
       #endif
@@ -637,7 +643,11 @@ void main(){
       vec3 bn=texelFetch(aoBentTex,bq,0).xyz*2.-1.;
       if(length(bn)>.2)bentN=normalize(bn);
     }
-    float sunSh=sun>.001?sdfSunShadow(p,normal,sDir):0.;
+    float sunSh=0.;
+    if(sun>.001){
+      if(cachedSunSh>=0.&&(cachedSunSh<=.005||cachedSunSh>=.995))sunSh=cachedSunSh>.5?1.:0.;
+      else sunSh=sdfSunShadow(p,normal,sDir);
+    }
     vec3 sunCol=vec3(2.25,2.10,1.85);
     vec3 skyCol=vec3(.22,.26,.34);
     float skyF=.16+.24*max(0.,bentN.z);
@@ -733,6 +743,9 @@ uniform sampler2D bentTex;
 #endif
 #ifdef DIFFUSE_GI
 uniform sampler2D giTex;
+uniform float giFrames;
+uniform float giAlphaFloor;
+uniform float giSmoothFactor;
 #endif
 uniform mat4 prevViewProj;
 uniform mat4 prevView;
@@ -767,6 +780,29 @@ float staticDistance(vec3 pos){
   if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return 1e4;
   return texture(field,uv).r;
 }
+#ifdef DIFFUSE_GI
+float sdfSunShadowGI(vec3 pos,vec3 nor,vec3 sDir){
+  float ndl=dot(nor,sDir);
+  if(ndl<=.001)return 0.;
+  vec3 ro=pos+nor*.03+sDir*.02;
+  float ndlC=max(ndl,.15);
+  float t=.02,res=1.;
+  for(int s=0;s<68;s++){
+    float d=staticDistance(ro+sDir*t);
+    if(d>100.)break;
+    float tol=min(.012,.22*t*ndlC);
+    float dc=d-tol;
+    if(dc<=0.)return 0.;
+    res=min(res,8.*dc/t);
+    if(res<.005)return 0.;
+    float stepMul=mix(.4,.8,smoothstep(.40,.85,d));
+    t+=max(d*stepMul,.012);
+    if(t>10.5)break;
+  }
+  res=clamp(res,0.,1.);
+  return res*res*(3.-2.*res);
+}
+#endif
 // Front-loaded champion directions and its far SDF march, with exact triangle
 // visibility over the skipped near segment plus half a field-cell diagonal.
 float ign(vec2 q){return fract(52.9829189*fract(dot(q,vec2(.06711056,.00583715))));}
@@ -774,9 +810,9 @@ ${CONTACT_GLSL.replaceAll('candidateAO(', 'tracedAO(').replaceAll('candidateAOBe
 // The previous frame's accumulated static AO at p: p projected with the previous camera, the four history
 // texels around it weighted bilinearly with view-space tangent-plane distance rejection.
 // histTex (RG32F): (aoMean, viewDepth); normalTex (RGBA8): (octNormal.xy, sqrt(var)*4, frames/255).
-vec3 history(vec3 p,vec3 n,out vec3 prevBent,out vec3 prevGI){
+vec3 history(vec3 p,vec3 n,out vec3 prevBent,out vec4 prevGI){
   prevBent=n;
-  prevGI=vec3(0.);
+  prevGI=vec4(0.,0.,0.,-1.);
   vec4 c=prevViewProj*vec4(p,1.);
   if(c.w<=0.)return vec3(0.);
   vec2 res=vec2(textureSize(histTex,0));
@@ -790,7 +826,7 @@ vec3 history(vec3 p,vec3 n,out vec3 prevBent,out vec3 prevGI){
   vec3 bAcc=vec3(0.);
   #endif
   #ifdef DIFFUSE_GI
-  vec3 gAcc=vec3(0.);
+  vec4 gAcc=vec4(0.);
   #endif
   vec3 vp=(prevView*vec4(p,1.)).xyz;
   vec3 vn=mat3(prevView)*n;
@@ -817,7 +853,7 @@ vec3 history(vec3 p,vec3 n,out vec3 prevBent,out vec3 prevGI){
     bAcc+=bw*(texelFetch(bentTex,q,0).xyz*2.-1.);
     #endif
     #ifdef DIFFUSE_GI
-    gAcc+=bw*texelFetch(giTex,q,0).rgb;
+    gAcc+=bw*texelFetch(giTex,q,0);
     #endif
     ws+=bw;
   }
@@ -841,19 +877,21 @@ void main(){
     bentOut=vec4(.5,.5,1.,1.);
     #endif
     #ifdef DIFFUSE_GI
-    giOut=vec4(0.,0.,0.,1.);
+    giOut=vec4(0.,0.,0.,-1.);
     #endif
     return;
   }
   vec3 p=g.xyz,normal=normalize(gn.xyz);
-  vec3 prevBent,prevGI;
+  vec3 prevBent;vec4 prevGI;
   vec3 h=history(p,normal,prevBent,prevGI);
   ivec2 tile=q>>3;
   bool turn=tileRate<2.||(tile.x&1)+2*(tile.y&1)==int(mod(frame,4.));
   // Variance-guided early settling: open zero-variance surfaces settle after 24 frames
   // instead of tracing all 64 frames; noisy crevices keep tracing up to settleFrames.
   #ifdef DIFFUSE_GI
-  bool settled=settleFrames>0.&&h.y>=max(settleFrames,histMax);
+  bool aoSettled=settleFrames>0.&&(h.y>=settleFrames||(h.y>=24.&&h.z<.00015));
+  bool giSettled=settleFrames>0.&&giAlphaFloor<.001&&giFrames>=max(settleFrames,histMax);
+  bool settled=aoSettled&&giSettled;
   #else
   bool settled=settleFrames>0.&&(h.y>=settleFrames||(h.y>=24.&&h.z<.00015));
   #endif
@@ -863,20 +901,41 @@ void main(){
   #endif
   #ifdef DIFFUSE_GI
   vec3 giIrr;
+  float sunShOut=prevGI.a;
   #endif
   if(turn&&!settled){
-    frames=min(h.y+1.,histMax);
     #ifdef DIFFUSE_GI
-    float nd=h.y<8.?4.:(h.y<16.?3.:2.);
-    #else
-    float nd=h.y<8.?4.:(h.y<16.?3.:(h.y>=24.&&h.z<.0006?1.:2.));
-    #endif
-    #ifdef DIFFUSE_GI
+    float effAge=min(h.y,giFrames);
+    float nd=effAge<8.?4.:(effAge<16.?3.:(giFrames>=64.&&giAlphaFloor<.001?1.:2.));
     vec3 sampleGI;
     vec4 resAO=tracedAOBentGI(p,normal,nd,sampleGI);
+    // Soft firefly suppression only while sun is moving or first few frames (zero bias on converged GI)
+    if(giAlphaFloor>.01||giFrames<6.){
+      float maxC=max(sampleGI.r,max(sampleGI.g,sampleGI.b));
+      sampleGI/=1.+.15*maxC;
+    }
+    if(!aoSettled){
+      frames=min(h.y+1.,histMax);
+      float sampleAO=resAO.x;
+      float alpha=1./frames;
+      aoStatic=mix(h.x,sampleAO,alpha);
+      aoVar=frames>1.5?max(0.,((frames-1.)*h.z+(sampleAO-h.x)*(sampleAO-aoStatic))/frames):.02;
+      vec3 bMix=mix(prevBent,resAO.yzw,alpha);
+      float bl=length(bMix);
+      bentN=bl>1e-4?bMix/bl:normal;
+    }else{
+      frames=min(h.y,histMax);aoStatic=h.x;aoVar=h.z;bentN=prevBent;
+    }
+    float giAlpha=h.y<.5?1.:max(1./max(giFrames,1.),giAlphaFloor);
+    giIrr=mix(prevGI.rgb,sampleGI,giAlpha);
+    // Cache half-res sun shadow in giOut.a when sun moves, camera moves, or first frame
+    if(sunShOut<-.5||giAlphaFloor>.01||giFrames<2.5){
+      sunShOut=sdfSunShadowGI(p,normal,normalize(giSunDir));
+    }
     #else
+    frames=min(h.y+1.,histMax);
+    float nd=h.y<8.?4.:(h.y<16.?3.:(h.y>=24.&&h.z<.0006?1.:2.));
     vec4 resAO=tracedAOBent(p,normal,nd);
-    #endif
     float sampleAO=resAO.x;
     float alpha=1./frames;
     aoStatic=mix(h.x,sampleAO,alpha);
@@ -887,8 +946,6 @@ void main(){
     float bl=length(bMix);
     bentN=bl>1e-4?bMix/bl:normal;
     #endif
-    #ifdef DIFFUSE_GI
-    giIrr=mix(prevGI,sampleGI,alpha);
     #endif
   }else{
     frames=min(h.y,histMax);aoStatic=h.x;aoVar=h.z;
@@ -896,7 +953,7 @@ void main(){
     bentN=prevBent;
     #endif
     #ifdef DIFFUSE_GI
-    giIrr=prevGI;
+    giIrr=prevGI.rgb;
     #endif
   }
   histOut=vec4(aoStatic,g.w,0.,1.);
@@ -905,7 +962,7 @@ void main(){
   bentOut=vec4(bentN*.5+.5,1.);
   #endif
   #ifdef DIFFUSE_GI
-  giOut=vec4(giIrr,1.);
+  giOut=vec4(giIrr,sunShOut);
   #endif
 }`;
 // GPU bake of a signed distance field for an arbitrary triangle mesh, one z-layer
@@ -1099,6 +1156,7 @@ try {
   //   history); normal + frames/255. The AO pass writes one while reading the other; the scene draw reads it.
   const nearest=t=>{t.minFilter=t.magFilter=T.NearestFilter;t.generateMipmaps=false;};
   let aoScale=.5,gTarget,histories,historiesBent=null,historiesGI=null,giDenoiseTargets=null,hiz1,hiz2;let histIndex=0;
+  let giAccumFrames=0,giSunCooldown=0,giDenoiseCached=false,giDenoiseLastIdx=1;
   function makeHistPair(w,h,count,giHalf=false){
     return [0,1].map(()=>{const rt=new T.WebGLRenderTarget(w,h,{count,depthBuffer:false});
       rt.textures[0].type=T.FloatType;rt.textures[0].format=T.RGFormat;
@@ -1127,6 +1185,7 @@ try {
   function makeTracedTargets(scale){
     const w=Math.round(W*scale),h=Math.round(H*scale);
     gTarget?.dispose();histories?.forEach(rt=>rt.dispose());historiesBent?.forEach(rt=>rt.dispose());historiesBent=null;historiesGI?.forEach(rt=>rt.dispose());historiesGI=null;giDenoiseTargets?.forEach(rt=>rt.dispose());giDenoiseTargets=null;hiz1?.dispose();hiz2?.dispose();
+    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;
     gTarget=new T.WebGLRenderTarget(w,h,{count:2});
     gTarget.textures[0].type=T.FloatType;gTarget.textures[1].type=T.HalfFloatType;gTarget.textures.forEach(nearest);
     // Standard traced path: 2 MRTs (RG32F + RGBA8 = 12 B/px). 3rd bentOut MRT is allocated only when PBR is active.
@@ -1169,15 +1228,15 @@ try {
   // Also restore clean cumulative Halton(2,3) indexing when nd=4/3/2, avoiding any low-bit aliasing
   // when nd drops to 1 ray on converged low-variance pixels.
   const makeAOPass=extraDefines=>new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,defines:{DIRS:2,...extraDefines},
-    uniforms:{field:sdfUniforms.field,sdfMin:sdfUniforms.sdfMin,sdfInvSpan:sdfUniforms.sdfInvSpan,gPos:{value:gTarget.textures[0]},gNormal:{value:gTarget.textures[1]},histTex:{value:histories[0].textures[0]},normalTex:{value:histories[0].textures[1]},bentTex:{value:null},giTex:{value:null},radianceVol:{value:null},radianceScale:{value:RADIANCE_SCALE},giMaxDist:{value:8.5},giSunDir:sdfUniforms.sunDir,hizTex1:{value:hiz1.texture},hizTex2:{value:hiz2.texture},
+    uniforms:{field:sdfUniforms.field,sdfMin:sdfUniforms.sdfMin,sdfInvSpan:sdfUniforms.sdfInvSpan,gPos:{value:gTarget.textures[0]},gNormal:{value:gTarget.textures[1]},histTex:{value:histories[0].textures[0]},normalTex:{value:histories[0].textures[1]},bentTex:{value:null},giTex:{value:null},giFrames:{value:0},giAlphaFloor:{value:0},giSmoothFactor:{value:0},radianceVol:{value:null},radianceScale:{value:RADIANCE_SCALE},giMaxDist:{value:8.5},giSunDir:sdfUniforms.sunDir,hizTex1:{value:hiz1.texture},hizTex2:{value:hiz2.texture},
       prevViewProj:traced.prevViewProj,prevView:traced.prevView,curViewProj:traced.curViewProj,curView:traced.curView,invProjXY:traced.invProjXY,frame:traced.frame,contactMode:traced.contactMode,smoothFalloff:traced.smoothFalloff,histMax:traced.histMax,settleFrames:traced.settleFrames,tileRate:traced.tileRate},
     vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',fragmentShader:aoPassFragment}));
   const aoPass=makeAOPass({});
   const aoPassBent=makeAOPass({BENT_NORMALS:1});
   const aoPassGI=makeAOPass({BENT_NORMALS:1,DIFFUSE_GI:1});
-  // Lazily-used 2-pass half-res edge-preserving a-trous wavelet denoiser for 1-Bounce GI (zero cost when #gi is off).
+  // Lazily-used history-aware 2/3-pass half-res edge-preserving a-trous wavelet denoiser for 1-Bounce GI (zero cost when #gi is off).
   const giDenoisePass=new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,
-    uniforms:{giSrc:{value:null},aoTex:{value:null},aoNormalTex:{value:null},curView:traced.curView,invProjXY:traced.invProjXY,stepSize:{value:1}},
+    uniforms:{giSrc:{value:null},aoTex:{value:null},aoNormalTex:{value:null},curView:traced.curView,invProjXY:traced.invProjXY,stepSize:{value:1},giSmoothFactor:{value:0}},
     vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',
     fragmentShader:`precision highp float;
     uniform sampler2D giSrc;
@@ -1186,6 +1245,7 @@ try {
     uniform mat4 curView;
     uniform vec2 invProjXY;
     uniform int stepSize;
+    uniform float giSmoothFactor;
     out vec4 o;
     vec3 octDecodeRaw(vec2 e){
       e=e*2.-1.;
@@ -1199,8 +1259,9 @@ try {
       vec2 invRes2=2./vec2(resI);
       vec2 hC=texelFetch(aoTex,q,0).xy;
       vec4 hnC=texelFetch(aoNormalTex,q,0);
-      vec3 cC=texelFetch(giSrc,q,0).rgb;
-      if(hC.y<=0.||hnC.w*255.<.5){o=vec4(cC,1.);return;}
+      vec4 cFull=texelFetch(giSrc,q,0);
+      vec3 cC=cFull.rgb;
+      if(hC.y<=0.||hnC.w*255.<.5){o=cFull;return;}
       vec3 nC=normalize(octDecodeRaw(hnC.xy));
       vec3 vn=mat3(curView)*nC;
       vec2 ndcC=(vec2(q)+.5)*invRes2-1.;
@@ -1211,6 +1272,7 @@ try {
       float planeTol=(.0022*hC.y+.008)*float(stepSize);
       float lumaC=dot(cC,vec3(.2126,.7152,.0722));
       float lumaSigma=.22+.45*lumaC;
+      float relaxLuma=clamp(giSmoothFactor*1.25,0.,1.);
       vec3 sum=cC;
       float wSum=1.;
       for(int dy=-1;dy<=1;dy++){
@@ -1227,15 +1289,14 @@ try {
           vec2 ndcP=(vec2(p)+.5)*invRes2-1.;
           if(abs((dot(vnXY,ndcP)-vn.z)*hP.y-vpDotN)>planeTol)continue;
           vec3 cP=texelFetch(giSrc,p,0).rgb;
-          float lumaP=dot(cP,vec3(.2126,.7152,.0722));
           float wK=(dx==0||dy==0)?.5:.25;
-          float wL=exp(-abs(lumaP-lumaC)/lumaSigma);
+          float wL=relaxLuma>.99?1.:mix(exp(-abs(dot(cP,vec3(.2126,.7152,.0722))-lumaC)/lumaSigma),1.,relaxLuma);
           float w=wK*wL;
           sum+=cP*w;
           wSum+=w;
         }
       }
-      o=vec4(sum/wSum,1.);
+      o=vec4(sum/wSum,cFull.a);
     }`}));
   const lastCamera=new T.Matrix4();
   // Two compiled variants per mode: with mover code, and without it (NO_DYN) for when no mover
@@ -1331,11 +1392,11 @@ try {
     let rg=radianceGrids[activeScene];
     if(!rg){
       if(activeScene==='gallery'){
-        rg=buildRadianceGrid([galleryMesh],T,{halfData:galleryHalf,dims:galleryMeta.dims,min:galleryMeta.min,span:galleryMeta.span,sceneId:2});
+        rg=buildRadianceGrid([galleryMesh],T,{halfData:galleryHalf,field:galleryField,dims:galleryMeta.dims,min:galleryMeta.min,span:galleryMeta.span,sceneId:2},{renderer,FullScreenQuad});
       }else if(activeScene==='atrium'){
-        rg=buildRadianceGrid([atriumMesh],T,{halfData:atriumHalf,dims:atriumMeta.dims,min:atriumMeta.min,span:atriumMeta.span,sceneId:1});
+        rg=buildRadianceGrid([atriumMesh],T,{halfData:atriumHalf,field:atriumField,dims:atriumMeta.dims,min:atriumMeta.min,span:atriumMeta.span,sceneId:1},{renderer,FullScreenQuad});
       }else{
-        rg=buildRadianceGrid([mesh],T,{halfData:half,dims:[256,176,80],min:[-1,-1,-1],span:[26,18,8],sceneId:0});
+        rg=buildRadianceGrid([mesh],T,{halfData:half,field,dims:[256,176,80],min:[-1,-1,-1],span:[26,18,8],sceneId:0},{renderer,FullScreenQuad});
       }
       radianceGrids[activeScene]=rg;
     }
@@ -1424,7 +1485,18 @@ try {
       const activePass=useGI?aoPassGI:(useBent?aoPassBent:aoPass);
       const cur=histPair[histIndex],prev=histPair[1-histIndex],m=activePass.material.uniforms;
       camera.updateMatrixWorld();
-      traced.histMax.value=camera.matrixWorld.equals(lastCamera)?128:32;lastCamera.copy(camera.matrixWorld);
+      const stillCamera=camera.matrixWorld.equals(lastCamera);
+      traced.histMax.value=stillCamera?128:32;lastCamera.copy(camera.matrixWorld);
+      if(useGI&&stillCamera&&giSunCooldown===0&&dyn.dynCount.value===0&&traced.settleFrames.value>0&&giAccumFrames>=128&&giDenoiseCached){
+        // Fully settled static GI frame: reuse cached AO, bent-normal & denoised GI targets directly.
+        const lastWritten=histPair[1-histIndex];
+        traced.aoTex.value=lastWritten.textures[0];traced.aoNormalTex.value=lastWritten.textures[1];
+        traced.aoBentTex.value=lastWritten.textures[2];
+        traced.aoGITex.value=giDenoiseTargets[giDenoiseLastIdx].texture;
+        renderer.setRenderTarget(null);renderer.render(scene,camera);
+        traced.frame.value++;
+        return;
+      }
       const material=mesh.material,bg=scene.background,cc=renderer.getClearColor(new T.Color()),ca=renderer.getClearAlpha();
       setMaterial(gMaterial);scene.background=null;renderer.setClearColor(0,0);
       renderer.setRenderTarget(gTarget);renderer.render(scene,camera);
@@ -1432,7 +1504,25 @@ try {
       m.gPos.value=gTarget.textures[0];m.gNormal.value=gTarget.textures[1];
       m.histTex.value=prev.textures[0];m.normalTex.value=prev.textures[1];
       if(useBent)m.bentTex.value=prev.textures[2];
-      if(useGI)m.giTex.value=prev.textures[3];
+      let sunMoving=false,giSmooth=0,giFullySettled=false;
+      if(useGI){
+        m.giTex.value=prev.textures[3];
+        sunMoving=giSunCooldown>0;
+        if(!stillCamera){
+          giAccumFrames=Math.min(giAccumFrames+1,32);
+          giDenoiseCached=false;
+        }else if(sunMoving){
+          giAccumFrames=1;
+          giDenoiseCached=false;
+        }else{
+          giAccumFrames=Math.min(giAccumFrames+1,128);
+        }
+        giSmooth=sunMoving||giAccumFrames<12?1:Math.max(0,Math.min(1,(48-giAccumFrames)/36));
+        m.giFrames.value=giAccumFrames;
+        m.giAlphaFloor.value=sunMoving?.16:0;
+        m.giSmoothFactor.value=giSmooth;
+        giFullySettled=stillCamera&&!sunMoving&&traced.settleFrames.value>0&&giAccumFrames>=128;
+      }
       traced.curViewProj.value.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
       traced.curView.value.copy(camera.matrixWorldInverse);
       traced.invProjXY.value.set(1/camera.projectionMatrix.elements[0],1/camera.projectionMatrix.elements[5]);
@@ -1445,13 +1535,31 @@ try {
       traced.aoTex.value=cur.textures[0];traced.aoNormalTex.value=cur.textures[1];
       if(useBent)traced.aoBentTex.value=cur.textures[2];
       if(useGI){
-        const du=giDenoisePass.material.uniforms;
-        du.aoTex.value=cur.textures[0];du.aoNormalTex.value=cur.textures[1];
-        du.giSrc.value=cur.textures[3];du.stepSize.value=1;
-        renderer.setRenderTarget(giDenoiseTargets[0]);giDenoisePass.render(renderer);
-        du.giSrc.value=giDenoiseTargets[0].texture;du.stepSize.value=3;
-        renderer.setRenderTarget(giDenoiseTargets[1]);giDenoisePass.render(renderer);
-        traced.aoGITex.value=giDenoiseTargets[1].texture;
+        if(giFullySettled&&giDenoiseCached){
+          traced.aoGITex.value=giDenoiseTargets[giDenoiseLastIdx].texture;
+        }else{
+          const du=giDenoisePass.material.uniforms;
+          du.aoTex.value=cur.textures[0];du.aoNormalTex.value=cur.textures[1];
+          du.giSmoothFactor.value=giSmooth;
+          if(sunMoving||giAccumFrames<16){
+            du.giSrc.value=cur.textures[3];du.stepSize.value=1;
+            renderer.setRenderTarget(giDenoiseTargets[0]);giDenoisePass.render(renderer);
+            du.giSrc.value=giDenoiseTargets[0].texture;du.stepSize.value=3;
+            renderer.setRenderTarget(giDenoiseTargets[1]);giDenoisePass.render(renderer);
+            du.giSrc.value=giDenoiseTargets[1].texture;du.stepSize.value=6;
+            renderer.setRenderTarget(giDenoiseTargets[0]);giDenoisePass.render(renderer);
+            giDenoiseLastIdx=0;
+          }else{
+            du.giSrc.value=cur.textures[3];du.stepSize.value=1;
+            renderer.setRenderTarget(giDenoiseTargets[0]);giDenoisePass.render(renderer);
+            du.giSrc.value=giDenoiseTargets[0].texture;du.stepSize.value=3;
+            renderer.setRenderTarget(giDenoiseTargets[1]);giDenoisePass.render(renderer);
+            giDenoiseLastIdx=1;
+          }
+          traced.aoGITex.value=giDenoiseTargets[giDenoiseLastIdx].texture;
+          if(giFullySettled)giDenoiseCached=true;
+        }
+        if(giSunCooldown>0)giSunCooldown--;
       }
       renderer.setRenderTarget(null);renderer.render(scene,camera);
       traced.prevViewProj.value.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
@@ -1503,6 +1611,7 @@ try {
     if(historiesBent)for(const rt of historiesBent){renderer.setRenderTarget(rt);renderer.clear();}
     if(historiesGI)for(const rt of historiesGI){renderer.setRenderTarget(rt);renderer.clear();}
     renderer.setRenderTarget(null);
+    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;
   }
   function setGI(on){
     giMode.value=!!on;
@@ -1530,8 +1639,10 @@ try {
       const s=sdfUniforms.sunDir.value;
       radianceGrids[activeScene].relight([s.x,s.y,s.z]);
     }
-    traced.frame.value=0;
-    resetHistory();
+    // Keep static AO & bent-normal history intact; only mark GI responsive & invalidate GI denoise cache.
+    giSunCooldown=2;
+    giAccumFrames=1;
+    giDenoiseCached=false;
     updateStatus();
     resetFps();
   }

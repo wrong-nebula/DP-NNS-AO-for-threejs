@@ -412,12 +412,21 @@ def main():
                 aoDemo.setGI(true);
                 aoDemo.traced.frame.value = 0; aoDemo.resetHistory();
                 for (let i = 0; i < 70; i++) aoDemo.render(64);
+                const giFrame70 = measure(() => aoDemo.render(64), 20);
+                for (let i = 0; i < 65; i++) aoDemo.render(64);
                 const giSettled = measure(() => aoDemo.render(64), 25);
+                let sweepDeg = 10;
+                const giMovingSun = measure(() => {
+                    sweepDeg = sweepDeg >= 40 ? 10 : sweepDeg + 2;
+                    aoDemo.setSunAngle(sweepDeg);
+                    aoDemo.render(64);
+                }, 15);
+                aoDemo.setSunAngle(22);
                 const giEarly = measure(() => {
                     aoDemo.traced.frame.value = 0; aoDemo.resetHistory(); aoDemo.render(64);
                 }, 15);
 
-                return { aoEarly, aoSettled, giEarly, giSettled };
+                return { aoEarly, aoSettled, giEarly, giFrame70, giSettled, giMovingSun };
             }""")
 
             browser.close()
@@ -460,7 +469,7 @@ def main():
     print(f"Gallery AO-only  vs GI Ref: RGB MAE = {ao_only_mae_vs_gi_ref:.5f}, PSNR = {ao_only_psnr_vs_gi_ref:.2f} dB")
     print(f"Gallery 1-Bounce vs GI Ref: RGB MAE = {gi_mae_vs_gi_ref:.5f}, PSNR = {gi_psnr_vs_gi_ref:.2f} dB")
     print(f"Timing (AO-only):           early {timings['aoEarly']:.2f} ms/f, settled {timings['aoSettled']:.2f} ms/f")
-    print(f"Timing (1-Bounce GI):       early {timings['giEarly']:.2f} ms/f, settled {timings['giSettled']:.2f} ms/f")
+    print(f"Timing (1-Bounce GI):       early {timings['giEarly']:.2f} ms/f, frame-70 {timings['giFrame70']:.2f} ms/f, settled {timings['giSettled']:.2f} ms/f, moving-sun {timings['giMovingSun']:.2f} ms/f")
     print(f"Saved report: {out_json}")
 
     if gl_errors or console_errors or page_errors:

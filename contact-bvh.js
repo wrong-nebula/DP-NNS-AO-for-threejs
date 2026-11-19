@@ -412,11 +412,11 @@ vec4 tracedAOBentGI(vec3 p,vec3 n,float nd,out vec3 giOutIrr){
   }
   // Continue sphere-tracing past 1.12 m up to giMaxDist to capture room-scale color bleeding
   if(!giHit&&giMaxDist>1.12){
-   for(int k=0;k<18;k++){
+   for(int k=0;k<14;k++){
     float d=staticDistance(p+w*s);
     if(d>1e3)break;
     if(d<.042){giHit=true;tGi=s+max(d,0.);break;}
-    s+=max(d,.085);
+    s+=d>.30?d*1.15:max(d,.08);
     if(s>giMaxDist)break;
    }
   }
