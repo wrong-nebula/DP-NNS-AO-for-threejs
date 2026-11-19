@@ -1,12 +1,64 @@
 # Fast SDF AO
 
-Real-time ambient occlusion for Three.js from a baked signed distance field (SDF): a four-read formula, exact distances to moving objects, and an exact baker for meshes and point clouds. **Traced SDF (temporal)** combines exact near-surface triangle intersections (quantized SAH local BVH, or opt-in Hi-Z screen-space contact tracing) with an isotropic `256 × 176 × 80` FP16 SDF for farther visibility, half-resolution tangent-plane-aware upsampling, variance-guided temporal accumulation, and exact analytic/traced moving-object occlusion. See [nextgen-log.md](benchmark/nextgen-log.md) for current Apple M1 GPU accuracy, perceptual, temporal, and timing results (and [contact-results.md](benchmark/contact-results.md) for the earlier contact-repair baseline).
+**[Live Interactive Demo](https://wrong-nebula.github.io/Fast-SDF-AO/)** · Switch between **Archive (Boxes + 11 Movers)** and **Atrium (Curved Meshes)**, compare 7 AO modes, and toggle **PBR + Multi-Bounce + Bent Normals**, **Hi-Z contact**, **Smooth falloff**, or **AO mask**.
+
+Real-time ambient occlusion for Three.js from a baked signed distance field (SDF): a four-read formula, exact distances to moving objects, and an exact baker for meshes and point clouds. **Traced SDF (temporal)** combines exact near-surface triangle intersections (quantized SAH local BVH, or opt-in Hi-Z screen-space contact tracing) with an isotropic FP16 SDF for farther visibility, half-resolution tangent-plane-aware upsampling, variance-guided temporal accumulation, and exact analytic/traced moving-object occlusion. See [nextgen-log.md](benchmark/nextgen-log.md) for current Apple M1 GPU accuracy, perceptual, temporal, and timing results (and [contact-results.md](benchmark/contact-results.md) for the earlier contact-repair baseline).
 
 The project started from the DP-NNS nearest-neighbour paper, which motivates SDF baking, but it does not use DP-NNS: the baker computes exact distances to triangles with a BVH. *Why not DP-NNS* below explains why, with measurements.
 
-This repository is an interactive Three.js ambient occlusion comparison using the Archive scene, with stairs, shelves, and walls, plus 11 moving objects. Orbit the scene, switch among seven AO modes, toggle **PBR + Multi-Bounce**, **Hi-Z contact**, **Smooth falloff**, or **AO mask**, and inspect the live FPS counter.
+Serve this directory over HTTP and open `index.html` in a WebGL 2 browser (or open the [live GitHub Pages demo](https://wrong-nebula.github.io/Fast-SDF-AO/)). The Archive scene and FP16 distance field are embedded; the Curved Atrium scene (`assets/atrium-scene.js`, `assets/atrium.f16.gz`, 368 KB) lazy-loads on demand; the contact accelerator loads from `contact-bvh.js`. Three.js and its addons load from a pinned CDN URL.
 
-Serve this directory over HTTP and open `index.html` in a WebGL 2 browser. The scene and FP16 distance field are embedded; the contact accelerator loads from the local `contact-bvh.js` module. Three.js and its addons load from a pinned CDN URL.
+## Using Fast-SDF-AO in Three.js
+
+### 1. Bake an SDF from any OBJ / PLY mesh (`bake-sdf` CLI)
+
+```bash
+npx bake-sdf --obj scene.obj --lo -6.5 -6.5 -0.5 --span 13 13 6.5 \
+  --res-xyz 112 112 56 --clip 1.5 --reach 1.12 --f16 --validate 2000 --out scene.f16
+```
+
+`bin/bake-sdf.mjs` compiles `tools/bake_sdf.cpp` on first run (C++17, zero external dependencies) and caches the binary in `os.tmpdir()`.
+
+### 2. Drop-in 4-Tap SDF AO on any Three.js WebGL2 material (zero extra passes)
+
+```js
+import * as THREE from 'three';
+import { loadSDF, patchMaterialWithSDFAO } from 'fast-sdf-ao';
+
+const field = await loadSDF('./assets/atrium.f16.gz', { dims: [112, 112, 56], format: 'f16' });
+const material = new THREE.MeshStandardMaterial({ color: 0xd8cfc0, roughness: 0.55 });
+patchMaterialWithSDFAO(material, {
+  field,
+  min: [-6.5, -6.5, -0.5],
+  span: [13, 13, 6.5],
+  radius: 1.12,
+  multiBounce: true, // Jimenez multi-bounce colored AO + GTSO specular occlusion
+});
+```
+
+### 3. Three.js r187+ WebGPU / TSL `aoNode` (zero pre-pass, zero post-processing)
+
+```js
+import { loadSDF } from 'fast-sdf-ao';
+import { createSDFAONode } from 'fast-sdf-ao/tsl';
+
+const field = await loadSDF('./assets/atrium.f16.gz', { dims: [112, 112, 56], format: 'f16' });
+material.aoNode = createSDFAONode({ field, min: [-6.5, -6.5, -0.5], span: [13, 13, 6.5] });
+```
+
+### 4. Traced SDF + Quantized SAH Contact BVH (`TracedSDFAO`)
+
+```js
+import { loadSDF, TracedSDFAO } from 'fast-sdf-ao';
+
+const field = await loadSDF('./assets/atrium.f16.gz', { dims: [112, 112, 56], format: 'f16' });
+const tracedAO = await TracedSDFAO.create(renderer, scene, camera, {
+  field, min: [-6.5, -6.5, -0.5], span: [13, 13, 6.5],
+  staticMeshes: [atriumMesh], width: 1280, height: 720, bentNormals: true,
+});
+// In your render loop:
+const { aoTex, normalTex, bentTex } = tracedAO.update();
+```
 
 ## Traced SDF (temporal)
 
@@ -30,6 +82,20 @@ Validated on Apple M1 GPU (`benchmark/judge_v2.py`) across 6 views, 5 cm contact
 | Orbit 3°/f / Movers near (continuous) | 0.01150 / 0.03784 | **0.00975 / 0.02024** | **-15.2% / -46.5%** |
 | Wall ms/f (early / orbit / settled) | 3.106 / 2.200 / 0.912 | **2.988** / 2.450 / 1.100 | **-3.8% early** |
 | Contact BVH build / VRAM | 96.0 ms / 1,429.1 KiB | **16.5 ms / 398.6 KiB** | **5.8× faster / 3.6× smaller** |
+
+### Curved Atrium Scene (Non-Box Generalization)
+
+To validate Fast-SDF-AO on curved, non-axis-aligned triangle geometry with **zero** `wallFace` metadata, `index.html` includes a second selectable **Atrium (Curved)** rotunda scene ([`assets/atrium-scene.js`](assets/atrium-scene.js), 13,704 triangles: 8 fluted columns with torus bases/capitals, curved vaulted arches, curved apse wall & cornice, thin curved balustrades, 4 non-90° angled stone benches, tiered circular pedestal, bronze torus knot, lathed teapot & amphorae, and alabaster spheres). Its isotropic `112 × 112 × 56` FP16 SDF (`assets/atrium.f16.gz`, 368 KB gz, 11.6 cm voxels) bakes in 60.5 ms with 0 mismatches / 0 sign errors on 2,000 brute-force voxels.
+
+Scored on Apple M1 Chrome WebGL2 (`benchmark/bench_atrium.py`) against an independent **512-ray exact triangle reference** (`tools/trace_tris.cpp`, 57,371 sampled pixels, 1.12 m radius, 0 GL errors):
+
+| Curved Atrium (1280 × 720, 13,704 curved tris) | MAE vs 512-ray ref | RMSE | Wall ms/f |
+|---|---:|---:|---:|
+| **Traced SDF + SAH BVH (frame 1 / 4 / 16 / 64)** | 0.03723 / 0.02265 / 0.01503 / **0.01164** | **0.02471** | 12.0 early / **2.50** settled |
+| 4-Tap Wall-Correction SDF (`wallFace = 0`) | 0.05147 | 0.08102 | **1.20** |
+| 4-Tap Original SDF (generic) | 0.07400 | 0.10364 | **1.20** |
+| SSAO (Three.js 0.170) | 0.10597 | 0.15853 | 3.30 |
+| GTAO (Three.js 0.170) | 0.15127 | 0.24576 | 6.20 |
 
 Inspect `aoDemo.contactResources` for textures, memory, and build metadata. After changing static triangles or instance transforms, call `aoDemo.rebuildStaticContact()` (or supply a mesh array and `{gridSize, range, bias}`). This disposes the previous accelerator and resets temporal history. It does **not** rebake the far SDF, which must also be updated when static geometry changes.
 
