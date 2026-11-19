@@ -971,7 +971,7 @@ void main(){
     }else{
       frames=min(h.y,histMax);aoStatic=h.x;aoVar=h.z;bentN=prevBent;
     }
-    float giAlpha=h.y<.5?1.:max(1./max(giFrames,1.),giAlphaFloor);
+    float giAlpha=h.y<.5?1.:(giAlphaFloor>.001?giAlphaFloor:1./max(giFrames,1.));
     giIrr=mix(prevGI.rgb,sampleGI,giAlpha);
     // Cache half-res sun shadow in giOut.a when sun moves, camera moves, or first frame
     if(sunShOut<-.5||giAlphaFloor>.01||giFrames<2.5){
@@ -1617,17 +1617,18 @@ try {
         m.giTex.value=prev.textures[3];
         sunMoving=giSunCooldown>0;
         if(!stillCamera){
-          giAccumFrames=Math.min(giAccumFrames+1,32);
+          giAccumFrames=Math.min(Math.max(giAccumFrames+1,1),32);
           giDenoiseCached=false;
         }else if(sunMoving){
-          giAccumFrames=1;
+          // Keep effective EMA history count ~8 so when motion stops, convergence 8->128 is seamless (no pop).
+          giAccumFrames=Math.min(Math.max(giAccumFrames,8),12);
           giDenoiseCached=false;
         }else{
           giAccumFrames=Math.min(giAccumFrames+1,128);
         }
-        giSmooth=sunMoving||giAccumFrames<12?1:Math.max(0,Math.min(1,(48-giAccumFrames)/36));
+        giSmooth=(!stillCamera||sunMoving||giAccumFrames<12)?1:Math.max(0,Math.min(1,(48-giAccumFrames)/36));
         m.giFrames.value=giAccumFrames;
-        m.giAlphaFloor.value=sunMoving?.16:0;
+        m.giAlphaFloor.value=sunMoving?.12:(!stillCamera?.14:0);
         m.giSmoothFactor.value=giSmooth;
         giFullySettled=stillCamera&&!sunMoving&&traced.settleFrames.value>0&&giAccumFrames>=128;
       }
@@ -1649,7 +1650,7 @@ try {
           const du=giDenoisePass.material.uniforms;
           du.aoTex.value=cur.textures[0];du.aoNormalTex.value=cur.textures[1];
           du.giSmoothFactor.value=giSmooth;
-          if(sunMoving||giAccumFrames<16){
+          if(!stillCamera||sunMoving||giAccumFrames<16){
             du.giSrc.value=cur.textures[3];du.stepSize.value=1;
             renderer.setRenderTarget(giDenoiseTargets[0]);giDenoisePass.render(renderer);
             du.giSrc.value=giDenoiseTargets[0].texture;du.stepSize.value=3;
