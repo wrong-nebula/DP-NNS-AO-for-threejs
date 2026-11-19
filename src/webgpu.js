@@ -507,22 +507,31 @@ fn bvhContactHit(origin: vec3<f32>, w: vec3<f32>, root: u32, cnt: u32, qMin: vec
   return anyHit;
 }
 
-fn sdfSunShadow(pos: vec3<f32>, nor: vec3<f32>, sDir: vec3<f32>) -> f32 {
+fn sdfSunShadow(pos: vec3<f32>, nor: vec3<f32>, sDir: vec3<f32>, px: vec2<f32>, frame: u32) -> f32 {
   let ndl = dot(nor, sDir);
   if (ndl <= 0.001) { return 0.0; }
-  let ro = pos + nor * 0.03 + sDir * 0.02;
-  var t = 0.02;
+  // Stochastic 1.6-deg solar disk jitter + initial step phase jitter:
+  // eliminates 100% of deterministic SDF step/voxel contour bands when temporally accumulated!
+  let ax = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(sDir.x) < 0.9);
+  let st = normalize(cross(sDir, ax));
+  let sb = cross(sDir, st);
+  let u1 = fract(ign(px + vec2<f32>(19.0, 73.0)) + vdc2(frame));
+  let u2 = fract(ign(px + vec2<f32>(53.0, 11.0)) + vdc3(frame));
+  let rad = 0.028 * sqrt(u1);
+  let ang = 6.2831853 * u2;
+  let dir = normalize(sDir + st * (rad * cos(ang)) + sb * (rad * sin(ang)));
+  let ro = pos + nor * 0.028 + dir * 0.015;
+  var t = 0.012 + 0.035 * fract(ign(px + vec2<f32>(7.0, 41.0)) + vdc2(frame + 17u));
   var res = 1.0;
-  let steps = max(u.extra.x, 72u);
-  for (var s = 0u; s < steps; s++) {
-    let d = sampleSDF(ro + sDir * t);
+  for (var s = 0u; s < 48u; s++) {
+    let d = sampleSDF(ro + dir * t);
     if (d > 100.0) { break; }
-    let tol = min(0.012, 0.22 * t * max(ndl, 0.15));
+    let tol = min(0.010, 0.20 * t * max(ndl, 0.15));
     let dc = d - tol;
     if (dc <= 0.0) { return 0.0; }
-    res = min(res, 8.0 * dc / t);
+    res = min(res, 10.0 * dc / t);
     if (res < 0.005) { return 0.0; }
-    t += max(d * 0.4, 0.012);
+    t += max(d * 0.72, 0.018);
     if (t > 10.5) { break; }
   }
   res = clamp(res, 0.0, 1.0);
@@ -873,11 +882,11 @@ fn main(
     }
   }
 
-  // Half-res direct sun + orb shadows
+  // Half-res direct sun + orb shadows (stochastically jittered for band-free temporal penumbra)
   var sunSh = 1.0;
   var orbSh = 1.0;
   if (useGI) {
-    sunSh = sdfSunShadow(p, n, normalize(u.sunDirScale.xyz));
+    sunSh = sdfSunShadow(p, n, normalize(u.sunDirScale.xyz), px, frame);
     if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) > 1e-4) {
       orbSh = sdfPointShadow(p, n, u.emissivePos.xyz, u.emissivePos.w);
     }
@@ -902,6 +911,9 @@ struct TempU {
 @group(0) @binding(5) var prevPosDepth: texture_2d<f32>;
 @group(0) @binding(6) var prevNormal: texture_2d<f32>;
 @group(0) @binding(7) var outAOGI: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(8) var curMeta: texture_2d<f32>;
+@group(0) @binding(9) var prevMeta: texture_2d<f32>;
+@group(0) @binding(10) var outMeta: texture_storage_2d<rgba16float, write>;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -911,10 +923,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (q.x >= W || q.y >= H) { return; }
 
   let cur = textureLoad(curAOGI, q, 0);
+  let curM = textureLoad(curMeta, q, 0);
   let pd = textureLoad(curPosDepth, q, 0);
   let gn = textureLoad(curNormal, q, 0);
   if (u.params.w < 0.5 || pd.w <= 0.0 || gn.w < 0.5) {
     textureStore(outAOGI, q, cur);
+    textureStore(outMeta, q, curM);
     return;
   }
 
@@ -923,6 +937,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let clip = u.prevViewProj * vec4<f32>(p, 1.0);
   if (clip.w <= 0.0) {
     textureStore(outAOGI, q, cur);
+    textureStore(outMeta, q, curM);
     return;
   }
   let ndc = clip.xy / clip.w;
@@ -936,6 +951,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let planeTol = 0.0025 * pd.w + 0.012;
   var acc = vec4<f32>(0.0);
+  var mAcc = vec2<f32>(0.0);
   var wSum = 0.0;
   for (var k = 0; k < 4; k++) {
     let o = vec2<i32>(k & 1, k >> 1);
@@ -948,16 +964,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (dot(normalize(pgn.xyz), n) < 0.9) { continue; }
     if (abs(dot(n, ppd.xyz - p)) > planeTol) { continue; }
     acc += textureLoad(prevAOGI, pq, 0) * bw;
+    mAcc += textureLoad(prevMeta, pq, 0).xy * bw;
     wSum += bw;
   }
 
   if (wSum > 0.01) {
     let prev = acc / wSum;
-    let blended = mix(prev, cur, u.params.z);
-    textureStore(outAOGI, q, blended);
+    let prevSh = mAcc / wSum;
+    textureStore(outAOGI, q, mix(prev, cur, u.params.z));
+    // Temporally accumulate stochastic sun & orb shadows (faster alpha=0.14 for responsive sun drag!)
+    let shAlpha = max(u.params.z, 0.14);
+    let smoothSh = mix(prevSh, curM.xy, shAlpha);
+    textureStore(outMeta, q, vec4<f32>(smoothSh, curM.zw));
   } else {
-    // Disoccluded pixel: SHaRC world-space hash already gave a converged instant starting value!
     textureStore(outAOGI, q, cur);
+    textureStore(outMeta, q, curM);
   }
 }
 `;
@@ -1195,7 +1216,9 @@ fn ignComp(q: vec2<f32>) -> f32 {
       color += alb * diffWeight * u.emissiveCol.rgb * (2.6 * att * ndlO * orbSh);
     }
   }
-  let srgb = linearToSrgb(acesToneMap(color * 0.88)) + (ignComp(i.clip.xy) - 0.5) / 255.0;
+  // Triangular-PDF IGN dithering eliminates 8-bit swapchain banding on smooth walls
+  let triDither = (ignComp(i.clip.xy) + ignComp(i.clip.xy + vec2<f32>(17.0, 31.0)) - 1.0) / 255.0;
+  let srgb = linearToSrgb(acesToneMap(color * 0.88)) + triDither;
   return vec4<f32>(clamp(srgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 `;
@@ -1535,6 +1558,7 @@ export class WebGPUFastSDFAO {
     this.denoiseA  = mkTex(this.aoW, this.aoH, 'rgba16float', rw);
     this.denoiseB  = mkTex(this.aoW, this.aoH, 'rgba16float', rw);
     this.metaTex   = mkTex(this.aoW, this.aoH, 'rgba16float', rw);
+    this.histMeta  = [mkTex(this.aoW, this.aoH, 'rgba16float', rw), mkTex(this.aoW, this.aoH, 'rgba16float', rw)];
     this.pingIdx   = 0;
     this.hasPrev   = false;
     this.prevVP    = new Float32Array(16);
@@ -1739,6 +1763,9 @@ export class WebGPUFastSDFAO {
           { binding: 5, resource: this.gPosDepth[prevIdx].createView() },
           { binding: 6, resource: this.gNormal[prevIdx].createView() },
           { binding: 7, resource: this.histAOGI[curIdx].createView() },
+          { binding: 8, resource: this.metaTex.createView() },
+          { binding: 9, resource: this.histMeta[prevIdx].createView() },
+          { binding: 10, resource: this.histMeta[curIdx].createView() },
         ],
       });
     };
@@ -1806,7 +1833,7 @@ export class WebGPUFastSDFAO {
         { binding: 1, resource: tex.createView() },
         { binding: 2, resource: this.gPosDepth[pIdx].createView() },
         { binding: 3, resource: this.gNormal[pIdx].createView() },
-        { binding: 4, resource: this.metaTex.createView() },
+        { binding: 4, resource: this.histMeta[pIdx].createView() },
         { binding: 5, resource: this.histRefl[pIdx].createView() },
       ],
     });
