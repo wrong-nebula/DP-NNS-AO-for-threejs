@@ -291,19 +291,22 @@ float staticDistance(vec3 pos){
   return d;
 }
 float sdfSunShadow(vec3 pos,vec3 nor,vec3 sDir){
-  vec3 ro=pos+nor*.018+sDir*.012;
-  float ndl=max(dot(nor,sDir),.1);
-  float t=.012,res=1.;
-  for(int s=0;s<48;s++){
+  vec3 ro=pos+nor*.03+sDir*.02;
+  float ndl=max(dot(nor,sDir),.15);
+  float t=.02,res=1.;
+  for(int s=0;s<80;s++){
     float d=staticDistance(ro+sDir*t);
     if(d>100.)break;
-    float tol=min(.008,.15*t*ndl);
-    if(d<tol)return 0.;
-    res=min(res,10.*max(d-tol,0.)/t);
-    t+=max(d,.025);
-    if(t>9.5)break;
+    float tol=min(.012,.22*t*ndl);
+    float dc=d-tol;
+    if(dc<=0.)return 0.;
+    res=min(res,8.*dc/t);
+    if(res<.005)return 0.;
+    t+=max(d*.4,.012);
+    if(t>10.5)break;
   }
-  return clamp(res,0.,1.);
+  res=clamp(res,0.,1.);
+  return res*res*(3.-2.*res);
 }
 float sdBox(vec3 q,vec3 h){
   vec3 d=abs(q)-h;
