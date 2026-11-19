@@ -92,7 +92,7 @@ def trace_reference_512(tris_path: Path, pos_xyz: np.ndarray, nor_xyz: np.ndarra
 
     # Batch pixels to keep temp file size modest
     ao_ref = np.zeros(n_px, dtype=np.float32)
-    batch_px = 4096
+    batch_px = 1024
     with tempfile.TemporaryDirectory(prefix="atrium-ref-") as tmp:
         rays_file = Path(tmp) / "rays.f32"
         hits_file = Path(tmp) / "hits.u8"

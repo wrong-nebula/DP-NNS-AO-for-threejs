@@ -233,6 +233,179 @@ float candidateAO(vec3 p,vec3 n){
  float nd=frame<8.?4.:(frame<16.?3.:2.);
  return candidateAOBent(p,n,nd).x;
 }
+#ifdef DIFFUSE_GI
+uniform sampler3D radianceVol;
+uniform float radianceScale;
+uniform float giMaxDist;
+bool contactTestLeafHit(uint meta,vec3 origin,vec3 w,inout float bestT){
+ int first=int((meta&0x7FFFFFFFu)>>3u);
+ int count=int(meta&7u);
+ bool hit=false;
+ for(int j=0;j<7;j++){
+  if(j>=count)break;
+  int tri=(first+j)*3;
+  vec3 v0=contactFetch(contactTriangles,tri).xyz;
+  vec3 e1=contactFetch(contactTriangles,tri+1).xyz;
+  vec3 e2=contactFetch(contactTriangles,tri+2).xyz;
+  vec3 h=cross(w,e2);
+  float det=dot(e1,h);
+  if(abs(det)<1e-10)continue;
+  float invDet=1./det;
+  vec3 s=origin-v0;
+  float u=dot(s,h)*invDet;
+  if(u<0.||u>1.)continue;
+  vec3 q=cross(s,e1);
+  float v=dot(w,q)*invDet;
+  if(v<0.||u+v>1.)continue;
+  float distance=dot(e2,q)*invDet;
+  if(distance>0.&&distance<bestT){bestT=distance;hit=true;}
+ }
+ return hit;
+}
+bool contactHitCell(vec3 origin,vec3 w,int root,int treeCount,vec3 qMin,vec3 qScale,out float tHit){
+ tHit=contactRange;
+ if(treeCount<=0)return false;
+ vec3 inv=1./vec3(abs(w.x)<1e-12?1e-12:w.x,abs(w.y)<1e-12?1e-12:w.y,abs(w.z)<1e-12?1e-12:w.z);
+ vec3 qInv=qScale*inv;
+ vec3 qOff=(qMin-origin)*inv;
+ if(treeCount==1){
+  uvec4 nd=contactFetchNode(root);
+  if(contactBoxHit(nd,qInv,qOff)<0.)return false;
+  return contactTestLeafHit(nd.w,origin,w,tHit);
+ }
+ bool anyHit=false;
+ int stack[16];
+ int sp=0;
+ int pair=root;
+ for(int visit=0;visit<1024;visit++){
+  uvec4 ndL=contactFetchNode(pair);
+  uvec4 ndR=contactFetchNode(pair+1);
+  float tL=contactBoxHit(ndL,qInv,qOff);
+  float tR=contactBoxHit(ndR,qInv,qOff);
+  bool hitL=tL>=0.&&tL<tHit;
+  bool hitR=tR>=0.&&tR<tHit;
+  if(hitL&&(ndL.w&0x80000000u)!=0u){
+   if(contactTestLeafHit(ndL.w,origin,w,tHit))anyHit=true;
+   hitL=false;
+  }
+  if(hitR&&(ndR.w&0x80000000u)!=0u){
+   if(contactTestLeafHit(ndR.w,origin,w,tHit))anyHit=true;
+   hitR=false;
+  }
+  if(hitL&&hitR){
+   if(tL<=tR){
+    if(sp<16)stack[sp++]=int(ndR.w);
+    pair=int(ndL.w);
+   }else{
+    if(sp<16)stack[sp++]=int(ndL.w);
+    pair=int(ndR.w);
+   }
+   continue;
+  }
+  if(hitL){pair=int(ndL.w);continue;}
+  if(hitR){pair=int(ndR.w);continue;}
+  if(sp==0)break;
+  pair=stack[--sp];
+ }
+ return anyHit;
+}
+vec3 sampleRadianceVol(vec3 hitP){
+ vec3 uv=(hitP-sdfMin)*sdfInvSpan;
+ if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return vec3(0.);
+ return texture(radianceVol,uv).rgb*radianceScale;
+}
+vec4 tracedAOBentGI(vec3 p,vec3 n,float nd,out vec3 giOutIrr){
+ vec3 a=abs(n.x)<.9?vec3(1.,0.,0.):vec3(0.,1.,0.);
+ vec3 t=normalize(cross(n,a)),b=cross(n,t);
+ float su=ign(gl_FragCoord.xy);
+ float sp=ign(gl_FragCoord.xy+vec2(37.,17.));
+ float vis=0.;
+ vec3 bent=vec3(0.);
+ vec3 giSum=vec3(0.);
+ float fu=fract(su+vdc2(uint(frame)));
+ uint base=uint(frame)*4u;
+ float minCosClear=2.;
+ if(contactMode==0){
+  float dClear2=staticDistance(p+n*(2.*contactRange));
+  if(dClear2>=2.*contactRange-.004&&dClear2<1e3){
+   minCosClear=.25;
+  }else{
+   float dClear1=staticDistance(p+n*contactRange);
+   if(dClear1>=contactRange-.003&&dClear1<1e3)minCosClear=.5;
+  }
+ }
+ vec3 origin=p+n*contactBias;
+ int cellRoot=0,cellCount=0;
+ vec3 cellQMin=contactRootMin,cellQScale=contactRootSpan*(1./65535.);
+ if(contactMode!=1){
+  if(contactGridSize>0.){
+   ivec3 cell=ivec3(floor((p-contactGridMin)/contactGridSize));
+   ivec3 dims=textureSize(contactGrid,0);
+   if(!any(lessThan(cell,ivec3(0)))&&!any(greaterThanEqual(cell,dims))){
+    uvec2 bounds=texelFetch(contactGrid,cell,0).xy;
+    cellRoot=int(bounds.x);cellCount=int(bounds.y);
+    cellQMin=contactGridMin+vec3(cell)*contactGridSize-vec3(contactRange+abs(contactBias));
+    cellQScale=vec3((contactGridSize+2.*(contactRange+abs(contactBias)))*(1./65535.));
+   }
+  }else{
+   cellCount=contactNodeCount;
+  }
+ }
+ for(int i=0;i<4;i++){
+  if(float(i)>=nd)break;
+  float u=clamp((float(i)+fu)/nd,1e-4,.9999);
+  float phi=6.2831853*fract(sp+vdc3(base+uint(i)));
+  float cosn=sqrt(1.-u);
+  vec3 w=t*(sqrt(u)*cos(phi))+b*(sqrt(u)*sin(phi))+n*cosn;
+  bool skipBvh=cosn>=minCosClear;
+  float tHit=contactRange*.5;
+  bool blocked=false;
+  if(!skipBvh){
+   if(contactMode==1)blocked=contactBlockedHiZ(p,n,w);
+   else blocked=contactHitCell(origin,w,cellRoot,cellCount,cellQMin,cellQScale,tHit);
+  }
+  if(blocked){
+   giSum+=sampleRadianceVol(p+w*tHit);
+   continue;
+  }
+  float s=contactRange,v=1.;
+  bool giHit=false;
+  float tGi=0.,tMinVis=contactRange;
+  for(int k=0;k<16;k++){
+   float d=staticDistance(p+w*s),e=max(min(.025,.1*s*cosn),1e-6);
+   float stepVis=clamp((d+e)/(4.*e),0.,1.);
+   if(smoothFalloff>.5){
+    float fade=smoothstep(1.12,.72,s);
+    stepVis=mix(1.,stepVis,fade);
+   }
+   if(stepVis<v){v=stepVis;tMinVis=s;}
+   if(d<.028&&!giHit){giHit=true;tGi=s+max(d,0.);}
+   if(v<.01){if(!giHit){giHit=true;tGi=s+max(d,0.);}break;}
+   s+=max(d,.072);if(s>1.12)break;
+  }
+  // Continue sphere-tracing past 1.12 m up to giMaxDist to capture room-scale color bleeding
+  if(!giHit&&giMaxDist>1.12){
+   for(int k=0;k<18;k++){
+    float d=staticDistance(p+w*s);
+    if(d>1e3)break;
+    if(d<.042){giHit=true;tGi=s+max(d,0.);break;}
+    s+=max(d,.085);
+    if(s>giMaxDist)break;
+   }
+  }
+  vis+=v;
+  bent+=w*v;
+  if(giHit){
+   giSum+=sampleRadianceVol(p+w*tGi);
+  }else if(v<.99){
+   giSum+=(1.-v)*sampleRadianceVol(p+w*tMinVis);
+  }
+ }
+ giOutIrr=giSum/nd;
+ float bl=length(bent);
+ return vec4(vis/nd,bl>1e-4?bent/bl:n);
+}
+#endif
 `;
 
 const SAH_BINS=8;

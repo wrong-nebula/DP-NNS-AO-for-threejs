@@ -196,3 +196,33 @@ Implemented a standalone WebGPU Compute (WGSL) prototype (`benchmark/webgpu-hash
 | **Archive (1.9k tris)** Wall ms/f (early / orbit / settled) | 2.988 / 2.450 / 1.100 | **2.512 / 2.181 / 1.137** | **-15.9% early / -11.0% orbit** |
 | **Archive (1.9k tris)** GPU ms/f (early / orbit / settled) | 5.742 / 4.545 / 1.899 | **4.700 / 3.882 / 1.797** | **-18.1% early / -14.6% orbit / -5.4% settled** |
 | GL errors / console errors / tests | 0 / 0 | **0 / 0** (`npm test` + `webgl2-smoke.py`) | Pass |
+
+---
+
+## 1-Bounce Real-Time Diffuse GI & Sunlit Gallery Showcase (`post-gi`)
+
+### Architecture Implemented (`assets/gallery-scene.js`, `tools/gen_gallery.mjs`, `radiance-grid.js`, `contact-bvh.js`, `index.html`, `tools/trace_gi.cpp`, `benchmark/bench_gallery_gi.py`)
+1. **Sunlit Color-Bleeding Gallery (`assets/gallery-scene.js`, `assets/gallery.f16.gz`)**:
+   - 9,272 outward-wound triangles (`flipped = 0` asserted in `tools/gen_gallery.mjs`), isotropic `96 × 96 × 64` FP16 SDF (`153 KiB` gz, 8.33 cm voxels, 32.3 ms bake, 0 mismatches / 0 sign errors on 2,000 brute-force voxels).
+   - Terracotta crimson left wall (`[0.80, 0.13, 0.09]`), Mediterranean cobalt/teal right wall (`[0.09, 0.48, 0.64]`), golden ochre floor inlay (`[0.82, 0.58, 0.12]`) under a ceiling skylight, warm alabaster hero sculptures (stepped circular pedestal, smooth sphere, curved torus knot, angled monolith, curved back archway alcove + amphora, right gallery bench + spheres).
+2. **3D Direct-Lit Radiance Voxel Grid (`radiance-grid.js`)**:
+   - Area-weighted triangle splatting (`64 × 64 × 40` `RGBA8` `Data3DTexture`, `640 KiB` VRAM, 18,721 surface voxels) with precomputed 1-voxel surface dilation map so trilinear hit-point lookups never bleed black from empty air.
+   - Dynamic sun relighting (`relight(sunDir)`) evaluates direct sunlit radiance + sphere-traced SDF soft shadows on occupied surface voxels and copies to dilated voxels in **2.00 ms** median (usable on all 3 scenes: `Gallery`, `Atrium`, `Archive`).
+3. **Gated 1-Bounce Diffuse GI Pass (`contact-bvh.js`, `index.html`)**:
+   - 100% gated behind `#ifdef DIFFUSE_GI` (`#gi` toggle, `aoDemo.setGI(on)`): when off, standard `Archive` and `Atrium` AO passes (`aoPass`, 2 MRTs, 12 B/px) remain bit-exact.
+   - `contactHitCell` returns exact near-contact triangle hit distance `tHit`, far SDF rays continue sphere-tracing up to `giMaxDist` (8.5 m on Gallery), accumulating cosine-weighted 1-bounce irradiance into a lazily allocated `RGBA16F` half-res MRT (`giOut`) with view-space tangent-plane temporal reprojection and an edge-preserving 13-tap tangent-plane spatial bilateral upsample filter.
+   - Interactive controls: `Gallery (1-Bounce GI)` scene button, `#gi` (`1-Bounce GI`), `#gimask` (`GI bounce only`), and `#sunangle` (`Sun` angle slider `-65°..+65°`).
+
+### Verified Apple M1 Chrome WebGL2 Results (`benchmark/bench_gallery_gi.py` & Regressions)
+
+| Metric | Value | Notes |
+|---|---:|---|
+| **Gallery AO-only** vs 512-ray GI Ref | RGB MAE **0.35536** / PSNR **7.83 dB** | Dark shadowed crevices, no color bleeding |
+| **Gallery 1-Bounce GI** vs 512-ray GI Ref | RGB MAE **0.03380** / PSNR **25.31 dB** | **10.5× lower RGB MAE, +17.48 dB PSNR** |
+| **Gallery Pure Bounce Irradiance** MAE@64 | **0.05366** (linear RGB) | Against 512-ray `tools/trace_gi.cpp` |
+| **Gallery AO** MAE@64 | **0.01152** | 57,600 sampled pixels |
+| **Gallery Wall ms/f** (AO-only / 1-Bounce GI) | 6.60 / 2.20 ms → **10.20 / 4.00 ms** | Early / settled at 1280 × 720 |
+| **Radiance Grid** (`64 × 64 × 40`, `640 KiB`) | Build **25.7 ms** / Relight **2.00 ms** | Interactive Sun slider relighting |
+| **Archive Regression** (`judge_v2.py --tag post-gi`) | Fit@64 **0.00585** / Held@64 **0.00497** | **Bit-exact**, Wall early/settled 2.65 / 1.23 ms |
+| **Atrium Regression** (`bench_atrium.py`) | MAE@64 **0.01050** / Settled **1.70 ms** | Zero regressions |
+| **Errors** (all 3 scenes × 7 modes × all toggles) | **0 GL / 0 console / 0 page** | `npm test` + `webgl2-smoke.py` Pass |

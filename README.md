@@ -1,12 +1,12 @@
 # Fast SDF AO
 
-**[Live Interactive Demo](https://wrong-nebula.github.io/Fast-SDF-AO/)** · Switch between **Archive (Boxes + 11 Movers)** and **Atrium (Curved Meshes)**, compare 7 AO modes, and toggle **PBR + Multi-Bounce + Bent Normals**, **Hi-Z contact**, **Smooth falloff**, or **AO mask**.
+**[Live Interactive Demo](https://wrong-nebula.github.io/Fast-SDF-AO/)** · Switch between **Archive (Boxes + 11 Movers)**, **Atrium (Curved Meshes)**, and **Gallery (1-Bounce GI)**, compare 7 AO modes, toggle **1-Bounce GI**, **GI bounce only**, **PBR + Multi-Bounce + Bent Normals**, **Hi-Z contact**, **Smooth falloff**, or **AO mask**, and drag the **Sun** angle slider in real time.
 
-Real-time ambient occlusion for Three.js from a baked signed distance field (SDF): a four-read formula, exact distances to moving objects, and an exact baker for meshes and point clouds. **Traced SDF (temporal)** combines exact near-surface triangle intersections (quantized SAH local BVH, or opt-in Hi-Z screen-space contact tracing) with an isotropic FP16 SDF for farther visibility, half-resolution tangent-plane-aware upsampling, variance-guided temporal accumulation, and exact analytic/traced moving-object occlusion. See [nextgen-log.md](benchmark/nextgen-log.md) for current Apple M1 GPU accuracy, perceptual, temporal, and timing results (and [contact-results.md](benchmark/contact-results.md) for the earlier contact-repair baseline).
+Real-time ambient occlusion and **1-bounce diffuse global illumination (color bleeding)** for Three.js from a baked signed distance field (SDF): a four-read formula, exact distances to moving objects, and an exact baker for meshes and point clouds. **Traced SDF (temporal)** combines exact near-surface triangle intersections (quantized SAH local BVH, or opt-in Hi-Z screen-space contact tracing) with an isotropic FP16 SDF for farther visibility, half-resolution tangent-plane-aware upsampling, variance-guided temporal accumulation, exact analytic/traced moving-object occlusion, and an opt-in **1-Bounce Diffuse GI** pass backed by a `64 × 64 × 40` direct-lit 3D radiance voxel grid (`640 KiB` VRAM, `2.0 ms` dynamic sun relighting). See [nextgen-log.md](benchmark/nextgen-log.md) for current Apple M1 GPU accuracy, perceptual, temporal, GI, and timing results (and [contact-results.md](benchmark/contact-results.md) for the earlier contact-repair baseline).
 
 The project started from the DP-NNS nearest-neighbour paper, which motivates SDF baking, but it does not use DP-NNS: the baker computes exact distances to triangles with a BVH. *Why not DP-NNS* below explains why, with measurements.
 
-Serve this directory over HTTP and open `index.html` in a WebGL 2 browser (or open the [live GitHub Pages demo](https://wrong-nebula.github.io/Fast-SDF-AO/)). The Archive scene and FP16 distance field are embedded; the Curved Atrium scene (`assets/atrium-scene.js`, `assets/atrium.f16.gz`, 368 KB) lazy-loads on demand; the contact accelerator loads from `contact-bvh.js`. Three.js and its addons load from a pinned CDN URL.
+Serve this directory over HTTP and open `index.html` in a WebGL 2 browser (or open the [live GitHub Pages demo](https://wrong-nebula.github.io/Fast-SDF-AO/)). The Archive scene and FP16 distance field are embedded; the Curved Atrium (`assets/atrium-scene.js`, `assets/atrium.f16.gz`, 368 KB) and Sunlit Gallery (`assets/gallery-scene.js`, `assets/gallery.f16.gz`, 153 KB) scenes lazy-load on demand; the contact accelerator loads from `contact-bvh.js` and the 3D radiance voxel grid from `radiance-grid.js`. Three.js and its addons load from a pinned CDN URL.
 
 ## Using Fast-SDF-AO in Three.js
 
@@ -105,6 +105,23 @@ Scored on Apple M1 Chrome WebGL2 (`benchmark/bench_atrium.py`) against an indepe
 | Archive (Boxes) | 1,908 | 1.00 m | 7,642 | 1.12 | 19.4 | **2.51** | **1.14** |
 | Atrium (Curved) | 13,704 (7.2×) | 1.00 m | 21,425 | 2.88 | 51.1 | **7.00** | **1.60** |
 | Atrium-55k (1× subdivided) | 54,816 (28.7×) | 0.80 m | 115,920 | 14.88 | 296.7 | **8.60** | **1.70** |
+
+### 1-Bounce Real-Time Diffuse GI (Sunlit Gallery Showcase)
+
+Enabling **1-Bounce GI** (`#gi`, `aoDemo.setGI(true)`, enabled automatically in the **Gallery (1-Bounce GI)** scene and toggleable on **Archive** and **Atrium** too) extends the traced SDF + SAH contact BVH ray loop with room-scale 1-bounce diffuse color bleeding at zero overhead when off (all GI MRTs, shaders, and volume lookups are gated behind `#ifdef DIFFUSE_GI`):
+
+- **3D Direct-Lit Radiance Voxel Grid ([`radiance-grid.js`](radiance-grid.js)):** area-weighted triangle splatting of `(albedo, normal)` with 1-voxel surface dilation onto a `64 × 64 × 40` `RGBA8` `Data3DTexture` (`640 KiB` VRAM, built in ~25 ms once per scene). Dragging the **Sun** angle slider (`#sunangle`, `aoDemo.setSunAngle(deg)`) re-evaluates direct sunlit radiance + SDF soft sun shadows on the ~18.7k occupied surface voxels and dilates in **2.0 ms** on the CPU.
+- **Unified AO + 1-Bounce GI Tracing & Tangent-Plane Bilateral Upsampling:** near-contact BVH hits (`contactHitCell`) return exact hit distance `tHit` and far SDF rays continue sphere-tracing up to `giMaxDist` (8.5 m on Gallery), sampling the trilinear `radianceVol` at `p + w * tHit`. Because rays are cosine-weighted, averaging hits is an unbiased Monte Carlo estimator of 1-bounce diffuse irradiance, temporally accumulated in a gated `RGBA16F` half-res MRT (`giOut`) and upsampled at full resolution with an edge-preserving tangent-plane spatial bilateral filter. Toggle **GI bounce only** (`#gimask`, `aoDemo.setGIMask(true)`) to inspect the pure indirect color-bleeding buffer.
+- **Sunlit Color-Bleeding Gallery ([`assets/gallery-scene.js`](assets/gallery-scene.js)):** 9,272 outward-wound triangles (`flipped = 0`), isotropic `96 × 96 × 64` FP16 SDF (`assets/gallery.f16.gz`, 153 KB gz, 8.33 cm voxels, 0 mismatches / 0 sign errors on 2,000 brute-force voxels) featuring a terracotta crimson left wall, Mediterranean cobalt/teal right wall, golden ochre floor inlay under a skylight opening, stepped pedestal with smooth alabaster sphere & torus knot, angled monolith, curved back archway alcove, and gallery bench.
+
+Scored on Apple M1 Chrome WebGL2 (`benchmark/bench_gallery_gi.py`) against an independent **512-ray 1-bounce diffuse GI + AO reference** (`tools/trace_gi.cpp`, 57,600 sampled pixels, 0 GL / console / page errors across all 3 scenes × 7 modes × all toggles):
+
+| Sunlit Gallery (1280 × 720, 9,272 tris) | RGB MAE vs 512-ray GI ref | PSNR | AO MAE@64 | Wall ms/f (early / settled) |
+|---|---:|---:|---:|---:|
+| Gallery AO-only (`#gi` off) | 0.35536 | 7.83 dB | 0.01152 | 6.60 / 2.20 |
+| **Gallery 1-Bounce GI (`#gi` on)** | **0.03380** (**10.5× lower**) | **25.31 dB** (**+17.5 dB**) | **0.01152** | **10.20 / 4.00** |
+
+Pure bounce-only linear irradiance MAE: `0.05366` · Radiance grid: `64 × 64 × 40` (`640 KiB` VRAM, `25.7 ms` build, `2.00 ms` dynamic sun relight).
 
 Inspect `aoDemo.contactResources` for textures, memory, and build metadata. After changing static triangles or instance transforms, call `aoDemo.rebuildStaticContact()` (or supply a mesh array and `{gridSize, range, bias}`). This disposes the previous accelerator and resets temporal history. It does **not** rebake the far SDF, which must also be updated when static geometry changes.
 
