@@ -296,3 +296,35 @@ Fixed 5 verified visual defects on the Sunlit Gallery 1-Bounce GI renderer witho
 - **Archive Regression (`judge_v2.py --tag post-multibounce`)**: Fit@64 **0.00585**, Held@64 **0.00497**, Contact@64 **0.01877**, FLIP **0.02193**, GMSD **0.01051** (**bit-exact**), 0 errors.
 - **Atrium Regression (`bench_atrium.py`)**: MAE@64 **0.01050** (**bit-exact**), Wall settled **1.90 ms/f**, 0 errors.
 - **Tests**: `npm test` + `python3 test/webgl2-smoke.py` pass with 0 errors.
+
+---
+
+## Steps 1–4: Decoupled Shadows, L1 YCoCg SH REBLUR GI, Quarter-Res & Mipmapped Cone GI, and 4-Tier Quality Settings (`tiers-final`)
+
+### Changes Implemented
+1. **Step 1 (`a293794`) — Decoupled Half-Res `R8` Shadows & Stride-1 REBLUR Feedback**:
+   - Split sun and orb soft shadows into dedicated low-register half-res `R8` full-screen passes (`sunShadowPass`, `orbShadowPass`) that execute only when sun/orb/camera moves, with full-res penumbra refinement in the scene pass.
+   - Fixed stride-1 REBLUR recurrent feedback preservation in `giDenoiseTargets[1]`.
+2. **Step 2 (`42f48ae`) — Decoupled L1 YCoCg SH GI, Hit-Distance À-Trous & Dual Fast/Slow Anti-Lag**:
+   - Upgraded GI to a decoupled 4-MRT L1 YCoCg SH pass (`giSH0` RGBA16F `[Y, Co, Cg, normHitDist]` + `giSH1` RGBA8 `[d1*0.5+0.5, fastLuma]` + `giMeta` + `giDepth`) with hit-distance-guided à-trous wavelet denoising and REBLUR dual fast/slow per-pixel anti-lag.
+3. **Step 3 (`a01cab7`) — Quarter-Res Decoupled GI, `k=4` Empty-Sphere BVH Skip & Mipmapped Voxel Cone GI**:
+   - Decoupled GI resolution to `0.25×` (`320 × 180`) with exact subpixel stride alignment in `tracedAtGI()`, cutting active Gallery GI cost by ~25% and moving-sun cost to `7.3–7.7 ms/f`.
+   - Added `k=4` 1-Lipschitz SDF empty-sphere contact skip (`d(p + n·4R) >= 4R + 0.002` skips 98.4% of rays on open surfaces in 1 SDF fetch).
+   - Added hardware 3D mipmaps (`gl.generateMipmap(gl.TEXTURE_3D)`) on `radianceVol` and a dedicated 5-cone × 6-tap `giConePass` (zero noise, zero temporal lag, zero denoiser passes).
+4. **Step 4 — Unified 4-Tier Quality Settings (`src/index.js`, `index.html`, `benchmark/bench_quality_tiers.py`)**:
+   - Exported `QUALITY_PRESETS` (`low`, `medium`, `high`, `ultra`) from `src/index.js` and added `quality` option + `setQuality(tier)` on `TracedSDFAO`.
+   - Added `#quality` `<select>` in `index.html` nav bar + `aoDemo.setQuality(tier)` + `aoDemo.quality` getter + `?quality=` URL parameter.
+   - Uniform-driven `aoRaySchedule`, `moverRays`, `shadowRefine`, and shadow `maxSteps` enable zero-stutter, zero-leak tier switching while preserving AO history whenever `contactMode` & `aoScale` are unchanged.
+
+### Verified Apple M1 Chrome WebGL2 Results (`tiers-final`)
+- **Archive Regression (`judge_v2.py --tag tiers-final`)**: Fit@64 **0.00585**, Held@64 **0.00497**, Contact@64 **0.01877**, FLIP **0.02193**, GMSD **0.01051** (**bit-exact**), Wall early/orbit/settled **2.819 / 2.525 / 1.225 ms/f**, 0 GL / 0 console / 0 page errors.
+- **Atrium (`bench_atrium.py`)**: MAE@64 **0.01050** (**bit-exact**), Wall early/settled **8.00 / 2.60 ms/f** (55k tris: **8.40 / 2.00 ms/f**), 0 errors.
+- **Gallery 1-Bounce GI (`bench_gallery_gi.py`)**: AO MAE@64 **0.01152**, Bounce MAE **0.06178**, RGB MAE **0.04277**, PSNR **23.44 dB**, Wall early **9.00–9.90 ms/f**, frame-70 **4.60 ms/f**, settled **3.00–3.30 ms/f**, moving-sun **7.30–7.70 ms/f**, emissive-orb **12.80–13.50 ms/f**, 0 errors.
+- **4-Tier Quality Benchmark (`bench_quality_tiers.py`, per-frame GPU-synced median wall ms/f, 0 GL/console/page errors, 0 texture leaks across `low → medium → high → ultra → low`)**:
+
+| Tier | Archive (early / settled) | Atrium (early / settled) | Gallery GI (early / sun / settled / orb) |
+|---|---:|---:|---:|
+| **`low`** | 6.00 / 4.50 ms | 4.70 / 2.60 ms | **4.90 / 7.00 / 2.40 / 6.50 ms** |
+| **`medium`** | 5.80 / 4.70 ms | 5.30 / 1.90 ms | **8.30 / 13.40 / 3.10 / 11.30 ms** |
+| **`high` (default)** | 8.20 / 6.70 ms | 7.80 / 2.50 ms | **10.20 / 14.80 / 3.50 / 12.00 ms** |
+| **`ultra`** | 8.40 / 8.00 ms | 7.60 / 2.10 ms | **17.00 / 20.90 / 5.10 / 16.40 ms** |

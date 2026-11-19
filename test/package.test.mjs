@@ -15,6 +15,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import {
+  QUALITY_PRESETS,
   loadSDF,
   GENERIC_SDF_AO_GLSL,
   patchMaterialWithSDFAO,
@@ -80,6 +81,12 @@ assert.ok(fs.existsSync(path.join(repoRoot, 'LICENSE')));
 console.log('   OK');
 
 console.log('2. Checking src/index.js exports & GLSL...');
+assert.equal(typeof QUALITY_PRESETS, 'object');
+assert.deepEqual(Object.keys(QUALITY_PRESETS), ['low', 'medium', 'high', 'ultra']);
+assert.equal(QUALITY_PRESETS.low.giConeMode, true);
+assert.equal(QUALITY_PRESETS.low.giDenoisePasses, 0);
+assert.equal(QUALITY_PRESETS.high.giScale, 0.25);
+assert.equal(QUALITY_PRESETS.ultra.giScale, 0.5);
 assert.equal(typeof loadSDF, 'function');
 assert.equal(typeof patchMaterialWithSDFAO, 'function');
 assert.equal(typeof TracedSDFAO, 'function');

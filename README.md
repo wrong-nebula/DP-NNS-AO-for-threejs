@@ -1,6 +1,6 @@
 # Fast SDF AO
 
-**[Live Interactive Demo](https://wrong-nebula.github.io/Fast-SDF-AO/)** · Switch between **Archive (Boxes + 11 Movers)**, **Atrium (Curved Meshes)**, and **Gallery (GI)**, compare 7 AO modes, toggle **Diffuse GI**, **Multi-bounce GI**, **Emissive orb**, **GI bounce only**, **PBR + Multi-Bounce + Bent Normals**, **Hi-Z contact**, **Smooth falloff**, or **AO mask**, and drag the **Sun** angle slider in real time.
+**[Live Interactive Demo](https://wrong-nebula.github.io/Fast-SDF-AO/)** · Switch between **Archive (Boxes + 11 Movers)**, **Atrium (Curved Meshes)**, and **Gallery (GI)**, choose a **Quality** preset (**Performance (Low)**, **Balanced (Medium)**, **High (Default)**, **Ultra**), compare 7 AO modes, toggle **Diffuse GI**, **Multi-bounce GI**, **Emissive orb**, **GI bounce only**, **PBR + Multi-Bounce + Bent Normals**, **Hi-Z contact**, **Smooth falloff**, or **AO mask**, and drag the **Sun** angle slider in real time.
 
 Real-time ambient occlusion and **multi-bounce diffuse global illumination (color bleeding)** for Three.js from a baked signed distance field (SDF): a four-read formula, exact distances to moving objects, and an exact baker for meshes and point clouds. **Traced SDF (temporal)** combines exact near-surface triangle intersections (quantized SAH local BVH, or opt-in Hi-Z screen-space contact tracing) with an isotropic FP16 SDF for farther visibility, half-resolution tangent-plane-aware upsampling, variance-guided temporal accumulation, exact analytic/traced moving-object occlusion, and an opt-in **Multi-Bounce Diffuse GI** pass backed by a `64 × 64 × 40` GPU ping-pong 3D radiance voxel grid (`0.20 ms` GPU dynamic sun & emissive-orb relighting, `0.00 ms/f` when static). See [nextgen-log.md](benchmark/nextgen-log.md) for current Apple M1 GPU accuracy, perceptual, temporal, GI, and timing results (and [contact-results.md](benchmark/contact-results.md) for the earlier contact-repair baseline).
 
@@ -46,16 +46,19 @@ const field = await loadSDF('./assets/atrium.f16.gz', { dims: [112, 112, 56], fo
 material.aoNode = createSDFAONode({ field, min: [-6.5, -6.5, -0.5], span: [13, 13, 6.5] });
 ```
 
-### 4. Traced SDF + Quantized SAH Contact BVH (`TracedSDFAO`)
+### 4. Traced SDF + Quantized SAH Contact BVH (`TracedSDFAO` & `QUALITY_PRESETS`)
 
 ```js
-import { loadSDF, TracedSDFAO } from 'fast-sdf-ao';
+import { loadSDF, TracedSDFAO, QUALITY_PRESETS } from 'fast-sdf-ao';
 
 const field = await loadSDF('./assets/atrium.f16.gz', { dims: [112, 112, 56], format: 'f16' });
 const tracedAO = await TracedSDFAO.create(renderer, scene, camera, {
   field, min: [-6.5, -6.5, -0.5], span: [13, 13, 6.5],
   staticMeshes: [atriumMesh], width: 1280, height: 720, bentNormals: true,
+  quality: 'high', // 'low' | 'medium' | 'high' | 'ultra'
 });
+// Runtime zero-stutter quality switching:
+tracedAO.setQuality('medium');
 // In your render loop:
 const { aoTex, normalTex, bentTex } = tracedAO.update();
 ```
@@ -119,10 +122,23 @@ Scored on Apple M1 Chrome WebGL2 (`benchmark/bench_gallery_gi.py`) against an in
 
 | Sunlit Gallery (1280 × 720, 9,272 tris) | RGB MAE vs 512-ray GI ref | PSNR | AO MAE@64 | Wall ms/f (early / settled) |
 |---|---:|---:|---:|---:|
-| Gallery AO-only (`#gi` off) | 0.37133 | 7.65 dB | 0.01152 | 7.50 / 3.30 |
-| **Gallery 1-Bounce GI (`#gi` on)** | **0.04112** (**9.0× lower**) | **23.85 dB** (**+16.2 dB**) | **0.01152** | **11.80 / 2.70** |
+| Gallery AO-only (`#gi` off) | 0.37133 | 7.65 dB | 0.01152 | 7.70 / 3.80 |
+| **Gallery 1-Bounce GI (`#gi` on, `high` default)** | **0.04277** (**8.7× lower**) | **23.44 dB** (**+15.8 dB**) | **0.01152** | **9.00 / 3.00** |
 
-Pure bounce-only linear irradiance MAE: `0.05785` · Radiance grid: `64 × 64 × 40` (**0.20 ms** GPU relight for both 1-bounce & multi-bounce; 128-frame GI settles to **2.70 ms/f**, **5.70 ms/f** at frame 70, **10.50 ms/f** during moving sun, and **16.00 ms/f** with the orbiting dynamic emissive orb).
+Pure bounce-only linear irradiance MAE: `0.06178` · Radiance grid: `64 × 64 × 40` with hardware 3D mipmaps (**0.20 ms** GPU relight for 1-bounce, **0.20–0.60 ms** for multi-bounce; 128-frame GI settles to **3.00 ms/f**, **4.60 ms/f** at frame 70, **7.30–7.70 ms/f** during moving sun, and **12.80–13.50 ms/f** with the orbiting dynamic emissive orb).
+
+### Unified 4-Tier Quality Settings (`Low` / `Medium` / `High` / `Ultra`)
+
+Select **Quality** in the viewer nav bar (`#quality`, `?quality=low|medium|high|ultra`, `aoDemo.setQuality(tier)`) or configure `TracedSDFAO` via `QUALITY_PRESETS`. Switching tiers is uniform-driven, zero-stutter, and zero-leak (preserving AO history whenever contact mode & AO scale are unchanged):
+
+| Tier | AO & Contact | Diffuse GI & Denoiser | Shadows & Movers | Archive (early / settled) | Atrium (early / settled) | Gallery GI (early / sun / settled / orb) |
+|---|---|---|---|---:|---:|---:|
+| **`low` (Performance)** | Half-res Hi-Z contact (`nd = 2/1/1`, settle 32) | Quarter-res **Mipmapped Voxel + SDF Cone GI** (0 noise, **0 denoise passes**, 1-bounce grid) | Half-res `R8` direct (`52`/`28` steps, 0 refine), 8-ray movers | 6.0 / 4.5 ms | 4.7 / 2.6 ms | **4.9 / 7.0 / 2.4 / 6.5 ms** |
+| **`medium` (Balanced)** | Half-res SAH BVH2 (`nd = 2/2/1`, settle 48) | Quarter-res L1 YCoCg SH GI (2-pass hit-dist à-trous, 2-bounce grid) | Half-res `R8` + penumbra refine (`48`/`28` steps), 12-ray movers | 5.8 / 4.7 ms | 5.3 / 1.9 ms | **8.3 / 13.4 / 3.1 / 11.3 ms** |
+| **`high` (Default)** | Half-res SAH BVH2 (`nd = 4/3/2`, settle 64) | Quarter-res L1 YCoCg SH GI (3-pass hit-dist à-trous + REBLUR dual fast/slow anti-lag, 2-bounce grid) | Half-res `R8` + penumbra refine (`68`/`36` steps), 24-ray movers | 8.2 / 6.7 ms (`2.82 / 1.23 ms` static) | 7.8 / 2.5 ms | **10.2 / 14.8 / 3.5 / 12.0 ms** |
+| **`ultra`** | Half-res SAH BVH2 (`nd = 4/3/2`, settle 64) | **Half-res (`0.5×`)** L1 YCoCg SH GI (3-pass hit-dist à-trous + REBLUR anti-lag, 2-bounce grid) | Full-res penumbra shadows (`68`/`36` steps), 24-ray movers | 8.4 / 8.0 ms | 7.6 / 2.1 ms | **17.0 / 20.9 / 5.1 / 16.4 ms** |
+
+*(Per-frame GPU-synchronized median wall timings measured on Apple M1 Chrome WebGL2 at 1280 × 720 via `benchmark/bench_quality_tiers.py`, with 0 WebGL / console / page errors and 0 texture leaks across `low → medium → high → ultra → low` cycling.)*
 
 Inspect `aoDemo.contactResources` for textures, memory, and build metadata. After changing static triangles or instance transforms, call `aoDemo.rebuildStaticContact()` (or supply a mesh array and `{gridSize, range, bias}`). This disposes the previous accelerator and resets temporal history. It does **not** rebake the far SDF, which must also be updated when static geometry changes.
 

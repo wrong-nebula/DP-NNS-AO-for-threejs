@@ -1,5 +1,6 @@
 // Fast-SDF-AO: Drop-in Three.js WebGL2 API for real-time signed distance field AO.
 // Exports:
+//   - QUALITY_PRESETS
 //   - loadSDF(urlOrBuffer, { dims, format, gzip, THREE })
 //   - GENERIC_SDF_AO_GLSL
 //   - patchMaterialWithSDFAO(material, { field, min, span, radius, intensity, multiBounce })
@@ -9,6 +10,89 @@
 import { buildContactBVH, CONTACT_GLSL } from '../contact-bvh.js';
 
 export { buildContactBVH, CONTACT_GLSL };
+
+/**
+ * Declarative 4-tier Quality Settings shared by the library and interactive viewer.
+ * All tiers are uniform-driven and support zero-stutter runtime switching.
+ */
+export const QUALITY_PRESETS = Object.freeze({
+  low: Object.freeze({
+    id: 'low',
+    label: 'Performance (Low)',
+    aoScale: 0.5,
+    contactMode: 1,
+    aoRaySchedule: [2, 1, 1],
+    settleFrames: 32,
+    giConeMode: true,
+    giScale: 0.25,
+    giRays: 2,
+    giMaxSteps: 12,
+    giDenoisePasses: 0,
+    giMultiBounce: false,
+    giBouncePasses: 1,
+    sunShadowSteps: 52,
+    orbShadowSteps: 28,
+    shadowRefine: 0,
+    moverRays: 8,
+  }),
+  medium: Object.freeze({
+    id: 'medium',
+    label: 'Balanced (Medium)',
+    aoScale: 0.5,
+    contactMode: 0,
+    aoRaySchedule: [2, 2, 1],
+    settleFrames: 48,
+    giConeMode: false,
+    giScale: 0.25,
+    giRays: 2,
+    giMaxSteps: 14,
+    giDenoisePasses: 2,
+    giMultiBounce: true,
+    giBouncePasses: 1,
+    sunShadowSteps: 48,
+    orbShadowSteps: 28,
+    shadowRefine: 1,
+    moverRays: 12,
+  }),
+  high: Object.freeze({
+    id: 'high',
+    label: 'High (Default)',
+    aoScale: 0.5,
+    contactMode: 0,
+    aoRaySchedule: [4, 3, 2],
+    settleFrames: 64,
+    giConeMode: false,
+    giScale: 0.25,
+    giRays: 2,
+    giMaxSteps: 18,
+    giDenoisePasses: 3,
+    giMultiBounce: true,
+    giBouncePasses: 1,
+    sunShadowSteps: 68,
+    orbShadowSteps: 36,
+    shadowRefine: 1,
+    moverRays: 24,
+  }),
+  ultra: Object.freeze({
+    id: 'ultra',
+    label: 'Ultra',
+    aoScale: 0.5,
+    contactMode: 0,
+    aoRaySchedule: [4, 3, 2],
+    settleFrames: 64,
+    giConeMode: false,
+    giScale: 0.5,
+    giRays: 2,
+    giMaxSteps: 22,
+    giDenoisePasses: 3,
+    giMultiBounce: true,
+    giBouncePasses: 1,
+    sunShadowSteps: 68,
+    orbShadowSteps: 36,
+    shadowRefine: 2,
+    moverRays: 24,
+  }),
+});
 
 /**
  * Scene-agnostic 4-tap SDF AO GLSL (no wallFace metadata) + Jimenez 2016
@@ -255,6 +339,7 @@ uniform vec2 invProjXY;
 uniform float frame;
 uniform float histMax;
 uniform float settleFrames;
+uniform vec3 aoRaySchedule;
 layout(location = 0) out vec4 histOut;
 layout(location = 1) out vec4 normalOut;
 #ifdef BENT_NORMALS
@@ -353,7 +438,7 @@ void main() {
   #endif
   if (!settled) {
     frames = min(h.y + 1.0, histMax);
-    float nd = h.y < 8.0 ? 4.0 : (h.y < 16.0 ? 3.0 : (h.y >= 24.0 && h.z < 0.0006 ? 1.0 : 2.0));
+    float nd = h.y < 8.0 ? aoRaySchedule.x : (h.y < 16.0 ? aoRaySchedule.y : (h.y >= 24.0 && h.z < 0.0006 ? 1.0 : aoRaySchedule.z));
     vec4 resAO = tracedAOBent(p, normal, nd);
     float sampleAO = resAO.x;
     float alpha = 1.0 / frames;
@@ -398,23 +483,27 @@ export class TracedSDFAO {
       staticMeshes = [],
       width = 1280,
       height = 720,
-      aoScale = 0.5,
+      quality = 'high',
+      aoScale,
       gridSize = 1.0,
       bias = 0.0003,
       bentNormals = false,
       smoothFalloff = false,
-      settleFrames = 64,
+      settleFrames,
     } = {}
   ) {
     if (!THREE) throw new Error('TracedSDFAO requires { THREE } (or use TracedSDFAO.create(...))');
     if (!field) throw new Error('TracedSDFAO requires a Data3DTexture { field }');
+    const tierKey = typeof quality === 'string' && QUALITY_PRESETS[quality.toLowerCase()] ? quality.toLowerCase() : 'high';
+    const preset = QUALITY_PRESETS[tierKey];
     this.T = THREE;
     this.renderer = renderer;
     this.scene = scene;
     this.camera = camera;
     this.width = width;
     this.height = height;
-    this.aoScale = aoScale;
+    this._quality = tierKey;
+    this.aoScale = aoScale ?? preset.aoScale;
     this.bentNormals = bentNormals;
     this.histIndex = 0;
     this.frame = 0;
@@ -432,27 +521,9 @@ export class TracedSDFAO {
     this.lastCamera = new THREE.Matrix4();
     this.invProjXY = new THREE.Vector2(1, 1);
 
-    const w = Math.max(1, Math.round(width * aoScale));
-    const h = Math.max(1, Math.round(height * aoScale));
-    const nearest = (t) => {
-      t.minFilter = THREE.NearestFilter;
-      t.magFilter = THREE.NearestFilter;
-      t.generateMipmaps = false;
-    };
-
-    this.gTarget = new THREE.WebGLRenderTarget(w, h, { count: 2 });
-    this.gTarget.textures[0].type = THREE.FloatType;
-    this.gTarget.textures[1].type = THREE.HalfFloatType;
-    this.gTarget.textures.forEach(nearest);
-
-    const mrtCount = bentNormals ? 3 : 2;
-    this.histories = [0, 1].map(() => {
-      const rt = new THREE.WebGLRenderTarget(w, h, { count: mrtCount, depthBuffer: false });
-      rt.textures[0].type = THREE.FloatType;
-      rt.textures[0].format = THREE.RGFormat;
-      rt.textures.forEach(nearest);
-      return rt;
-    });
+    this.gTarget = null;
+    this.histories = null;
+    this._allocateTargets(this.aoScale);
 
     this.gMaterial = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3,
@@ -481,8 +552,9 @@ export class TracedSDFAO {
         invProjXY: { value: this.invProjXY },
         frame: { value: 0 },
         histMax: { value: 128 },
-        settleFrames: { value: settleFrames },
-        contactMode: { value: 0 },
+        settleFrames: { value: settleFrames ?? preset.settleFrames },
+        aoRaySchedule: { value: new THREE.Vector3(...preset.aoRaySchedule) },
+        contactMode: { value: preset.contactMode },
         smoothFalloff: { value: smoothFalloff ? 1 : 0 },
         hizTex1: { value: null },
         hizTex2: { value: null },
@@ -507,6 +579,55 @@ export class TracedSDFAO {
   static async create(renderer, scene, camera, opts = {}) {
     const THREE = opts.THREE || (await import('three'));
     return new TracedSDFAO(renderer, scene, camera, { ...opts, THREE });
+  }
+
+  _allocateTargets(scale) {
+    const THREE = this.T;
+    const w = Math.max(1, Math.round(this.width * scale));
+    const h = Math.max(1, Math.round(this.height * scale));
+    const nearest = (t) => {
+      t.minFilter = THREE.NearestFilter;
+      t.magFilter = THREE.NearestFilter;
+      t.generateMipmaps = false;
+    };
+    if (this.gTarget) this.gTarget.dispose();
+    if (this.histories) for (const rt of this.histories) rt.dispose();
+    this.gTarget = new THREE.WebGLRenderTarget(w, h, { count: 2 });
+    this.gTarget.textures[0].type = THREE.FloatType;
+    this.gTarget.textures[1].type = THREE.HalfFloatType;
+    this.gTarget.textures.forEach(nearest);
+    const mrtCount = this.bentNormals ? 3 : 2;
+    this.histories = [0, 1].map(() => {
+      const rt = new THREE.WebGLRenderTarget(w, h, { count: mrtCount, depthBuffer: false });
+      rt.textures[0].type = THREE.FloatType;
+      rt.textures[0].format = THREE.RGFormat;
+      rt.textures.forEach(nearest);
+      return rt;
+    });
+  }
+
+  get quality() {
+    return this._quality;
+  }
+
+  setQuality(tier) {
+    const key = typeof tier === 'string' && QUALITY_PRESETS[tier.toLowerCase()] ? tier.toLowerCase() : null;
+    if (!key) throw new Error(`Unknown quality tier "${tier}" (expected: ${Object.keys(QUALITY_PRESETS).join(', ')})`);
+    const preset = QUALITY_PRESETS[key];
+    this._quality = key;
+    const u = this.aoMaterial.uniforms;
+    u.aoRaySchedule.value.set(...preset.aoRaySchedule);
+    u.settleFrames.value = preset.settleFrames;
+    const contactChanged = u.contactMode.value !== preset.contactMode;
+    u.contactMode.value = preset.contactMode;
+    if (Math.abs(this.aoScale - preset.aoScale) > 1e-4) {
+      this.aoScale = preset.aoScale;
+      this._allocateTargets(this.aoScale);
+      this.resetHistory();
+    } else if (contactChanged) {
+      this.resetHistory();
+    }
+    return preset;
   }
 
   rebuildContactBVH(staticMeshes, { gridSize = 'auto', range, bias = 0.0003 } = {}) {

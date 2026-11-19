@@ -20,7 +20,7 @@ HTML = """<!doctype html>
 </head><body>
 <script type="module">
 import * as THREE from 'three';
-import { loadSDF, patchMaterialWithSDFAO, TracedSDFAO } from '/src/index.js';
+import { QUALITY_PRESETS, loadSDF, patchMaterialWithSDFAO, TracedSDFAO } from '/src/index.js';
 import {
   ATRIUM_SDF_DIMS, ATRIUM_SDF_MIN, ATRIUM_SDF_SPAN, ATRIUM_CAMERA,
   buildAtriumThreeGeometry,
@@ -77,7 +77,7 @@ let sum = 0;
 for (let i = 0; i < px.length; i += 4) sum += px[i] + px[i + 1] + px[i + 2];
 const meanLuma = sum / (640 * 360 * 3 * 255);
 
-// Also test TracedSDFAO wrapper
+// Also test TracedSDFAO wrapper + 4-tier quality switching (low -> medium -> high -> ultra -> low)
 const traced = await TracedSDFAO.create(renderer, scene, camera, {
   THREE,
   field,
@@ -87,9 +87,16 @@ const traced = await TracedSDFAO.create(renderer, scene, camera, {
   width: 640,
   height: 360,
   bentNormals: true,
+  quality: 'high',
 });
 const out1 = traced.update();
 const out2 = traced.update();
+const tiersVisited = [];
+for (const tier of ['low', 'medium', 'high', 'ultra', 'low']) {
+  traced.setQuality(tier);
+  tiersVisited.push(traced.quality);
+  traced.update();
+}
 gl.finish();
 const tracedErrs = drain();
 const hasTextures = Boolean(out1.aoTex && out1.normalTex && out1.bentTex && out2.aoTex);
@@ -100,6 +107,8 @@ window.__pkgTestResult = {
   tracedErrs,
   meanLuma,
   hasTextures,
+  tiersVisited,
+  presetCount: Object.keys(QUALITY_PRESETS).length,
 };
 </script>
 </body></html>
