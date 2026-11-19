@@ -502,36 +502,31 @@ struct PointBVH {
 
 // ------------------------------------------------------------------ sign by winding number
 // Inside = nonzero winding number along a +z ray through the voxel column centre.
-static std::vector<uint8_t> insideMask(const std::vector<Tri>& t,const V3& lo,const V3& span,int R,int threads){
-    std::vector<uint8_t> in(size_t(R)*R*R,0);
-    // Bin triangles by their xy footprint in voxel-column units (CSR: count, prefix sum, fill).
-    // A triangle whose three vertices share x (or y) exactly can never pass the edge test below: with
-    // ax=bx=cx the edge functions are rounded differences of fl(X*ay), fl(X*by), fl(X*cy), and rounding is
-    // monotone, so their signs follow (cy-by), (ay-cy), (by-ay), which sum to zero and can't all agree.
-    // Such triangles (the side faces of boxes) are left out of the bins; the mask is unchanged.
-    const double sx=span[0]/R,sy=span[1]/R;
+static std::vector<uint8_t> insideMask(const std::vector<Tri>& t,const V3& lo,const V3& span,int RX,int RY,int RZ,int threads){
+    std::vector<uint8_t> in(size_t(RX)*RY*RZ,0);
+    const double sx=span[0]/RX,sy=span[1]/RY;
     struct FP { uint32_t id; int i0,i1,j0,j1; }; std::vector<FP> fp; fp.reserve(t.size());
-    std::vector<uint32_t> start(size_t(R)*R+1,0);
+    std::vector<uint32_t> start(size_t(RX)*RY+1,0);
     for(uint32_t i=0;i<t.size();++i){
         const Tri& tr=t[i];
         if((tr.a[0]==tr.b[0]&&tr.a[0]==tr.c[0])||(tr.a[1]==tr.b[1]&&tr.a[1]==tr.c[1]))continue;
         double x0=std::min({tr.a[0],tr.b[0],tr.c[0]}),x1=std::max({tr.a[0],tr.b[0],tr.c[0]});
         double y0=std::min({tr.a[1],tr.b[1],tr.c[1]}),y1=std::max({tr.a[1],tr.b[1],tr.c[1]});
-        int i0=std::max(0,int(std::floor((x0-lo[0])/sx-.5))),i1=std::min(R-1,int(std::ceil((x1-lo[0])/sx-.5)));
-        int j0=std::max(0,int(std::floor((y0-lo[1])/sy-.5))),j1=std::min(R-1,int(std::ceil((y1-lo[1])/sy-.5)));
+        int i0=std::max(0,int(std::floor((x0-lo[0])/sx-.5))),i1=std::min(RX-1,int(std::ceil((x1-lo[0])/sx-.5)));
+        int j0=std::max(0,int(std::floor((y0-lo[1])/sy-.5))),j1=std::min(RY-1,int(std::ceil((y1-lo[1])/sy-.5)));
         if(i0>i1||j0>j1)continue;
         fp.push_back({i,i0,i1,j0,j1});
-        for(int j=j0;j<=j1;++j)for(int k=i0;k<=i1;++k)++start[size_t(j)*R+k+1];
+        for(int j=j0;j<=j1;++j)for(int k=i0;k<=i1;++k)++start[size_t(j)*RX+k+1];
     }
     for(size_t c=1;c<start.size();++c)start[c]+=start[c-1];
     std::vector<uint32_t> items(start.back());
     {std::vector<uint32_t> fill(start.begin(),start.end()-1);
-     for(const FP& f:fp)for(int j=f.j0;j<=f.j1;++j)for(int k=f.i0;k<=f.i1;++k)items[fill[size_t(j)*R+k]++]=f.id;}
+     for(const FP& f:fp)for(int j=f.j0;j<=f.j1;++j)for(int k=f.i0;k<=f.i1;++k)items[fill[size_t(j)*RX+k]++]=f.id;}
     std::atomic<int> next{0};
     auto work=[&]{
         std::vector<std::pair<double,int>> hits;
-        for(int col;(col=next++)<R*R;){
-            const int i=col%R,j=col/R;
+        for(int col;(col=next++)<RX*RY;){
+            const int i=col%RX,j=col/RX;
             // Tiny irrational offset keeps the ray off shared edges and vertices of axis-aligned input.
             const double x=lo[0]+(i+.5)*sx+1.2345e-9*sx,y=lo[1]+(j+.5)*sy+2.7182e-9*sy;
             hits.clear();
@@ -546,10 +541,10 @@ static std::vector<uint8_t> insideMask(const std::vector<Tri>& t,const V3& lo,co
             if(hits.empty())continue;
             std::sort(hits.begin(),hits.end());
             int winding=0; size_t h=0;
-            for(int z=0;z<R;++z){
-                const double zc=lo[2]+(z+.5)*span[2]/R;
+            for(int z=0;z<RZ;++z){
+                const double zc=lo[2]+(z+.5)*span[2]/RZ;
                 while(h<hits.size()&&hits[h].first<zc)winding+=hits[h++].second;
-                if(winding!=0)in[(size_t(z)*R+j)*R+i]=1;
+                if(winding!=0)in[(size_t(z)*RY+j)*RX+i]=1;
             }
         }
     };
@@ -557,8 +552,23 @@ static std::vector<uint8_t> insideMask(const std::vector<Tri>& t,const V3& lo,co
     return in;
 }
 
+static uint16_t floatToHalf(float f){
+    uint32_t u; std::memcpy(&u,&f,4);
+    uint32_t sign=(u>>16)&0x8000u;
+    int32_t exp=int32_t((u>>23)&0xFFu)-127+15;
+    uint32_t frac=u&0x7FFFFFu;
+    if(exp<=0){
+        if(exp<-10)return uint16_t(sign);
+        frac=(frac|0x800000u)>>(1-exp);
+        return uint16_t(sign|((frac+0x1000u)>>13));
+    }
+    if(exp>=31)return uint16_t(sign|0x7C00u);
+    uint32_t h=sign|(uint32_t(exp)<<10)|((frac+0x1000u)>>13);
+    return uint16_t(h);
+}
+
 int main(int argc,char** argv){
-    std::string boxes,obj,points,writePoints,out,statsPath,search="bvh-neighbour"; int subdiv=1; size_t sample=0,validate=0; uint64_t seed=1; double cellOverride=0; V3 lo{0,0,0},span{0,0,0}; int R=128,block=8,threads=int(std::max(1u,std::thread::hardware_concurrency())); double clip=1.5,reach=0;
+    std::string boxes,obj,points,writePoints,out,brickOut,statsPath,search="bvh-neighbour"; int subdiv=1; size_t sample=0,validate=0; uint64_t seed=1; double cellOverride=0; V3 lo{0,0,0},span{0,0,0}; int RX=128,RY=128,RZ=128,block=8,threads=int(std::max(1u,std::thread::hardware_concurrency())); double clip=1.5,reach=0; bool writeF16=false;
     for(int i=1;i<argc;++i){
         std::string a=argv[i]; auto need=[&](int n){if(i+n>=argc)throw std::runtime_error("missing value for "+a);};
         if(a=="--boxes"){need(1);boxes=argv[++i];}
@@ -569,10 +579,13 @@ int main(int argc,char** argv){
         else if(a=="--validate"){need(1);validate=std::strtoull(argv[++i],nullptr,10);}
         else if(a=="--seed"){need(1);seed=std::strtoull(argv[++i],nullptr,10);}
         else if(a=="--out"){need(1);out=argv[++i];}
+        else if(a=="--brick-out"){need(1);brickOut=argv[++i];}
+        else if(a=="--f16"){writeF16=true;}
         else if(a=="--stats"){need(1);statsPath=argv[++i];}
         else if(a=="--lo"){need(3);for(int k=0;k<3;++k)lo[k]=std::atof(argv[++i]);}
         else if(a=="--span"){need(3);for(int k=0;k<3;++k)span[k]=std::atof(argv[++i]);}
-        else if(a=="--res"){need(1);R=std::atoi(argv[++i]);}
+        else if(a=="--res"){need(1);RX=RY=RZ=std::atoi(argv[++i]);}
+        else if(a=="--res-xyz"){need(3);RX=std::atoi(argv[++i]);RY=std::atoi(argv[++i]);RZ=std::atoi(argv[++i]);}
         else if(a=="--clip"){need(1);clip=std::atof(argv[++i]);}
         else if(a=="--reach"){need(1);reach=std::atof(argv[++i]);}
         else if(a=="--threads"){need(1);threads=std::max(1,std::atoi(argv[++i]));}
@@ -582,9 +595,9 @@ int main(int argc,char** argv){
         else if(a=="--cell"){need(1);cellOverride=std::atof(argv[++i]);}
         else throw std::runtime_error("unknown option "+a);
     }
-    if(int(!boxes.empty())+int(!obj.empty())+int(!points.empty())!=1||(sample&&!points.empty())||(!writePoints.empty()&&!sample)||out.empty()||R<2||R>1024||!(span[0]>0&&span[1]>0&&span[2]>0)||!(clip>0))
-        {std::cerr<<"Usage: bake_sdf (--boxes f.json | --obj f.obj [--sample N [--write-points f.ply]] | --points f.ply) --lo x y z --span x y z --out field.f32 [--res 128] [--clip 1.5] [--threads N] [--block 8] [--search bvh-neighbour|bvh|grid] [--validate K] [--seed S] [--stats f.json]\n";return 2;}
-    if(block&&R%block){std::cerr<<"--res must be a multiple of --block\n";return 2;}
+    if(int(!boxes.empty())+int(!obj.empty())+int(!points.empty())!=1||(sample&&!points.empty())||(!writePoints.empty()&&!sample)||out.empty()||RX<2||RY<2||RZ<2||RX>1024||RY>1024||RZ>1024||!(span[0]>0&&span[1]>0&&span[2]>0)||!(clip>0))
+        {std::cerr<<"Usage: bake_sdf (--boxes f.json | --obj f.obj | --points f.ply) --lo x y z --span x y z --out field.f32 [--res 128 | --res-xyz nx ny nz] [--f16] [--brick-out b.bin] [--clip 1.5] [--threads N] [--block 8] [--validate K]\n";return 2;}
+    if(block&&(RX%block||RY%block||RZ%block)){std::cerr<<"--res-xyz must be multiples of --block\n";return 2;}
 
     // One more worker than --threads (at least 2) for the parallel phases, when the machine has the core.
     const int hw=int(std::max(1u,std::thread::hardware_concurrency()));
@@ -609,7 +622,7 @@ int main(int argc,char** argv){
     // The sign pass only needs the triangles: it runs on its own thread alongside the BVH build and
     // the distance pass, which write unsigned distances; inside voxels are negated at the end.
     std::vector<uint8_t> inside; double tSign=0;
-    std::thread signThread([&]{if(pointMode)return;auto ts=Clk::now();inside=insideMask(tris,lo,span,R,1);tSign=since(ts);});
+    std::thread signThread([&]{if(pointMode)return;auto ts=Clk::now();inside=insideMask(tris,lo,span,RX,RY,RZ,1);tSign=since(ts);});
     t0=Clk::now(); BVH bvh(useGrid||pointMode?noTris:tris,std::max(threads,2));
     const std::vector<PF> onePoint{PF{0,0,0}}; PointCloud none; none.p=onePoint;
     PointBVH pbvh(pointMode?pc:none,work2); const double tBvh=since(t0);
@@ -618,10 +631,10 @@ int main(int argc,char** argv){
 
 
     // Left uninitialised: the workers write every voxel (culled ones as clip).
-    const size_t NV=size_t(R)*R*R; std::unique_ptr<float[]> fieldBuf(new float[NV]); float* const field=fieldBuf.get();
+    const size_t NV=size_t(RX)*RY*RZ; std::unique_ptr<float[]> fieldBuf(new float[NV]); float* const field=fieldBuf.get();
     const float fclip=float(clip);
-    const V3 vox{span[0]/R,span[1]/R,span[2]/R};
-    const int B=block?block:1,NB=R/B;
+    const V3 vox{span[0]/RX,span[1]/RY,span[2]/RZ};
+    const int B=block?block:1,NBX=RX/B,NBY=RY/B,NBZ=RZ/B;
     const double halfDiag=.5*std::sqrt(dot3(vox,vox))*B;
     // Distances above `limit` are written as clip without being resolved. With --reach r (the
     // farthest distance the AO shader can use, 1.12-.045 for the viewer), limit = r + one voxel
@@ -677,7 +690,7 @@ int main(int argc,char** argv){
         auto T=[&](int x,int y,int z){return T0[(ptrdiff_t(z)*TW+y)*TW+x];};
         auto fillCube=[&](int ox,int oy,int oz,int S,float sg){
             const float v=PM?sg*fclip:fclip;
-            for(int z=0;z<S;++z)for(int y=0;y<S;++y){float* f=field+(size_t(oz+z)*R+(oy+y))*R+ox;for(int x=0;x<S;++x)f[x]=v;}};
+            for(int z=0;z<S;++z)for(int y=0;y<S;++y){float* f=field+(size_t(oz+z)*RY+(oy+y))*RX+ox;for(int x=0;x<S;++x)f[x]=v;}};
         // Cube of S^3 voxels at voxel origin o, with reference distance dref at half coordinate r.
         // 1-Lipschitz: every point p has d(p) >= dref - |p-r|. Even cubes of 4+ split into 8 subcubes;
         // a subcube is culled from the reference bound, or from its own centre's exact distance, which
@@ -699,7 +712,7 @@ int main(int argc,char** argv){
                 return;
             }
             for(int z=0;z<S;++z)for(int y=0;y<S;++y){
-                const int k=oz+z,j=oy+y; float* const f=field+(size_t(k)*R+j)*R;
+                const int k=oz+z,j=oy+y; float* const f=field+(size_t(k)*RY+j)*RX;
                 for(int x=0;x<S;++x){const int i=ox+x;
                     const double r=T(2*i+1-rx,2*j+1-ry,2*k+1-rz);
                     if(dref-r>limit){f[i]=PM?rs*fclip:fclip;++vc;continue;}
@@ -709,8 +722,8 @@ int main(int argc,char** argv){
                 }
             }
         };
-        for(int b;(b=next++)<NB*NB*NB;){
-            const int bx=b%NB,by=(b/NB)%NB,bz=b/(NB*NB);
+        for(int b;(b=next++)<NBX*NBY*NBZ;){
+            const int bx=b%NBX,by=(b/NBX)%NBY,bz=b/(NBX*NBY);
             if(block){
                 const int hx=(2*bx+1)*B,hy=(2*by+1)*B,hz=(2*bz+1)*B;
                 ++q; const V3 c=pt(hx,hy,hz); const double dc=cut(nearest(c,limit+halfDiag),limit+halfDiag); const float cs=sideOf(c);
@@ -721,7 +734,7 @@ int main(int argc,char** argv){
                 const int i=bx,j=by,k=bz;
                 ++q; const V3 v=pt(2*i+1,2*j+1,2*k+1); double d=cut(nearest(v,limit),limit);
                 if(std::isinf(d))d=clip;
-                field[(size_t(k)*R+j)*R+i]=float(std::min(d,clip))*sideOf(v);
+                field[(size_t(k)*RY+j)*RX+i]=float(std::min(d,clip))*sideOf(v);
             }
         }
         queries+=q; tested+=s.tested+bt; voxCulled+=vc;
@@ -746,13 +759,13 @@ int main(int argc,char** argv){
         std::atomic<size_t> nx{0};
         auto chk=[&]{
             for(size_t t;(t=nx++)<pick.size();){
-                const size_t k=pick[t]; const int i=int(k%R),j=int((k/R)%R),z=int(k/(size_t(R)*R));
+                const size_t k=pick[t]; const int i=int(k%RX),j=int((k/RX)%RY),z=int(k/(size_t(RX)*RY));
                 const V3 p{lo[0]+.5*(2*i+1)*vox[0],lo[1]+.5*(2*j+1)*vox[1],lo[2]+.5*(2*z+1)*vox[2]};
                 double best=INFINITY; bool neg=false;
                 if(pointMode){int bi=0; for(size_t m=0;m<pbvh.P.size();++m){const double d=pd2(p,pbvh.P[m]);if(d<best){best=d;bi=int(m);}} neg=pbvh.side(p,bi)<0;}
                 else{
                     for(const Tri& tr:tris)best=std::min(best,triDist2(p,tr));
-                    const double sx=span[0]/R,sy=span[1]/R,x=lo[0]+(i+.5)*sx+1.2345e-9*sx,y=lo[1]+(j+.5)*sy+2.7182e-9*sy,zc=lo[2]+(z+.5)*span[2]/R;
+                    const double sx=span[0]/RX,sy=span[1]/RY,x=lo[0]+(i+.5)*sx+1.2345e-9*sx,y=lo[1]+(j+.5)*sy+2.7182e-9*sy,zc=lo[2]+(z+.5)*span[2]/RZ;
                     int w=0;
                     for(const Tri& tr:tris){
                         const double ax=tr.a[0]-x,ay=tr.a[1]-y,bx=tr.b[0]-x,by=tr.b[1]-y,cx=tr.c[0]-x,cy=tr.c[1]-y;
@@ -772,19 +785,51 @@ int main(int argc,char** argv){
     const bool vFail=vMis||vSign;
 
     std::ostringstream js; js<<std::fixed<<std::setprecision(3)
-      <<"{\"triangles\":"<<tris.size()<<",\"points\":"<<(pointMode?pc.p.size():0)<<",\"points_hidden\":"<<pc.hidden<<",\"signed\":"<<(pointMode&&!pc.oriented?"false":"true")<<",\"res\":"<<R<<",\"clip\":"<<clip<<",\"threads\":"<<threads<<",\"block\":"<<block<<",\"search\":\""<<search<<"\""
+      <<"{\"triangles\":"<<tris.size()<<",\"points\":"<<(pointMode?pc.p.size():0)<<",\"points_hidden\":"<<pc.hidden<<",\"signed\":"<<(pointMode&&!pc.oriented?"false":"true")<<",\"res\":["<<RX<<","<<RY<<","<<RZ<<"],\"f16\":"<<(writeF16?"true":"false")<<",\"clip\":"<<clip<<",\"threads\":"<<threads<<",\"block\":"<<block<<",\"search\":\""<<search<<"\""
       <<",\"grid_cell\":"<<grid.cell<<",\"ms\":{\"load\":"<<tLoad<<",\"grid\":"<<tGrid<<",\"bvh\":"<<tBvh<<",\"sign\":"<<tSign<<",\"sign_wait\":"<<tSignWait<<",\"distance\":"<<tField<<",\"total\":"<<tTotal<<"}"
-      <<",\"limit\":"<<limit<<",\"blocks\":"<<NB*NB*NB<<",\"blocks_culled\":"<<culled<<",\"voxels_culled\":"<<voxCulled<<",\"distance_queries\":"<<queries<<",\"triangle_tests\":"<<tested;
+      <<",\"limit\":"<<limit<<",\"blocks\":"<<NBX*NBY*NBZ<<",\"blocks_culled\":"<<culled<<",\"voxels_culled\":"<<voxCulled<<",\"distance_queries\":"<<queries<<",\"triangle_tests\":"<<tested;
     if(validate)js<<",\"validate\":{\"voxels\":"<<validate<<",\"mismatches\":"<<vMis<<",\"sign_errors\":"<<vSign<<",\"ms\":"<<tValidate<<"}";
     js<<"}";
     std::cout<<js.str()<<"\n";
     if(!statsPath.empty())std::ofstream(statsPath)<<js.str()<<"\n";
-    // Raw write() loop, then flush and _exit: skips stream buffering and the teardown of the
-    // BVH, triangles and field (the OS reclaims them).
+    // Optional 2-level sparse narrow-band 8^3 brick map export (indirection table + active bricks in f16).
+    if(!brickOut.empty()&&block==8){
+        std::vector<uint32_t> indir(size_t(NBX)*NBY*NBZ,0xFFFFFFFFu);
+        std::vector<uint16_t> bricks;
+        uint32_t activeBricks=0;
+        for(int bz=0;bz<NBZ;++bz)for(int by=0;by<NBY;++by)for(int bx=0;bx<NBX;++bx){
+            bool active=false;
+            for(int z=0;z<8&&!active;++z)for(int y=0;y<8&&!active;++y){
+                const float* row=field+(size_t(bz*8+z)*RY+(by*8+y))*RX+bx*8;
+                for(int x=0;x<8;++x)if(std::fabs(row[x])<fclip){active=true;break;}
+            }
+            if(!active)continue;
+            indir[(size_t(bz)*NBY+by)*NBX+bx]=activeBricks++;
+            for(int z=0;z<8;++z)for(int y=0;y<8;++y){
+                const float* row=field+(size_t(bz*8+z)*RY+(by*8+y))*RX+bx*8;
+                for(int x=0;x<8;++x)bricks.push_back(floatToHalf(row[x]));
+            }
+        }
+        std::ofstream bo(brickOut,std::ios::binary);
+        uint32_t hdr[6]={uint32_t(RX),uint32_t(RY),uint32_t(RZ),uint32_t(NBX),uint32_t(NBY),uint32_t(NBZ)};
+        bo.write((const char*)hdr,sizeof(hdr));
+        bo.write((const char*)&activeBricks,4);
+        bo.write((const char*)indir.data(),indir.size()*4);
+        bo.write((const char*)bricks.data(),bricks.size()*2);
+        std::cerr<<"brick-map: "<<activeBricks<<"/"<<(NBX*NBY*NBZ)<<" active 8^3 bricks ("<<(indir.size()*4+bricks.size()*2)/1024<<" KiB)\n";
+    }
+    // Raw write() loop, then flush and _exit.
     {const int fd=::open(out.c_str(),O_WRONLY|O_CREAT|O_TRUNC,0644);
      if(fd<0){std::cerr<<"cannot write "<<out<<": "<<std::strerror(errno)<<"\n";return 1;}
-     const char* w=(const char*)field; size_t left=NV*4;
-     while(left){const ssize_t n=::write(fd,w,left);if(n<0){if(errno==EINTR)continue;std::cerr<<"write failed: "<<std::strerror(errno)<<"\n";::close(fd);return 1;}w+=n;left-=size_t(n);}
+     if(writeF16){
+      std::vector<uint16_t> f16(NV);
+      for(size_t k=0;k<NV;++k)f16[k]=floatToHalf(field[k]);
+      const char* w=(const char*)f16.data(); size_t left=NV*2;
+      while(left){const ssize_t n=::write(fd,w,left);if(n<0){if(errno==EINTR)continue;std::cerr<<"write failed: "<<std::strerror(errno)<<"\n";::close(fd);return 1;}w+=n;left-=size_t(n);}
+     }else{
+      const char* w=(const char*)field; size_t left=NV*4;
+      while(left){const ssize_t n=::write(fd,w,left);if(n<0){if(errno==EINTR)continue;std::cerr<<"write failed: "<<std::strerror(errno)<<"\n";::close(fd);return 1;}w+=n;left-=size_t(n);}
+     }
      if(::close(fd)!=0){std::cerr<<"close failed: "<<std::strerror(errno)<<"\n";return 1;}}
     if(vFail)std::cerr<<"validation FAILED: "<<vMis<<" distance mismatches, "<<vSign<<" sign errors in "<<validate<<" voxels\n";
     std::cout.flush(); std::fflush(nullptr); std::_Exit(vFail?1:0);

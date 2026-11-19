@@ -342,7 +342,7 @@ def start_server(root: Path):
 # ---------------------------------------------------------------------------
 # Main Judge Runner
 # ---------------------------------------------------------------------------
-def run_judge(tag: str, url_path: str, quick: bool = False):
+def run_judge(tag: str, url_path: str, quick: bool = False, contact_mode: int = 0):
     out_dir = OUT_ROOT / tag
     out_dir.mkdir(parents=True, exist_ok=True)
     curved_ref = build_curved_fixture_ref(OUT_ROOT / "curved_fixture_ref.json")
@@ -368,10 +368,11 @@ def run_judge(tag: str, url_path: str, quick: bool = False):
             page.wait_for_function("() => window.aoDemo !== undefined", timeout=60000)
 
             # 1. GPU info & 7-mode GL sanity check
-            env_info = page.evaluate("""async () => {
+            env_info = page.evaluate("""async (contactMode) => {
                 const d = aoDemo, gl = d.renderer.getContext();
                 d.renderer.setAnimationLoop(null);
                 d.controls.enableDamping = false;
+                if (d.setContactMode) d.setContactMode(contactMode);
                 const dbg = gl.getExtension('WEBGL_debug_renderer_info');
                 const renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
                 const vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
@@ -395,7 +396,7 @@ def run_judge(tag: str, url_path: str, quick: bool = False):
                     contactTriangles: cr ? cr.triangles : null,
                     contactRange: cr ? cr.range : null,
                 };
-            }""")
+            }""", contact_mode)
             if "Apple M1" not in env_info["renderer"] and "Metal" not in env_info["renderer"]:
                 raise RuntimeError(f"Expected real Apple Metal GPU, got: {env_info['renderer']}")
 
@@ -607,6 +608,7 @@ def run_judge(tag: str, url_path: str, quick: bool = False):
                 const traceBody = fragSrc.slice(fragSrc.indexOf('float ign('), fragSrc.indexOf('// The previous frame'));
                 const probeFrag = `precision highp float; precision highp sampler3D;
                 uniform float frame; uniform float gap; uniform int probeMode;
+                uniform sampler2D gPos;
                 float staticDistance(vec3 p) {
                     if (probeMode == 0) {
                         vec3 q = abs(p - vec3(0., 0., gap + .01)) - vec3(.25, .25, .01);
@@ -625,14 +627,19 @@ def run_judge(tag: str, url_path: str, quick: bool = False):
                     probeOut = vec4(tracedAO(vec3(x, 0., 0.), vec3(0., 0., 1.)), 0., 0., 1.);
                 }`;
                 const W = 129, H = 16;
+                const dummyTex = new T.DataTexture(new Float32Array(4), 1, 1, T.RGBAFormat, T.FloatType);
+                dummyTex.needsUpdate = true;
                 const u = {
                     frame: {value: 0}, gap: {value: 0.02}, probeMode: {value: 0},
+                    contactMode: {value: 0},
+                    gPos: {value: dummyTex}, hizTex1: {value: dummyTex}, hizTex2: {value: dummyTex},
+                    curViewProj: {value: new T.Matrix4()}, curView: {value: new T.Matrix4()},
                     contactRange: {value: d.aoPass.material.uniforms.contactRange.value},
                     contactBias: {value: d.aoPass.material.uniforms.contactBias.value},
                 };
                 // Copy any extra uniforms (like STBN texture) if present on aoPass
                 for (const [k, v] of Object.entries(d.aoPass.material.uniforms)) {
-                    if (!(k in u) && !['field','gPos','gNormal','histTex','normalTex','prevViewProj','histMax','settleFrames','tileRate'].includes(k)) {
+                    if (!(k in u) && !['field','gPos','gNormal','histTex','normalTex','prevViewProj','prevView','curViewProj','curView','invProjXY','hizTex1','hizTex2','histMax','settleFrames','tileRate'].includes(k)) {
                         u[k] = { value: v.value };
                     }
                 }
@@ -872,5 +879,6 @@ if __name__ == "__main__":
     ap.add_argument("--tag", required=True)
     ap.add_argument("--url", default="/index.html")
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--contact-mode", type=int, default=0)
     args = ap.parse_args()
-    run_judge(args.tag, args.url, args.quick)
+    run_judge(args.tag, args.url, args.quick, args.contact_mode)

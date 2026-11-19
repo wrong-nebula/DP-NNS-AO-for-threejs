@@ -67,3 +67,35 @@ Established `benchmark/judge_v2.py` (real Apple M1 Metal GPU via Playwright Chro
 | ThinPlate meanMAE64 | 0.01090 | 0.00612 | **-43.9%** |
 | Curved (Sphere+Torus) MAE | 0.05125 | 0.03958 | **-22.8%** |
 | GL errors (7 modes) | 0 | 0 | Pass |
+
+---
+
+## Phase 3 — Fast Contact BVH, Hi-Z Contact Hybrid & Isotropic FP16 Static SDF
+
+### Changes Implemented
+1. **Contact BVH Overhaul (`contact-bvh.js`)**:
+   - Replaced O(cells × tris) `.filter()` / `.flatMap()` with O(T) 2-pass CSR AABB-to-cell binning in flat typed arrays.
+   - Replaced longest-axis median split with 8-bin SAH + cell-clipped triangle AABBs.
+   - Packed BVH nodes into **single-fetch `RGBA32UI` (16 B/node)** using conservative 16-bit local-cell quantization (~23 µm precision) + split-axis-ordered short-stack traversal (`int stack[24]`, nearer child first).
+   - Deduplicated triangle vertices into an L1/L2-resident `RGBA32F` table indexed by `R32UI` `contactTriIdx` + compact `RG32UI` 3D grid (`8 B/cell`).
+   - Result: CPU build **5.7× faster** (`96.0 → 16.8 ms`), BVH VRAM **3.6× smaller** (`1,429.1 → 398.6 KiB`), bit-exact accuracy.
+2. **Screen-Space Hi-Z Contact Hybrid (`index.html`, `contact-bvh.js`)**:
+   - Added 2-level Hi-Z min-depth pyramid (`hiz1`, `hiz2`) + 8-step perspective-correct HZB contact march, exposed as an opt-in UI toggle (`#hizcontact`) and `aoDemo.setContactMode(0|1)`.
+   - Head-to-head (`p3b-hiz`): zero BVH memory/startup, 20% faster GPU early (`4.674 ms`), beats `main` on Fit@4/Held@4/Orbit/GMSD, but BVH remains default for superior contact accuracy (`0.01891` vs `0.02693`).
+3. **Isotropic FP16 Static SDF + Sparse Brick-Map Support (`tools/bake_sdf.cpp`, `index.html`)**:
+   - Extended `tools/bake_sdf.cpp` with `--res-xyz nx ny nz`, direct IEEE-754 binary16 export (`--f16`), and 2-level sparse narrow-band `8³` brick-map export (`--brick-out`).
+   - Re-baked Archive at **isotropic `256 × 176 × 80` FP16** (~10.1 cm isotropic voxels vs `20.3 × 14.1 × 6.3 cm`; `--validate 5000`: 0 mismatches, 0 sign errors; baked in 51.1 ms).
+   - Embedded gzipped FP16 directly in `index.html` (**-204.5 KB smaller** than `128³` FP32!) and eliminated the 2.1M-float JS `toHalfFloat()` startup loop. Kept `contactRange = max(0.24, ...)` after ThinPlate caught 20 cm plate skip at `0.208 m`.
+
+### Phase 3 Results (`p3-final` vs `baseline-main`)
+
+| Metric | `baseline-main` | `p3b-hiz` (opt-in) | `p3-final` (default BVH + Iso256) | Delta vs `main` |
+|---|---:|---:|---:|---:|
+| Fit MAE (1 / 4 / 16 / 64) | 0.02389 / 0.01684 / 0.00913 / 0.00746 | 0.02251 / 0.01443 / 0.01081 / 0.00852 | 0.02234 / 0.01326 / 0.00844 / 0.00593 | **-20.5%** @64 |
+| Held MAE (1 / 4 / 16 / 64) | 0.02209 / 0.01551 / 0.00836 / 0.00651 | 0.02020 / 0.01233 / 0.00892 / 0.00697 | 0.01966 / 0.01163 / 0.00737 / 0.00507 | **-22.1%** @64 |
+| Contact@64 MAE / underOcc / overOcc | 0.02542 / 0.00601 / 0.01940 | 0.02693 / 0.01355 / 0.01338 | 0.01891 / 0.00475 / 0.01416 | **-25.6%** / **-21.0%** / **-27.0%** |
+| Perceptual@64 Oklab / FLIP / p95 / GMSD | 0.00365 / 0.02772 / 0.1036 / 0.02093 | 0.00377 / 0.02919 / 0.1002 / 0.01997 | 0.00272 / 0.02221 / 0.0788 / 0.01052 | **-25.5%** / **-19.9%** / **-23.9%** / **-49.7%** |
+| CVaR-5%@64 | 0.05175 | 0.05358 | 0.03342 | **-35.4%** |
+| Temporal ConvAUC / Orbit3° / Settle4 | 0.00841 / 0.01150 / 0.01060 | 0.00978 / 0.01107 / 0.01084 | 0.00771 / 0.00978 / 0.00930 | **-8.3%** / **-15.0%** / **-12.3%** |
+| ThinPlate meanMAE64 / Curved MAE | 0.01090 / 0.05125 | — | 0.00776 / 0.04030 | **-28.8%** / **-21.4%** |
+| Startup contactBuild / BVH VRAM | 96.0 ms / 1429.1 KiB | 0 ms / 0 KiB | **16.8 ms** / **398.6 KiB** | **5.7× faster** / **3.6× smaller** |
