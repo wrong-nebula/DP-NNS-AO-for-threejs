@@ -162,6 +162,32 @@ try {
         fetchGzipHalf('./assets/gallery.f16.gz'),
       ]);
       const data = mod.buildGalleryGeometryData();
+      // Make the central hero sphere at (0.36, -0.16, 1.08, r=0.40) half mirror-smooth chrome (left)
+      // and half brushed rough chrome (right) to showcase real-time SDF glossy + rough reflections.
+      const vCnt = data.positions.length / 3;
+      const rough = new Float32Array(vCnt);
+      for (let i = 0; i < vCnt; i++) {
+        const px = data.positions[i * 3], py = data.positions[i * 3 + 1], pz = data.positions[i * 3 + 2];
+        const nz = data.normals[i * 3 + 2];
+        const dHero = Math.hypot(px - 0.36, py + 0.16, pz - 1.08);
+        if (dHero < 0.415) {
+          const smoothHalf = px < 0.36;
+          data.colors[i * 3]     = smoothHalf ? 0.95 : 0.90;
+          data.colors[i * 3 + 1] = smoothHalf ? 0.96 : 0.91;
+          data.colors[i * 3 + 2] = smoothHalf ? 0.98 : 0.93;
+          // Negative roughness encodes conductor (metal = 1.0) in WebGPUFastSDFAO
+          rough[i] = smoothHalf ? -0.03 : -0.34;
+        } else if (pz < 0.02 && nz > 0.85) {
+          rough[i] = 0.16;
+        } else if (Math.abs(nz) < 0.15 && (Math.abs(px) > 3.2 || Math.abs(py) > 3.2)) {
+          rough[i] = 0.80;
+        } else if (pz < 2.2) {
+          rough[i] = 0.24;
+        } else {
+          rough[i] = 0.55;
+        }
+      }
+      data.roughness = rough;
       const mesh = makeThreeMesh(data);
       const contactRange = Math.max(0.18, 0.12 + 0.5 * Math.hypot(mod.GALLERY_SDF_SPAN[0] / mod.GALLERY_SDF_DIMS[0], mod.GALLERY_SDF_SPAN[1] / mod.GALLERY_SDF_DIMS[1], mod.GALLERY_SDF_SPAN[2] / mod.GALLERY_SDF_DIMS[2]));
       const bvh = buildContactBVH([mesh], T, { gridSize: 'auto', range: contactRange + 0.0005 });

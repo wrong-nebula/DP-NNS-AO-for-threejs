@@ -189,21 +189,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let frame = u32(u.eyeFrame.w);
   let px = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
 
-  // GGX importance-sampled half vector (clamped alpha for crisp low-variance reflections)
-  let a = rough * rough;
-  let u1 = clamp(fract(ign(px) + vdc2(frame)), 1e-4, 0.92);
-  let u2 = fract(ign(px + vec2<f32>(29.0, 53.0)) + vdc3(frame));
-  let phi = 6.2831853 * u2;
-  let cosTh = sqrt((1.0 - u1) / max(1.0 + (a * a - 1.0) * u1, 1e-5));
-  let sinTh = sqrt(max(0.0, 1.0 - cosTh * cosTh));
+  // GGX importance-sampled half vector (exact mirror ray when rough <= 0.05 for razor-sharp chrome)
+  var R = reflect(-V, n);
+  if (rough > 0.05) {
+    let a = rough * rough;
+    let u1 = clamp(fract(ign(px) + vdc2(frame)), 1e-4, 0.92);
+    let u2 = fract(ign(px + vec2<f32>(29.0, 53.0)) + vdc3(frame));
+    let phi = 6.2831853 * u2;
+    let cosTh = sqrt((1.0 - u1) / max(1.0 + (a * a - 1.0) * u1, 1e-5));
+    let sinTh = sqrt(max(0.0, 1.0 - cosTh * cosTh));
 
-  let ax = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.x) < 0.9);
-  let tVec = normalize(cross(n, ax));
-  let bVec = cross(n, tVec);
-  let Hvec = normalize(tVec * (sinTh * cos(phi)) + bVec * (sinTh * sin(phi)) + n * cosTh);
-  var R = reflect(-V, Hvec);
-  if (dot(R, n) < 0.03) {
-    R = normalize(reflect(-V, n) + n * 0.05);
+    let ax = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.x) < 0.9);
+    let tVec = normalize(cross(n, ax));
+    let bVec = cross(n, tVec);
+    let Hvec = normalize(tVec * (sinTh * cos(phi)) + bVec * (sinTh * sin(phi)) + n * cosTh);
+    R = reflect(-V, Hvec);
+    if (dot(R, n) < 0.03) {
+      R = normalize(reflect(-V, n) + n * 0.05);
+    }
   }
 
   let origin = p + n * 0.008;

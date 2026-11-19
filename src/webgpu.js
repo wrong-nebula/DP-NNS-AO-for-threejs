@@ -60,8 +60,9 @@ struct GOut {
 @fragment fn fs(i: VOut) -> GOut {
   var o: GOut;
   o.posDepth = vec4<f32>(i.wPos, i.viewZ);
-  o.normal = vec4<f32>(normalize(i.wNor), 1.0);
-  o.albedo = i.colRough;
+  let isMetal = select(0.0, 1.0, i.colRough.a < 0.0);
+  o.normal = vec4<f32>(normalize(i.wNor), 1.0 + isMetal);
+  o.albedo = vec4<f32>(i.colRough.rgb, abs(i.colRough.a));
   return o;
 }
 `;
@@ -1082,7 +1083,8 @@ fn ignComp(q: vec2<f32>) -> f32 {
   let p = i.wPos;
   let n = normalize(i.wNor);
   let alb = i.colRough.rgb;
-  let rough = clamp(i.colRough.a, 0.05, 1.0);
+  let isMetal = select(0.0, 1.0, i.colRough.a < 0.0);
+  let rough = clamp(abs(i.colRough.a), 0.03, 1.0);
   let aoRes = u.screen.zw;
   let f = i.clip.xy * (aoRes / u.screen.xy) - 0.5;
   let i0 = vec2<i32>(floor(f));
@@ -1151,21 +1153,35 @@ fn ignComp(q: vec2<f32>) -> f32 {
     return vec4<f32>(pow(max(col, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)), 1.0);
   }
 
-  // PBR + Multi-Bounce GI + Real-Time Glossy SDF Reflections + Dynamic Emissive Orb
+  // PBR + Multi-Bounce GI + Real-Time Glossy SDF Reflections + Chrome Conductor + Dynamic Emissive Orb
   let mbAO = multiBounceAO(ao, alb);
   let skyCol = vec3<f32>(0.68, 0.79, 0.96);
   let gndCol = vec3<f32>(0.30, 0.27, 0.24);
   let ambEnv = mix(gndCol, skyCol, n.z * 0.5 + 0.5);
-  var color = alb * (vec3<f32>(2.25, 2.10, 1.85) * sun * sunSh + gi + ambEnv * mbAO * 0.16);
+  let diffWeight = 1.0 - isMetal;
+  var color = alb * diffWeight * (vec3<f32>(2.25, 2.10, 1.85) * sun * sunSh + gi + ambEnv * mbAO * 0.16);
 
-  // Fresnel + GTSO specular occlusion glossy reflection blend
-  if (rough < 0.72) {
-    let V = normalize(u.eye.xyz - p);
-    let NoV = max(dot(n, V), 1e-3);
-    let F = 0.04 + 0.96 * pow(1.0 - NoV, 5.0);
+  // Fresnel + GTSO specular occlusion glossy reflection blend (conductor F0 = albedo for chrome)
+  let V = normalize(u.eye.xyz - p);
+  let NoV = max(dot(n, V), 1e-3);
+  if (rough < 0.72 || isMetal > 0.5) {
+    let F0 = mix(vec3<f32>(0.04), alb, isMetal);
+    let F = F0 + (vec3<f32>(1.0) - F0) * pow(1.0 - NoV, 5.0);
     let specOcc = clamp(pow(NoV + ao, exp2(-16.0 * rough - 1.0)) - 1.0 + ao, 0.0, 1.0);
-    let reflFade = smoothstep(0.72, 0.12, rough);
-    color += rf.rgb * (F * specOcc * reflFade * 1.35);
+    let reflFade = mix(smoothstep(0.72, 0.12, rough) * 1.35, 1.05, isMetal);
+    color += rf.rgb * F * (specOcc * reflFade);
+
+    // Crisp GGX direct sun specular highlight on smooth/rough chrome & glossy dielectric
+    if (sun > 0.001) {
+      let H = normalize(V + sDir);
+      let NoH = max(dot(n, H), 0.0);
+      let a = max(rough * rough, 0.004);
+      let a2 = a * a;
+      let dn = NoH * NoH * (a2 - 1.0) + 1.0;
+      let D = a2 / (3.14159265 * dn * dn + 1e-5);
+      let specSun = min(D * 0.22, 6.0) * sun * sunSh * specOcc;
+      color += vec3<f32>(2.25, 2.10, 1.85) * F * specSun;
+    }
   }
 
   if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) > 1e-4) {
@@ -1176,7 +1192,7 @@ fn ignComp(q: vec2<f32>) -> f32 {
     let ndlO = max(0.0, dot(n, lDir));
     if (ndlO > 0.001 && dist < 7.5) {
       let att = 1.0 / (0.28 + d2);
-      color += alb * u.emissiveCol.rgb * (2.6 * att * ndlO * orbSh);
+      color += alb * diffWeight * u.emissiveCol.rgb * (2.6 * att * ndlO * orbSh);
     }
   }
   let srgb = linearToSrgb(acesToneMap(color * 0.88)) + (ignComp(i.clip.xy) - 0.5) / 255.0;
