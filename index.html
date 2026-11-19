@@ -1219,7 +1219,7 @@ try {
   //   history); normal + frames/255. The AO pass writes one while reading the other; the scene draw reads it.
   const nearest=t=>{t.minFilter=t.magFilter=T.NearestFilter;t.generateMipmaps=false;};
   let aoScale=.5,gTarget,histories,historiesBent=null,historiesGI=null,giDenoiseTargets=null,hiz1,hiz2;let histIndex=0;
-  let giAccumFrames=0,giSunCooldown=0,giDenoiseCached=false,giDenoiseLastIdx=1,giGTargetValid=false;
+  let giAccumFrames=0,giSunCooldown=0,giDenoiseCached=false,giDenoiseLastIdx=1,giGTargetValid=false,giHasRecurrent=false;
   function makeHistPair(w,h,count,giHalf=false){
     return [0,1].map(()=>{const rt=new T.WebGLRenderTarget(w,h,{count,depthBuffer:false});
       rt.textures[0].type=T.FloatType;rt.textures[0].format=T.RGFormat;
@@ -1614,21 +1614,25 @@ try {
       if(useBent)m.bentTex.value=prev.textures[2];
       let sunMoving=false,giSmooth=0,giFullySettled=false;
       if(useGI){
-        m.giTex.value=prev.textures[3];
         sunMoving=giSunCooldown>0;
+        // REBLUR-style recurrent feedback during motion: feed back the previous frame's stride-1
+        // tangent-plane-filtered GI (stored in giDenoiseTargets[1]) so spatial variance collapses
+        // exponentially across frames instead of drifting as low-frequency color blobs.
+        const useRecurrent=(!stillCamera||sunMoving)&&giHasRecurrent;
+        m.giTex.value=useRecurrent?giDenoiseTargets[1].texture:prev.textures[3];
         if(!stillCamera){
           giAccumFrames=Math.min(Math.max(giAccumFrames+1,1),32);
           giDenoiseCached=false;
         }else if(sunMoving){
-          // Keep effective EMA history count ~8 so when motion stops, convergence 8->128 is seamless (no pop).
-          giAccumFrames=Math.min(Math.max(giAccumFrames,8),12);
+          // Keep effective EMA history count ~10 so when motion stops, convergence 10->128 is seamless (no pop).
+          giAccumFrames=Math.min(Math.max(giAccumFrames,10),14);
           giDenoiseCached=false;
         }else{
           giAccumFrames=Math.min(giAccumFrames+1,128);
         }
         giSmooth=(!stillCamera||sunMoving||giAccumFrames<12)?1:Math.max(0,Math.min(1,(48-giAccumFrames)/36));
         m.giFrames.value=giAccumFrames;
-        m.giAlphaFloor.value=sunMoving?.12:(!stillCamera?.14:0);
+        m.giAlphaFloor.value=sunMoving?.10:(!stillCamera?.11:0);
         m.giSmoothFactor.value=giSmooth;
         giFullySettled=stillCamera&&!sunMoving&&traced.settleFrames.value>0&&giAccumFrames>=128;
       }
@@ -1651,6 +1655,8 @@ try {
           du.aoTex.value=cur.textures[0];du.aoNormalTex.value=cur.textures[1];
           du.giSmoothFactor.value=giSmooth;
           if(!stillCamera||sunMoving||giAccumFrames<16){
+            // Pass 1 (stride=1) -> [0], Pass 2 (stride=3) -> [1] (reused as recurrent feedback while moving),
+            // Pass 3 (stride=6) -> [0] (displayed). Tangent-plane + normal weights keep geometric corners sharp.
             du.giSrc.value=cur.textures[3];du.stepSize.value=1;
             renderer.setRenderTarget(giDenoiseTargets[0]);giDenoisePass.render(renderer);
             du.giSrc.value=giDenoiseTargets[0].texture;du.stepSize.value=3;
@@ -1658,12 +1664,14 @@ try {
             du.giSrc.value=giDenoiseTargets[1].texture;du.stepSize.value=6;
             renderer.setRenderTarget(giDenoiseTargets[0]);giDenoisePass.render(renderer);
             giDenoiseLastIdx=0;
+            giHasRecurrent=true;
           }else{
             du.giSrc.value=cur.textures[3];du.stepSize.value=1;
             renderer.setRenderTarget(giDenoiseTargets[0]);giDenoisePass.render(renderer);
             du.giSrc.value=giDenoiseTargets[0].texture;du.stepSize.value=3;
             renderer.setRenderTarget(giDenoiseTargets[1]);giDenoisePass.render(renderer);
             giDenoiseLastIdx=1;
+            giHasRecurrent=true;
           }
           traced.aoGITex.value=giDenoiseTargets[giDenoiseLastIdx].texture;
           if(giFullySettled)giDenoiseCached=true;
@@ -1726,7 +1734,7 @@ try {
     if(historiesBent)for(const rt of historiesBent){renderer.setRenderTarget(rt);renderer.clear();}
     if(historiesGI)for(const rt of historiesGI){renderer.setRenderTarget(rt);renderer.clear();}
     renderer.setRenderTarget(null);
-    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;giGTargetValid=false;
+    giAccumFrames=0;giSunCooldown=0;giDenoiseCached=false;giGTargetValid=false;giHasRecurrent=false;
   }
   function setGI(on){
     giMode.value=!!on;

@@ -356,13 +356,16 @@ vec4 tracedAOBentGI(vec3 p,vec3 n,float nd,bool needAO,out vec3 giOutIrr){
    cellCount=contactNodeCount;
   }
  }
+ float phiBase=6.2831853*fract(sp+vdc3(uint(frame)));
  for(int i=0;i<4;i++){
   if(float(i)>=nd)break;
   float u=clamp((float(i)+fu)/nd,1e-4,.9999);
-  float phi=6.2831853*fract(sp+vdc3(base+uint(i)));
+  // Antithetic azimuth stratification: rays within a frame are evenly spaced around 2*PI
+  // (180 deg apart for nd=2, 90 deg for nd=4), eliminating frame-to-frame directional color drift.
+  float phi=phiBase+float(i)*(6.2831853/nd);
   float cosn=sqrt(1.-u);
   vec3 w=t*(sqrt(u)*cos(phi))+b*(sqrt(u)*sin(phi))+n*cosn;
-  // Trace far GI extension on at most 2 stratified rays/frame (unbiased across strata) while keeping
+  // Trace far GI extension on at most 2 opposite (antithetic) stratified rays/frame while keeping
   // all nd short rays for crisp AO & near-contact visibility.
   bool doGI=(nd<=2.5)||(nd<3.5?(i!=fMod3):((i&1)==fParity));
   if(doGI)giRays+=1.;
