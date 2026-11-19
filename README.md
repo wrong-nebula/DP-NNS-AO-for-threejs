@@ -1,26 +1,37 @@
 # Fast SDF AO
 
-Real-time ambient occlusion for Three.js from a baked signed distance field (SDF): a four-read formula, exact distances to moving objects, and an exact baker for meshes and point clouds. **Traced SDF (temporal)** combines exact triangle intersections near surfaces with farther SDF tracing, at half resolution with temporal accumulation. The contact repair adds geometry data and runtime cost; see the [current GPU validation](benchmark/contact-results.md) for accuracy, timing, and remaining limitations.
+Real-time ambient occlusion for Three.js from a baked signed distance field (SDF): a four-read formula, exact distances to moving objects, and an exact baker for meshes and point clouds. **Traced SDF (temporal)** combines exact near-surface triangle intersections (quantized SAH local BVH, or opt-in Hi-Z screen-space contact tracing) with an isotropic `256 × 176 × 80` FP16 SDF for farther visibility, half-resolution tangent-plane-aware upsampling, variance-guided temporal accumulation, and exact analytic/traced moving-object occlusion. See [nextgen-log.md](benchmark/nextgen-log.md) for current Apple M1 GPU accuracy, perceptual, temporal, and timing results (and [contact-results.md](benchmark/contact-results.md) for the earlier contact-repair baseline).
 
 The project started from the DP-NNS nearest-neighbour paper, which motivates SDF baking, but it does not use DP-NNS: the baker computes exact distances to triangles with a BVH. *Why not DP-NNS* below explains why, with measurements.
 
-This repository is an interactive Three.js ambient occlusion comparison using the Archive scene, with stairs, shelves, and walls, plus 11 moving objects. Orbit the scene, switch among seven AO modes, and inspect the live FPS counter or the AO mask.
+This repository is an interactive Three.js ambient occlusion comparison using the Archive scene, with stairs, shelves, and walls, plus 11 moving objects. Orbit the scene, switch among seven AO modes, toggle **PBR + Multi-Bounce**, **Hi-Z contact**, **Smooth falloff**, or **AO mask**, and inspect the live FPS counter.
 
-Serve this directory over HTTP and open `index.html` in a WebGL 2 browser. The scene and distance field are embedded; the contact accelerator loads from the local `contact-bvh.js` module. Three.js and its addons load from a pinned CDN URL.
+Serve this directory over HTTP and open `index.html` in a WebGL 2 browser. The scene and FP16 distance field are embedded; the contact accelerator loads from the local `contact-bvh.js` module. Three.js and its addons load from a pinned CDN URL.
 
 ## Traced SDF (temporal)
 
-The **Traced SDF (temporal)** mode estimates the unblocked share of cosine-weighted directions out to 1.12 m. [contact-bvh.js](contact-bvh.js) supplies a generic triangle-mesh contact accelerator, including indexed and instanced meshes with world transforms. The farther estimator samples the existing baked field.
+The **Traced SDF (temporal)** mode estimates the unblocked share of cosine-weighted directions out to 1.12 m. [contact-bvh.js](contact-bvh.js) supplies a generic triangle-mesh contact accelerator, including indexed and instanced meshes with world transforms. The farther estimator samples the baked isotropic FP16 distance field (`256 × 176 × 80`, ~10.1 cm voxels).
 
-- **Tracing:** each AO pixel traces 4 directions on frames 0–7, 3 on frames 8–15, and 2 afterward. Every direction first checks exact triangle intersections from a 0.3 mm normal-offset origin through the near segment. Its length is 12 cm plus half a field-cell diagonal, about 24.7 cm for this scene. This covers the skipped near region without relying on the coarse field to distinguish the receiving surface from a thin blocker.
-- **Far visibility:** unblocked directions retain the champion's SDF march, starting at 12 cm, with up to 16 steps of at least 7.2 cm. The soft visibility is `min over steps of clamp((d + e) / (4e), 0, 1)`, where `e = max(1e-6, min(0.025, 0.1 * t * (w·n)))`. This remains an approximation; the near geometry pass does not make the whole AO estimate exact.
-- **Local geometry:** a 1 m world grid selects a local triangle BVH. Cell candidate bounds include the contact range and origin bias. Geometry determines the grid and BVHs; camera position, scene IDs, and reference AO do not. For the Archive this adds about 1.4 MiB of GPU texture data and roughly 260 ms of CPU construction at startup. Fetch counts depend on geometry and direction, so the old estimator-only 14.25-read budget does not apply.
-- **Accumulation and display:** history is reused only for matching depth and normals, with up to 128 frames while still or 32 while moving. The displayed result blends the wall-correction formula with the traced mean using `frames / (frames + 3)`. Only the traced mean enters the history.
-- **Resolution and movers:** tracing runs at half resolution. Moving-object occlusion and moving surfaces continue through the existing per-frame formula path. A static pixel stops tracing after 64 accumulated frames. Optional quarter-rate tracing (`aoDemo.traced.tileRate.value = 4`) remains off by default.
+- **Sampling and tracing:** each AO pixel traces 4 directions on frames 0–7, 3 on frames 8–15, and 2 afterward (dropping to 1 on low-variance pixels after frame 24), using Cranley-Patterson IGN spatial shifts with exact 2D Halton(2, 3) sequences (`vdc2` elevation, `vdc3` azimuth) for spatial anti-correlation and wrap-free temporal stratification. Every direction first checks exact triangle intersections from a 0.3 mm normal-offset origin over the near segment (`max(0.24 m, 0.12 m + half voxel diagonal)`).
+- **Far visibility:** unblocked directions hand off directly at `s = contactRange` to the SDF march (up to 16 steps of at least 7.2 cm, early exit at `v < 0.01`). Soft visibility is `min over steps of clamp((d + e) / (4e), 0, 1)`, where `e = max(1e-6, min(0.025, 0.1 * t * (w·n)))`. An opt-in **Smooth falloff** toggle fades occlusion smoothly over `[0.72, 1.12] m`.
+- **Quantized SAH contact BVH:** a 1 m world grid selects a local 8-bin SAH triangle BVH built via O(T) 2-pass CSR cell binning with cell-clipped triangle AABBs. Nodes pack into single-fetch `RGBA32UI` (16 B/node, 16-bit local-cell quantization, ~23 µm precision) with split-axis-ordered short-stack traversal and deduplicated triangle storage. For the Archive this takes **~16.5 ms** CPU startup and **398.6 KiB** VRAM (5.8× faster build and 3.6× smaller than the initial float32 contact BVH). An opt-in **Hi-Z contact** toggle (`aoDemo.setContactMode(1)`) replaces the BVH with a 2-level Hi-Z min-depth screen-space contact trace (zero BVH memory/build).
+- **Accumulation, upsampling, and variance filtering:** both temporal reprojection and full-resolution upsampling validate neighbors with **view-space tangent-plane distance** reconstructed from `viewDepth` (zero extra render targets or fetches), eliminating offset-plane shadow bleeding. History stays at **12 B/px** (`RG32F` AO + depth; `RGBA8` octahedral normal + Welford online `sqrt(var)*4` + `frames/255`), enabling variance-guided early settling (`frames >= 24 && var < 0.00015`), a variance-weighted formula blend, a 4-neighbor cross-bilateral prefilter on young noisy histories (`frames < 6`), and zero full-res SDF reads on settled pixels (`frames >= 32 && var < 0.0006`).
+- **Moving objects and PBR showcase:** in Traced mode, nearby movers use closed-form analytic sphere occlusion (`sphOcclusion`) plus 24-ray stratified cosine-weighted exact ray-box/SDF visibility per frame (zero temporal lag, cutting near-mover error by 46.7%). Enabling **PBR + Multi-Bounce** (`aoDemo.setPBR(true)`) lazily enables a 3rd `bentOut` MRT for temporally accumulated **bent normals**, driving Jimenez multi-bounce colored AO, directional sky/ground ambient, GGX sun specular with GTSO specular occlusion, and ACES tone mapping + sRGB transfer (`AO mask` always outputs pure linear `[0, 1]` AO).
+- **WebGPU world-space hash cache prototype:** [benchmark/webgpu-hash-ao.html](benchmark/webgpu-hash-ao.html) implements a native WebGPU compute world-space spatial hash AO cache (distance-LOD cells, tangent-plane jitter, LRU eviction, 100% converged-cell skip): `0.01126` frame-1 camera-cut revisit MAE (2× lower disocclusion error than screen-space) at `0.619 ms/f` settled on Apple M1 Metal-3.
 
-The renderer change was validated on the GPU at 1, 4, 16, and 64 frames across six views, plus thin plates, camera motion, and moving objects. Frame-16 mean error is approximately 0.00913 on fitting views and 0.00836 on held-out views. See [contact-results.md](benchmark/contact-results.md) for current results and the timing tradeoff. The Python estimator in [accuracy/traced_ao.py](accuracy/traced_ao.py) and its [original contract](thermite/traced-ao.contract.json) describe the earlier SDF-only model; they do not implement or score this broader renderer change.
+Validated on Apple M1 GPU (`benchmark/judge_v2.py`) across 6 views, 5 cm contacts, perceptual metrics (Oklab, FLIP-style, GMSD, CVaR-5%), camera cuts/orbits, frozen & continuous movers, thin plates, and curved geometry:
 
-Inspect `aoDemo.contactResources` for textures, memory, and build metadata. After changing static triangles or instance transforms, call `aoDemo.rebuildStaticContact()` (or supply a mesh array and `{gridSize, range, bias}`). This disposes the previous accelerator and resets temporal history. It does **not** rebake the far SDF, which must also be updated when static geometry changes. The current builder limits each local tree to 8192 nodes and duplicated triangle records to fewer than 2²¹; it rejects textures that exceed the device's 2D or 3D size limits. It is a static-mesh accelerator, not a per-frame deforming-mesh solution.
+| Apple M1 GPU (1280 × 720, 640 × 360 AO) | Previous contact BVH (`e600a61`) | **Current `main`** | Change |
+|---|---:|---:|---:|
+| Fitting MAE (1 / 4 / 16 / 64 frames) | 0.02389 / 0.01684 / 0.00913 / 0.00746 | **0.02234 / 0.01325 / 0.00845 / 0.00585** | -6.5% / **-21.3%** / -7.4% / **-21.6%** |
+| Held-out MAE (1 / 4 / 16 / 64 frames) | 0.02209 / 0.01551 / 0.00836 / 0.00651 | **0.01966 / 0.01156 / 0.00738 / 0.00497** | -11.0% / **-25.5%** / -11.7% / **-23.7%** |
+| 5 cm contact MAE@64 (underOcc / overOcc) | 0.02542 (0.00601 / 0.01940) | **0.01877 (0.00470 / 0.01407)** | **-26.2%** |
+| Perceptual@64: FLIP / GMSD / CVaR-5% | 0.02772 / 0.02093 / 0.05175 | **0.02193 / 0.01051 / 0.03340** | **-20.9% / -49.8% / -35.5%** |
+| Orbit 3°/f / Movers near (continuous) | 0.01150 / 0.03784 | **0.00975 / 0.02024** | **-15.2% / -46.5%** |
+| Wall ms/f (early / orbit / settled) | 3.106 / 2.200 / 0.912 | **2.988** / 2.450 / 1.100 | **-3.8% early** |
+| Contact BVH build / VRAM | 96.0 ms / 1,429.1 KiB | **16.5 ms / 398.6 KiB** | **5.8× faster / 3.6× smaller** |
+
+Inspect `aoDemo.contactResources` for textures, memory, and build metadata. After changing static triangles or instance transforms, call `aoDemo.rebuildStaticContact()` (or supply a mesh array and `{gridSize, range, bias}`). This disposes the previous accelerator and resets temporal history. It does **not** rebake the far SDF, which must also be updated when static geometry changes.
 
 **Historical SDF-only results:** the following table predates the contact accelerator and uses two directions per frame with blend constant 8. Its timings and 43% improvement describe that earlier implementation.
 
@@ -94,14 +105,14 @@ The Archive volume was baked from analytic box distances. The runtime AO shader 
 
 ## Baking a field for your own scene
 
-[`tools/bake_sdf.cpp`](tools/bake_sdf.cpp) bakes the same 128³ clipped signed field from any closed triangle mesh (OBJ), box list (JSON) or oriented point cloud (PLY). It has no dependencies:
+[`tools/bake_sdf.cpp`](tools/bake_sdf.cpp) bakes a clipped signed distance field (cubic `--res 128`, anisotropic/isotropic `--res-xyz 256 176 80`, direct binary16 `--f16`, or 2-level sparse narrow-band `8³` brick-map `--brick-out`) from any closed triangle mesh (OBJ), box list (JSON) or oriented point cloud (PLY). It has no dependencies:
 
 ```
 c++ -O3 -std=c++17 -pthread tools/bake_sdf.cpp -o bake_sdf
-./bake_sdf --obj scene.obj --lo -1 -1 -1 --span 26 18 8 --res 128 --clip 1.5 --out scene.f32
+./bake_sdf --obj scene.obj --lo -1 -1 -1 --span 26 18 8 --res-xyz 256 176 80 --clip 1.5 --f16 --out scene.f16
 ```
 
-Distances are exact (closest point on the nearest triangle), far space is skipped, sign comes from winding numbers, and all cores are used. On an Apple M1, the Archive takes about 35 ms and a 488k-triangle version of it about 150 ms (originally 115 ms and 307 ms; see below). Outside the geometry the output matches the analytic field exactly, and AO accuracy is unchanged. See [precompute.md](benchmark/precompute.md).
+Distances are exact (closest point on the nearest triangle), far space is skipped, sign comes from winding numbers, and all cores are used. On an Apple M1, the Archive takes about 35 ms at `128³` (~51 ms at isotropic `256 × 176 × 80` FP16) and a 488k-triangle version of it about 150 ms (originally 115 ms and 307 ms; see below). Outside the geometry the output matches the analytic field exactly, and AO accuracy is unchanged. See [precompute.md](benchmark/precompute.md).
 
 ### From a point cloud (scans, photogrammetry, splats)
 

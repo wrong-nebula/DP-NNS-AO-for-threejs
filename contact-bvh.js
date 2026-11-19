@@ -133,7 +133,9 @@ vec4 candidateAOBent(vec3 p,vec3 n,float nd){
  float su=ign(gl_FragCoord.xy);
  float sp=ign(gl_FragCoord.xy+vec2(37.,17.));
  float vis=0.;
+ #ifdef BENT_NORMALS
  vec3 bent=vec3(0.);
+ #endif
  float fu=fract(su+vdc2(uint(frame)));
  uint base=uint(frame)*4u;
  for(int i=0;i<4;i++){
@@ -155,10 +157,16 @@ vec4 candidateAOBent(vec3 p,vec3 n,float nd){
    s+=max(d,.072);if(s>1.12)break;
   }
   vis+=v;
+  #ifdef BENT_NORMALS
   bent+=w*v;
+  #endif
  }
+ #ifdef BENT_NORMALS
  float bl=length(bent);
  return vec4(vis/nd,bl>1e-4?bent/bl:n);
+ #else
+ return vec4(vis/nd,n);
+ #endif
 }
 float candidateAO(vec3 p,vec3 n,float nd){return candidateAOBent(p,n,nd).x;}
 float candidateAO(vec3 p,vec3 n){

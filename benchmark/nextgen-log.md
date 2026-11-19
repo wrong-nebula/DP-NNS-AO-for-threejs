@@ -137,20 +137,27 @@ Implemented a standalone WebGPU Compute (WGSL) prototype (`benchmark/webgpu-hash
    - Opt-in `#smoothfalloff` toggle (`aoDemo.setSmoothFalloff(on)`): smooth `[0.72, 1.12] m` distance falloff vs exact hard `1.12 m` benchmark cutoff.
    - `AO mask` remains 100% pure linear AO in `[0, 1]`.
 
+### Speed Pass (Gated `bentOut` MRT + `RG32F` History Bandwidth Trim)
+
+- **Gated bent-normal MRT to PBR mode (`index.html`, `contact-bvh.js`)**: standard Traced mode uses a 2-MRT `aoPass` (`RG32F` + `RGBA8` = **12 B/px**, matching `main`) with `#ifdef BENT_NORMALS` compiled out; the 3-MRT `aoPassBent` / `historiesBent` are allocated lazily only when `#pbr` is enabled.
+- **Trimmed `histTex` (`RGBA32F → RG32F`, 2× less bandwidth)**: packed octahedral surface normal (`xy`, <0.5° error), `sqrt(var)*4` (`z`) via exact Welford online variance, and `frames/255` (`w`) into `normalTex` (`RGBA8`), hoisted view-space plane-distance terms, replaced `normalize()` with squared-dot threshold checks, and skipped full-res 4-tap SDF reads on settled low-variance pixels (`frames >= 32 && var < 0.0006`).
+
 ### Final End-to-End Comparison (`main` `e600a61` vs `feat/ao-next-gen`)
 
 | Metric | `main` (`e600a61`) | `feat/ao-next-gen` | Change |
 |---|---:|---:|---:|
-| Fit MAE (1 / 4 / 16 / 64) | 0.02389 / 0.01684 / 0.00913 / 0.00746 | **0.02234 / 0.01326 / 0.00844 / 0.00593** | -6.5% / **-21.3%** / -7.6% / **-20.5%** |
-| Held MAE (1 / 4 / 16 / 64) | 0.02209 / 0.01551 / 0.00836 / 0.00651 | **0.01966 / 0.01163 / 0.00737 / 0.00507** | -11.0% / **-25.0%** / -11.8% / **-22.1%** |
-| Contact@64 MAE / underOcc / overOcc | 0.02542 / 0.00601 / 0.01940 | **0.01891 / 0.00475 / 0.01416** | **-25.6%** / **-21.0%** / **-27.0%** |
-| Perceptual@64 Oklab / FLIP / p95 / GMSD | 0.00365 / 0.02772 / 0.1036 / 0.02093 | **0.00272 / 0.02221 / 0.0788 / 0.01052** | **-25.5%** / **-19.9%** / **-23.9%** / **-49.7%** |
-| Tail-Risk CVaR-5%@64 | 0.05175 | **0.03342** | **-35.4%** |
-| Temporal ConvAUC / Disocc(1..4) / Orbit3° | 0.00841 / 0.01826 / 0.01150 | **0.00771 / 0.01598 / 0.00978** | **-8.3%** / **-12.5%** / **-15.0%** |
+| Fit MAE (1 / 4 / 16 / 64) | 0.02389 / 0.01684 / 0.00913 / 0.00746 | **0.02234 / 0.01325 / 0.00845 / 0.00585** | -6.5% / **-21.3%** / -7.4% / **-21.6%** |
+| Held MAE (1 / 4 / 16 / 64) | 0.02209 / 0.01551 / 0.00836 / 0.00651 | **0.01966 / 0.01156 / 0.00738 / 0.00497** | -11.0% / **-25.5%** / -11.7% / **-23.7%** |
+| Contact@64 MAE / underOcc / overOcc | 0.02542 / 0.00601 / 0.01940 | **0.01877 / 0.00470 / 0.01407** | **-26.2%** / **-21.8%** / **-27.5%** |
+| Perceptual@64 Oklab / FLIP / p95 / GMSD | 0.00365 / 0.02772 / 0.1036 / 0.02093 | **0.00269 / 0.02193 / 0.0787 / 0.01051** | **-26.3%** / **-20.9%** / **-24.0%** / **-49.8%** |
+| Tail-Risk CVaR-5%@64 | 0.05175 | **0.03340** | **-35.5%** |
+| Temporal ConvAUC / Disocc(1..4) / Orbit3° | 0.00841 / 0.01826 / 0.01150 | **0.00768 / 0.01589 / 0.00975** | **-8.7%** / **-13.0%** / **-15.2%** |
 | Diag `pix416854` (ref 1.000) | 0.8314 | **1.0000** | Fixed (exact) |
-| Movers Frozen all/near | 0.01185 / 0.03778 | **0.00889 / 0.02016** | **-25.0% / -46.6%** |
-| Movers Continuous all/near | 0.01188 / 0.03784 | **0.00891 / 0.02025** | **-25.0% / -46.5%** |
+| Movers Frozen all/near | 0.01185 / 0.03778 | **0.00887 / 0.02015** | **-25.1% / -46.7%** |
+| Movers Continuous all/near | 0.01188 / 0.03784 | **0.00889 / 0.02024** | **-25.2% / -46.5%** |
 | ThinPlate meanMAE64 / Curved MAE | 0.01090 / 0.05125 | **0.00776 / 0.04030** | **-28.8% / -21.4%** |
-| Contact BVH Build / VRAM | 96.0 ms / 1429.1 KiB | **16.8–25.9 ms / 398.6 KiB** | **3.7–5.7× faster / 3.6× smaller** |
+| Wall ms/f (early / orbit / settled) | 3.106 / 2.200 / 0.912 | **2.988** / 2.450 / 1.100 | **-3.8% early** |
+| GPU ms/f (early / orbit / settled) | 5.863 / 4.006 / 1.478 | **5.742** / 4.545 / 1.899 | **-2.1% early** |
+| Contact BVH Build / VRAM | 96.0 ms / 1429.1 KiB | **16.5 ms / 398.6 KiB** | **5.8× faster / 3.6× smaller** |
 | `index.html` SDF Payload | 924 KB (128³ f32.gz) | **715 KB (256×176×80 f16.gz)** | **-204.5 KB, 0 JS f16 loop** |
 | Exhaustive GL & Console Errors | 0 / 0 | **0 / 0** (all 7 modes × all toggles) | Pass |

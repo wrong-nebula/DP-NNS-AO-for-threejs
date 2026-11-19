@@ -100,18 +100,28 @@ uniform vec2 invProjXY;
 // a cut or a just-revealed surface starts from the formula (never worse than it), and the blend beats either
 // alone at every history length (the two estimators' errors partly cancel).
 uniform float blendK;
+// Octahedral normal decode without normalize() for fast dot-product threshold tests.
+vec3 octDecodeRaw(vec2 e){
+  e=e*2.-1.;
+  vec3 v=vec3(e.xy,1.-abs(e.x)-abs(e.y));
+  if(v.z<0.)v.xy=(1.-abs(v.yx))*vec2(v.x>=0.?1.:-1.,v.y>=0.?1.:-1.);
+  return v;
+}
 // The traced AO at this pixel, from the AO-resolution result: its four nearest texels weighted bilinearly
 // with view-space tangent-plane distance rejection reconstructed from viewDepth (zero extra texture fetches).
 // Returns vec3(aoMean, frames, variance). For young noisy histories (frames < 6), applies a lightweight
 // 4-neighbor cross-bilateral prefilter with identical plane/normal rejection.
 vec3 tracedAt(vec3 pWorld,vec3 n){
   vec2 res=vec2(textureSize(aoTex,0));
+  vec2 invRes2=2./res;
   vec2 f=gl_FragCoord.xy*res/vec2(${W}.,${H}.)-.5;
   f=mix(f,round(f),vec2(lessThan(abs(f-round(f)),vec2(.02))));
   ivec2 i0=ivec2(floor(f));vec2 w=f-floor(f);
   vec3 vp=(viewMatrix*vec4(pWorld,1.)).xyz;
   vec3 vn=mat3(viewMatrix)*n;
   float viewDepth=-vp.z;
+  vec2 vnXY=vn.xy*invProjXY;
+  float vpDotN=dot(vn,vp);
   vec3 acc=vec3(0.);float ws=0.;
   float planeTol=.0015*viewDepth+.005;
   float depthTol=.08*viewDepth+.05;
@@ -119,14 +129,16 @@ vec3 tracedAt(vec3 pWorld,vec3 n){
     ivec2 o=ivec2(k&1,k>>1),q=clamp(i0+o,ivec2(0),ivec2(res)-1);
     float bw=(o.x==1?w.x:1.-w.x)*(o.y==1?w.y:1.-w.y);
     if(bw<1e-4)continue;
-    vec4 h=texelFetch(aoTex,q,0);
+    vec2 h=texelFetch(aoTex,q,0).xy;
     vec4 hn=texelFetch(aoNormalTex,q,0);
     float frames=hn.w*255.;
-    if(frames<.5||abs(h.y-viewDepth)>depthTol||dot(hn.xyz*2.-1.,n)<.9)continue;
-    vec2 ndcQ=((vec2(q)+.5)/res)*2.-1.;
-    vec3 vpQ=vec3(ndcQ*invProjXY*h.y,-h.y);
-    if(abs(dot(vn,vpQ-vp))>planeTol)continue;
-    acc+=bw*vec3(h.x,frames,h.w);ws+=bw;
+    if(frames<.5||abs(h.y-viewDepth)>depthTol)continue;
+    vec3 nv=octDecodeRaw(hn.xy);float dn=dot(nv,n);
+    if(dn<=0.||dn*dn<.81*dot(nv,nv))continue;
+    vec2 ndcQ=(vec2(q)+.5)*invRes2-1.;
+    if(abs((dot(vnXY,ndcQ)-vn.z)*h.y-vpDotN)>planeTol)continue;
+    float sig=hn.z*.25;
+    acc+=bw*vec3(h.x,frames,sig*sig);ws+=bw;
   }
   if(ws<=.01)return vec3(0.);
   vec3 resVal=acc/ws;
@@ -137,12 +149,13 @@ vec3 tracedAt(vec3 pWorld,vec3 n){
     const ivec2 offs[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
     for(int k=0;k<4;k++){
       ivec2 q=clamp(c0+offs[k],ivec2(0),ivec2(res)-1);
-      vec4 h=texelFetch(aoTex,q,0);
+      vec2 h=texelFetch(aoTex,q,0).xy;
       vec4 hn=texelFetch(aoNormalTex,q,0);
-      if(hn.w*255.<.5||abs(h.y-viewDepth)>depthTol||dot(hn.xyz*2.-1.,n)<.9)continue;
-      vec2 ndcQ=((vec2(q)+.5)/res)*2.-1.;
-      vec3 vpQ=vec3(ndcQ*invProjXY*h.y,-h.y);
-      if(abs(dot(vn,vpQ-vp))>planeTol)continue;
+      if(hn.w*255.<.5||abs(h.y-viewDepth)>depthTol)continue;
+      vec3 nv=octDecodeRaw(hn.xy);float dn=dot(nv,n);
+      if(dn<=0.||dn*dn<.81*dot(nv,nv))continue;
+      vec2 ndcQ=(vec2(q)+.5)*invRes2-1.;
+      if(abs((dot(vnXY,ndcQ)-vn.z)*h.y-vpDotN)>planeTol)continue;
       fSum+=h.x;fw+=1.;
     }
     resVal.x=fSum/fw;
@@ -445,12 +458,16 @@ void main(){
       shown=aoWallCorrection(ds,normal);
     }else{
       // Shown: formula and traced mean blended (see blendK). Only the traced mean is accumulated (AO pass), so
-      // the blend never feeds back into the history.
+      // the blend never feeds back into the history. Settled pixels skip the 4 full-res SDF reads completely.
       vec3 tr=tracedAt(p,normal);
-      vec4 ds=vec4(staticDistance(p+normal*R.x),staticDistance(p+normal*R.y),
-                   staticDistance(p+wallCorrectionTap2(normal)),staticDistance(p+wallCorrectionTap3(normal)));
-      float effK=clamp(blendK*(.55+8.*tr.z),1.5,4.5);
-      shown=mix(aoWallCorrection(ds,normal),tr.x,tr.y/(tr.y+effK));
+      if(tr.y>=32.&&tr.z<.0006){
+        shown=tr.x;
+      }else{
+        vec4 ds=vec4(staticDistance(p+normal*R.x),staticDistance(p+normal*R.y),
+                     staticDistance(p+wallCorrectionTap2(normal)),staticDistance(p+wallCorrectionTap3(normal)));
+        float effK=clamp(blendK*(.55+8.*tr.z),1.5,4.5);
+        shown=mix(aoWallCorrection(ds,normal),tr.x,tr.y/(tr.y+effK));
+      }
     }
     // Exact analytic + per-frame cosine-weighted ray-traced mover visibility (zero lag, no moverScale=0.5 hack).
     ao=dynMask!=0?shown*dynamicVisibility(p,normal):shown;
@@ -536,7 +553,9 @@ uniform sampler2D gPos;
 uniform sampler2D gNormal;
 uniform sampler2D histTex;
 uniform sampler2D normalTex;
+#ifdef BENT_NORMALS
 uniform sampler2D bentTex;
+#endif
 uniform mat4 prevViewProj;
 uniform mat4 prevView;
 uniform vec2 invProjXY;
@@ -546,8 +565,21 @@ uniform float settleFrames;
 uniform float tileRate;
 layout(location=0) out vec4 histOut;
 layout(location=1) out vec4 normalOut;
+#ifdef BENT_NORMALS
 layout(location=2) out vec4 bentOut;
+#endif
 const vec3 scale=1./vec3(26.,18.,8.);
+vec2 octEncode(vec3 n){
+  n/=abs(n.x)+abs(n.y)+abs(n.z);
+  if(n.z<0.)n.xy=(1.-abs(n.yx))*vec2(n.x>=0.?1.:-1.,n.y>=0.?1.:-1.);
+  return n.xy*.5+.5;
+}
+vec3 octDecodeRaw(vec2 e){
+  e=e*2.-1.;
+  vec3 v=vec3(e.xy,1.-abs(e.x)-abs(e.y));
+  if(v.z<0.)v.xy=(1.-abs(v.yx))*vec2(v.x>=0.?1.:-1.,v.y>=0.?1.:-1.);
+  return v;
+}
 float staticDistance(vec3 pos){
   vec3 uv=(pos+1.)*scale;
   if(any(lessThan(uv,vec3(0.)))||any(greaterThan(uv,vec3(1.))))return 1e4;
@@ -558,21 +590,26 @@ float staticDistance(vec3 pos){
 float ign(vec2 q){return fract(52.9829189*fract(dot(q,vec2(.06711056,.00583715))));}
 ${CONTACT_GLSL.replaceAll('candidateAO(', 'tracedAO(').replaceAll('candidateAOBent(', 'tracedAOBent(')}
 // The previous frame's accumulated static AO at p: p projected with the previous camera, the four history
-// texels around it weighted bilinearly, each only if it saw the same surface (view depth within 3% + 1 cm,
-// normals within ~25 degrees) and holds a static-surface history. x: AO, y: frames (0 = none).
-// histTex: (aoMean, viewDepth, aoM2, variance); normalTex: (normal, frames/255).
-vec4 history(vec3 p,vec3 n,out vec3 prevBent){
+// texels around it weighted bilinearly with view-space tangent-plane distance rejection.
+// histTex (RG32F): (aoMean, viewDepth); normalTex (RGBA8): (octNormal.xy, sqrt(var)*4, frames/255).
+vec3 history(vec3 p,vec3 n,out vec3 prevBent){
   prevBent=n;
   vec4 c=prevViewProj*vec4(p,1.);
-  if(c.w<=0.)return vec4(0.);
+  if(c.w<=0.)return vec3(0.);
   vec2 res=vec2(textureSize(histTex,0));
+  vec2 invRes2=2./res;
   vec2 f=(c.xy/c.w*.5+.5)*res-.5;
   // A still camera reprojects onto texel centres: snap there, or the bilinear fetch re-blurs the history every frame.
   f=mix(f,round(f),vec2(lessThan(abs(f-round(f)),vec2(.02))));
   ivec2 i0=ivec2(floor(f));vec2 w=f-floor(f);
-  vec4 acc=vec4(0.);vec3 bAcc=vec3(0.);float ws=0.;
+  vec3 acc=vec3(0.);float ws=0.;
+  #ifdef BENT_NORMALS
+  vec3 bAcc=vec3(0.);
+  #endif
   vec3 vp=(prevView*vec4(p,1.)).xyz;
   vec3 vn=mat3(prevView)*n;
+  vec2 vnXY=vn.xy*invProjXY;
+  float vpDotN=dot(vn,vp);
   float planeTol=.0015*c.w+.005;
   float depthTol=.08*c.w+.05;
   for(int k=0;k<4;k++){
@@ -580,52 +617,76 @@ vec4 history(vec3 p,vec3 n,out vec3 prevBent){
     float bw=(o.x==1?w.x:1.-w.x)*(o.y==1?w.y:1.-w.y);
     // A still camera lands on one texel (snapped above): the other three weigh nothing and are not read.
     if(bw<1e-4||any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,ivec2(res))))continue;
-    vec4 h=texelFetch(histTex,q,0);
+    vec2 h=texelFetch(histTex,q,0).xy;
     vec4 hn=texelFetch(normalTex,q,0);
     float frames=hn.w*255.;
-    if(frames<.5||abs(h.y-c.w)>depthTol||dot(hn.xyz*2.-1.,n)<.9)continue;
-    vec2 ndcQ=((vec2(q)+.5)/res)*2.-1.;
-    vec3 vpQ=vec3(ndcQ*invProjXY*h.y,-h.y);
-    if(abs(dot(vn,vpQ-vp))>planeTol)continue;
-    acc+=bw*vec4(h.x,frames,h.z,h.w);
+    if(frames<.5||abs(h.y-c.w)>depthTol)continue;
+    vec3 nv=octDecodeRaw(hn.xy);float dn=dot(nv,n);
+    if(dn<=0.||dn*dn<.81*dot(nv,nv))continue;
+    vec2 ndcQ=(vec2(q)+.5)*invRes2-1.;
+    if(abs((dot(vnXY,ndcQ)-vn.z)*h.y-vpDotN)>planeTol)continue;
+    float sig=hn.z*.25;
+    acc+=bw*vec3(h.x,frames,sig*sig);
+    #ifdef BENT_NORMALS
     bAcc+=bw*(texelFetch(bentTex,q,0).xyz*2.-1.);
+    #endif
     ws+=bw;
   }
-  if(ws>.01){float bl=length(bAcc);prevBent=bl>1e-4?bAcc/bl:n;return acc/ws;}
-  return vec4(0.);
+  if(ws>.01){
+    #ifdef BENT_NORMALS
+    float bl=length(bAcc);prevBent=bl>1e-4?bAcc/bl:n;
+    #endif
+    return acc/ws;
+  }
+  return vec3(0.);
 }
 void main(){
   ivec2 q=ivec2(gl_FragCoord.xy);
   vec4 g=texelFetch(gPos,q,0),gn=texelFetch(gNormal,q,0);
-  if(g.w<=0.||gn.w>.5){histOut=vec4(0.,g.w,0.,0.);normalOut=vec4(0.);bentOut=vec4(.5,.5,1.,1.);return;}
+  if(g.w<=0.||gn.w>.5){
+    histOut=vec4(0.,g.w,0.,1.);normalOut=vec4(0.);
+    #ifdef BENT_NORMALS
+    bentOut=vec4(.5,.5,1.,1.);
+    #endif
+    return;
+  }
   vec3 p=g.xyz,normal=normalize(gn.xyz);
   vec3 prevBent;
-  vec4 h=history(p,normal,prevBent);
+  vec3 h=history(p,normal,prevBent);
   ivec2 tile=q>>3;
   bool turn=tileRate<2.||(tile.x&1)+2*(tile.y&1)==int(mod(frame,4.));
   // Variance-guided early settling: open zero-variance surfaces settle after 24 frames
   // instead of tracing all 64 frames; noisy crevices keep tracing up to settleFrames.
-  bool settled=settleFrames>0.&&(h.y>=settleFrames||(h.y>=24.&&h.w<.00015));
-  float aoStatic,aoM2,aoVar,frames;
+  bool settled=settleFrames>0.&&(h.y>=settleFrames||(h.y>=24.&&h.z<.00015));
+  float aoStatic,aoVar,frames;
+  #ifdef BENT_NORMALS
   vec3 bentN;
+  #endif
   if(turn&&!settled){
     frames=min(h.y+1.,histMax);
-    float nd=h.y<8.?4.:(h.y<16.?3.:(h.y>=24.&&h.w<.0006?1.:2.));
+    float nd=h.y<8.?4.:(h.y<16.?3.:(h.y>=24.&&h.z<.0006?1.:2.));
     vec4 resAO=tracedAOBent(p,normal,nd);
     float sampleAO=resAO.x;
     float alpha=1./frames;
     aoStatic=mix(h.x,sampleAO,alpha);
-    aoM2=mix(h.z,sampleAO*sampleAO,alpha);
-    aoVar=frames>1.5?max(0.,aoM2-aoStatic*aoStatic):0.02;
+    // Exact Welford online variance using only prevMean and prevVar (no M2 channel needed).
+    aoVar=frames>1.5?max(0.,((frames-1.)*h.z+(sampleAO-h.x)*(sampleAO-aoStatic))/frames):.02;
+    #ifdef BENT_NORMALS
     vec3 bMix=mix(prevBent,resAO.yzw,alpha);
     float bl=length(bMix);
     bentN=bl>1e-4?bMix/bl:normal;
+    #endif
   }else{
-    frames=min(h.y,histMax);aoStatic=h.x;aoM2=h.z;aoVar=h.w;bentN=prevBent;
+    frames=min(h.y,histMax);aoStatic=h.x;aoVar=h.z;
+    #ifdef BENT_NORMALS
+    bentN=prevBent;
+    #endif
   }
-  histOut=vec4(aoStatic,g.w,aoM2,aoVar);
-  normalOut=vec4(normal*.5+.5,frames/255.);
+  histOut=vec4(aoStatic,g.w,0.,1.);
+  normalOut=vec4(octEncode(normal),clamp(sqrt(aoVar)*4.,0.,1.),frames/255.);
+  #ifdef BENT_NORMALS
   bentOut=vec4(bentN*.5+.5,1.);
+  #endif
 }`;
 // GPU bake of a signed distance field for an arbitrary triangle mesh, one z-layer
 // per draw. Distance: exact point-triangle distance (min over all triangles).
@@ -809,14 +870,25 @@ try {
   // - two history targets, ping-ponged: AO + view depth (float: half floats round away the small updates of a long
   //   history); normal + frames/255. The AO pass writes one while reading the other; the scene draw reads it.
   const nearest=t=>{t.minFilter=t.magFilter=T.NearestFilter;t.generateMipmaps=false;};
-  let aoScale=.5,gTarget,histories,hiz1,hiz2;let histIndex=0;
+  let aoScale=.5,gTarget,histories,historiesBent=null,hiz1,hiz2;let histIndex=0;
+  function makeHistPair(w,h,count){
+    return [0,1].map(()=>{const rt=new T.WebGLRenderTarget(w,h,{count,depthBuffer:false});
+      rt.textures[0].type=T.FloatType;rt.textures[0].format=T.RGFormat;rt.textures.forEach(nearest);return rt;});
+  }
+  function ensureBentHistories(){
+    if(historiesBent)return;
+    const w=Math.round(W*aoScale),h=Math.round(H*aoScale);
+    historiesBent=makeHistPair(w,h,3);
+    for(const rt of historiesBent){renderer.setRenderTarget(rt);renderer.clear();}
+    renderer.setRenderTarget(null);
+  }
   function makeTracedTargets(scale){
     const w=Math.round(W*scale),h=Math.round(H*scale);
-    gTarget?.dispose();histories?.forEach(rt=>rt.dispose());hiz1?.dispose();hiz2?.dispose();
+    gTarget?.dispose();histories?.forEach(rt=>rt.dispose());historiesBent?.forEach(rt=>rt.dispose());historiesBent=null;hiz1?.dispose();hiz2?.dispose();
     gTarget=new T.WebGLRenderTarget(w,h,{count:2});
     gTarget.textures[0].type=T.FloatType;gTarget.textures[1].type=T.HalfFloatType;gTarget.textures.forEach(nearest);
-    histories=[0,1].map(()=>{const rt=new T.WebGLRenderTarget(w,h,{count:3,depthBuffer:false});
-      rt.textures[0].type=T.FloatType;rt.textures[0].format=T.RGBAFormat;rt.textures.forEach(nearest);return rt;});
+    // Standard traced path: 2 MRTs (RG32F + RGBA8 = 12 B/px). 3rd bentOut MRT is allocated only when PBR is active.
+    histories=makeHistPair(w,h,2);
     const makeHiZ=(hw,hh)=>{const rt=new T.WebGLRenderTarget(Math.max(1,hw),Math.max(1,hh),{depthBuffer:false});
       rt.texture.type=T.FloatType;rt.texture.format=T.RedFormat;nearest(rt.texture);return rt;};
     hiz1=makeHiZ(w>>1,h>>1);hiz2=makeHiZ(w>>2,h>>2);
@@ -846,10 +918,12 @@ try {
     aoTex:{value:null},aoNormalTex:{value:null},aoBentTex:{value:null}};
   // Also restore clean cumulative Halton(2,3) indexing when nd=4/3/2, avoiding any low-bit aliasing
   // when nd drops to 1 ray on converged low-variance pixels.
-  const aoPass=new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,defines:{DIRS:2},
-    uniforms:{field:{value:field},gPos:{value:gTarget.textures[0]},gNormal:{value:gTarget.textures[1]},histTex:{value:histories[0].textures[0]},normalTex:{value:histories[0].textures[1]},bentTex:{value:histories[0].textures[2]},hizTex1:{value:hiz1.texture},hizTex2:{value:hiz2.texture},
+  const makeAOPass=extraDefines=>new FullScreenQuad(new T.ShaderMaterial({glslVersion:T.GLSL3,defines:{DIRS:2,...extraDefines},
+    uniforms:{field:{value:field},gPos:{value:gTarget.textures[0]},gNormal:{value:gTarget.textures[1]},histTex:{value:histories[0].textures[0]},normalTex:{value:histories[0].textures[1]},bentTex:{value:null},hizTex1:{value:hiz1.texture},hizTex2:{value:hiz2.texture},
       prevViewProj:traced.prevViewProj,prevView:traced.prevView,curViewProj:traced.curViewProj,curView:traced.curView,invProjXY:traced.invProjXY,frame:traced.frame,contactMode:traced.contactMode,smoothFalloff:traced.smoothFalloff,histMax:traced.histMax,settleFrames:traced.settleFrames,tileRate:traced.tileRate},
     vertexShader:'void main(){gl_Position=vec4(position.xy,0.,1.);}',fragmentShader:aoPassFragment}));
+  const aoPass=makeAOPass({});
+  const aoPassBent=makeAOPass({BENT_NORMALS:1});
   const lastCamera=new T.Matrix4();
   // Two compiled variants per mode: with mover code, and without it (NO_DYN) for when no mover
   // is in the AO, so the static path carries none of the mover loops.
@@ -880,11 +954,13 @@ try {
   function rebuildStaticContact(objects=[mesh],{gridSize=1,range=contactRange,bias=.0003}={}){
     const start=performance.now(),next=buildContactBVH(objects,T,{gridSize,range:range+Math.abs(bias),maxTextureSize:renderer.capabilities.maxTextureSize,max3DTextureSize:renderer.getContext().getParameter(renderer.getContext().MAX_3D_TEXTURE_SIZE)});
     Object.assign(aoPass.material.uniforms,next.uniforms,{contactRange:{value:range},contactBias:{value:bias}});
+    Object.assign(aoPassBent.material.uniforms,next.uniforms,{contactRange:{value:range},contactBias:{value:bias}});
     const previous=contactResources;
     contactResources={...next,range,bias,gridSize,buildMs:performance.now()-start};
     previous?.dispose();
     traced.frame.value=0;
     for(const rt of histories){renderer.setRenderTarget(rt);renderer.clear();}
+    if(historiesBent)for(const rt of historiesBent){renderer.setRenderTarget(rt);renderer.clear();}
     renderer.setRenderTarget(null);
     return {triangles:next.triangles,nodes:next.nodes,bytes:next.bytes,gridDims:next.gridDims,maxTreeNodes:next.maxTreeNodes,range,bias,gridSize,buildMs:contactResources.buildMs};
   }
@@ -991,7 +1067,11 @@ try {
     } else setMaterial((dyn.dynCount.value>0?materials:staticMaterials)[taps]);
     if(taps===64){
       // Geometry pass and AO pass at the AO resolution, then the scene draw, which upsamples the traced AO.
-      const cur=histories[histIndex],prev=histories[1-histIndex],m=aoPass.material.uniforms;
+      const useBent=pbrMode.value;
+      if(useBent)ensureBentHistories();
+      const histPair=useBent?historiesBent:histories;
+      const activePass=useBent?aoPassBent:aoPass;
+      const cur=histPair[histIndex],prev=histPair[1-histIndex],m=activePass.material.uniforms;
       camera.updateMatrixWorld();
       traced.histMax.value=camera.matrixWorld.equals(lastCamera)?128:32;lastCamera.copy(camera.matrixWorld);
       const material=mesh.material,bg=scene.background,cc=renderer.getClearColor(new T.Color()),ca=renderer.getClearAlpha();
@@ -999,7 +1079,8 @@ try {
       renderer.setRenderTarget(gTarget);renderer.render(scene,camera);
       scene.background=bg;renderer.setClearColor(cc,ca);setMaterial(material);
       m.gPos.value=gTarget.textures[0];m.gNormal.value=gTarget.textures[1];
-      m.histTex.value=prev.textures[0];m.normalTex.value=prev.textures[1];m.bentTex.value=prev.textures[2];
+      m.histTex.value=prev.textures[0];m.normalTex.value=prev.textures[1];
+      if(useBent)m.bentTex.value=prev.textures[2];
       traced.curViewProj.value.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
       traced.curView.value.copy(camera.matrixWorldInverse);
       traced.invProjXY.value.set(1/camera.projectionMatrix.elements[0],1/camera.projectionMatrix.elements[5]);
@@ -1010,8 +1091,9 @@ try {
         renderer.setRenderTarget(hiz2);hizDownPass.render(renderer);
         m.hizTex1.value=hiz1.texture;m.hizTex2.value=hiz2.texture;
       }
-      renderer.setRenderTarget(cur);aoPass.render(renderer);
-      traced.aoTex.value=cur.textures[0];traced.aoNormalTex.value=cur.textures[1];traced.aoBentTex.value=cur.textures[2];
+      renderer.setRenderTarget(cur);activePass.render(renderer);
+      traced.aoTex.value=cur.textures[0];traced.aoNormalTex.value=cur.textures[1];
+      if(useBent)traced.aoBentTex.value=cur.textures[2];
       renderer.setRenderTarget(null);renderer.render(scene,camera);
       traced.prevViewProj.value.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
       traced.prevView.value.copy(camera.matrixWorldInverse);
@@ -1047,12 +1129,12 @@ try {
   document.querySelector('#dynao').onchange=event=>{dynamicAO=event.target.checked;updateMovers(simTime);resetFps();};
   document.querySelector('#forcemesh').onchange=event=>{forceMesh=event.target.checked;if(forceMesh)ensureAllBaked();updateMovers(simTime);resetFps();};
   document.querySelector('#hizcontact').onchange=event=>{traced.contactMode.value=event.target.checked?1:0;traced.frame.value=0;aoDemo.resetHistory();resetFps();};
-  document.querySelector('#pbr').onchange=event=>{pbrMode.value=event.target.checked;resetFps();};
+  document.querySelector('#pbr').onchange=event=>{pbrMode.value=event.target.checked;traced.frame.value=0;aoDemo.resetHistory();resetFps();};
   document.querySelector('#smoothfalloff').onchange=event=>{traced.smoothFalloff.value=event.target.checked?1:0;traced.frame.value=0;aoDemo.resetHistory();resetFps();};
   // Debug hook for timing from the console.
-  window.aoDemo={scene,mesh,boxes,T,aoPass,field,get contactResources(){return contactResources;},rebuildStaticContact,renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,bakeSyncMs,bakeGpuMs,totalTris,get atlas(){return baked.tex;},meshRes:MESH_RES,setMask:on=>{mask.value=on;},setPBR:on=>{pbrMode.value=on;},setSmoothFalloff:on=>{traced.smoothFalloff.value=on?1:0;traced.frame.value=0;aoDemo.resetHistory();},setMoverScale:(x,y=x,z=x,w=x)=>dyn.moverScale.value.set(x,y,z,w),select:mode=>select(mode),
+  window.aoDemo={scene,mesh,boxes,T,aoPass,aoPassBent,field,get contactResources(){return contactResources;},rebuildStaticContact,renderer,camera,controls,render,updateMovers,dyn,movers,bakeMs,bakeSyncMs,bakeGpuMs,totalTris,get atlas(){return baked.tex;},meshRes:MESH_RES,setMask:on=>{mask.value=on;},setPBR:on=>{pbrMode.value=on;traced.frame.value=0;aoDemo.resetHistory();},setSmoothFalloff:on=>{traced.smoothFalloff.value=on?1:0;traced.frame.value=0;aoDemo.resetHistory();},setMoverScale:(x,y=x,z=x,w=x)=>dyn.moverScale.value.set(x,y,z,w),select:mode=>select(mode),
     setDynamicAO:on=>{dynamicAO=on;updateMovers(simTime);},setContactMode:mode=>{traced.contactMode.value=mode?1:0;traced.frame.value=0;aoDemo.resetHistory();},traced,
-    resetHistory:()=>{for(const rt of histories){renderer.setRenderTarget(rt);renderer.clear();}renderer.setRenderTarget(null);},
+    resetHistory:()=>{for(const rt of histories){renderer.setRenderTarget(rt);renderer.clear();}if(historiesBent)for(const rt of historiesBent){renderer.setRenderTarget(rt);renderer.clear();}renderer.setRenderTarget(null);},
     setAOScale:scale=>{aoScale=scale;makeTracedTargets(scale);},
     setForceMesh:on=>{forceMesh=on;if(on)ensureAllBaked();updateMovers(simTime);}};
   document.addEventListener('visibilitychange',resetFps);
