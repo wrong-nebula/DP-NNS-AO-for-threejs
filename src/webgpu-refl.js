@@ -91,18 +91,18 @@ fn evalHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
           let ag = textureLoad(histAOGI, iq, 0);
           let mt = textureLoad(metaTex, iq, 0);
           let sDir = normalize(u.sunDir.xyz);
-          let sun = max(0.0, dot(hn, sDir)) * mt.x;
-          var col = halb * (vec3<f32>(2.25, 2.10, 1.85) * sun + ag.rgb + vec3<f32>(0.08, 0.09, 0.11) * ag.a);
+          let sun = max(0.0, dot(hn, sDir)) * clamp(mt.x, 0.0, 1.0);
+          var col = halb * (vec3<f32>(2.25, 2.10, 1.85) * sun + max(ag.rgb, vec3<f32>(0.0)) + vec3<f32>(0.08, 0.09, 0.11) * clamp(ag.a, 0.0, 1.0));
           if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) > 1e-4) {
             let toO = u.emissivePos.xyz - hitP;
             let d2 = dot(toO, toO);
             let dist = sqrt(d2);
             let ndlO = max(0.0, dot(hn, toO / max(dist, 1e-4)));
             if (ndlO > 0.001 && dist < 7.5) {
-              col += halb * u.emissiveCol.rgb * (2.6 * ndlO * mt.y / (0.28 + d2));
+              col += halb * u.emissiveCol.rgb * (2.6 * ndlO * clamp(mt.y, 0.0, 1.0) / (0.28 + d2));
             }
           }
-          return col;
+          return max(col, vec3<f32>(0.0));
         }
       }
     }

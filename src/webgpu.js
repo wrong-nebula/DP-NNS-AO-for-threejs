@@ -1816,7 +1816,7 @@ export class WebGPUFastSDFAO {
         { binding: 8, resource: { buffer: s.bvhTris } },
         { binding: 9, resource: { buffer: s.bvhGrid } },
         { binding: 10, resource: this.histAOGI[pIdx].createView() },
-        { binding: 11, resource: this.metaTex.createView() },
+        { binding: 11, resource: this.histMeta[pIdx].createView() },
         { binding: 12, resource: this.rawRefl.createView() },
       ],
     });
@@ -1930,7 +1930,7 @@ export class WebGPUFastSDFAO {
     }
     this.stillFrames = camSame ? (this.stillFrames + 1) : 0;
     const traceShadows = !camSame || this.stillFrames < 28;
-    const traceRefl = this.useGI && this.useReflections && (!camSame || this.stillFrames < 44);
+    const traceRefl = this.useGI && this.useReflections && (!camSame || this.stillFrames < 46);
 
     const camData = new Float32Array(32);
     camData.set(vp, 0);
