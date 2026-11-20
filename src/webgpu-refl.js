@@ -18,6 +18,8 @@ struct ReflU {
   rootMin: vec4<f32>,
   rootSpan: vec4<f32>,
   extra: vec4<u32>,         // x=nodeCount, y=enabled(0/1), z=flags(bit0=checker,bit1=useBvh), w=maxSteps
+  dynPosRad: array<vec4<f32>, 4>,
+  dynColRough: array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<uniform> u: ReflU;
@@ -62,8 +64,19 @@ fn vdc3(n_in: u32) -> f32 {
 
 fn sampleSDF(p: vec3<f32>) -> f32 {
   let uv = (p - u.sdfMin.xyz) * u.sdfInvSpan.xyz;
-  if (any(uv < vec3<f32>(0.0)) || any(uv > vec3<f32>(1.0))) { return 1e4; }
-  return textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
+  var d = 1e4;
+  if (all(uv >= vec3<f32>(0.0)) && all(uv <= vec3<f32>(1.0))) {
+    d = textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
+  }
+  if ((u.extra.z & 4u) != 0u) {
+    for (var i = 0u; i < 4u; i++) {
+      let pr = u.dynPosRad[i];
+      if (pr.w > 0.0) {
+        d = min(d, length(p - pr.xyz) - pr.w);
+      }
+    }
+  }
+  return d;
 }
 
 fn sampleRad(p: vec3<f32>) -> vec3<f32> {
@@ -76,6 +89,18 @@ fn sampleRad(p: vec3<f32>) -> vec3<f32> {
 // shade with crisp pixel-resolution albedo + direct sun/orb + GI (eliminating 12.5 cm radVol blockiness);
 // otherwise seamlessly fall back to 360-degree 2-bounce radVol!
 fn evalHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
+  if ((u.extra.z & 4u) != 0u) {
+    for (var i = 0u; i < 4u; i++) {
+      let pr = u.dynPosRad[i];
+      if (pr.w > 0.0 && abs(length(hitP - pr.xyz) - pr.w) < 0.06) {
+        let hn = normalize(hitP - pr.xyz);
+        let sDir = normalize(u.sunDir.xyz);
+        let sun = max(0.0, dot(hn, sDir));
+        let skyT = clamp(hn.z * 0.5 + 0.5, 0.0, 1.0);
+        return u.dynColRough[i].rgb * (vec3<f32>(2.25, 2.10, 1.85) * sun + mix(vec3<f32>(0.25, 0.23, 0.21), vec3<f32>(0.68, 0.79, 0.96), skyT) * 0.45);
+      }
+    }
+  }
   let clip = u.curViewProj * vec4<f32>(hitP, 1.0);
   if (clip.w > 0.1) {
     let ndc = clip.xy / clip.w;
@@ -342,9 +367,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     rad = u.emissiveCol.rgb * 1.8;
   }
   if (!hitAny) {
-    // Clean studio sky gradient fallback on open ceiling / exterior miss
+    // Clean studio sky gradient + 3-point softbox/sun specular lobes on open ceiling / exterior miss
     let skyT = clamp(R.z * 0.5 + 0.5, 0.0, 1.0);
-    rad = mix(vec3<f32>(0.18, 0.20, 0.24), vec3<f32>(0.55, 0.66, 0.82), skyT);
+    let sDir = normalize(u.sunDir.xyz);
+    let sunDisc = pow(max(dot(R, sDir), 0.0), mix(36.0, 5.0, rough)) * vec3<f32>(2.8, 2.5, 2.1);
+    let keyBox = pow(max(dot(R, normalize(vec3<f32>(0.55, -0.62, 0.56))), 0.0), mix(10.0, 3.0, rough)) * vec3<f32>(1.15, 1.08, 0.98);
+    let rimBox = pow(max(dot(R, normalize(vec3<f32>(-0.72, -0.35, 0.58))), 0.0), mix(8.0, 3.0, rough)) * vec3<f32>(0.65, 0.82, 1.05);
+    let softBox = smoothstep(0.35, 0.92, R.z) * vec3<f32>(0.48, 0.54, 0.64);
+    rad = mix(vec3<f32>(0.22, 0.24, 0.28), vec3<f32>(0.62, 0.72, 0.88), skyT) + sunDisc + keyBox + rimBox + softBox;
   }
 
   let normDist = clamp(hitDist / 6.0, 0.05, 1.0);

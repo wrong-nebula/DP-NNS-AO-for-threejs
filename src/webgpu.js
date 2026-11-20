@@ -13,10 +13,10 @@ export { bakeSDFOnGPU };
 
 export const WEBGPU_QUALITY_PRESETS = {
   very_low:  { label: 'Very Low (Mobile)',  rays: 1, maxSamples: 32,  denoisePasses: 1, giSteps: 8,  giMaxDist: 6.0,  shadowSteps: 24, multiBounce: false, reflEnabled: false, reflChecker: true,  reflUseBvh: false, reflSteps: 12, reflRoughCut: 0.24 },
-  low:       { label: 'Low (Performance)',  rays: 1, maxSamples: 48,  denoisePasses: 2, giSteps: 10, giMaxDist: 6.8,  shadowSteps: 32, multiBounce: false, reflEnabled: true,  reflChecker: true,  reflUseBvh: false, reflSteps: 14, reflRoughCut: 0.28 },
-  medium:    { label: 'Medium (Balanced)',  rays: 1, maxSamples: 64,  denoisePasses: 2, giSteps: 12, giMaxDist: 7.5,  shadowSteps: 40, multiBounce: true,  reflEnabled: true,  reflChecker: true,  reflUseBvh: true,  reflSteps: 18, reflRoughCut: 0.38 },
-  high:      { label: 'High (Default)',     rays: 2, maxSamples: 128, denoisePasses: 3, giSteps: 14, giMaxDist: 8.5,  shadowSteps: 48, multiBounce: true,  reflEnabled: true,  reflChecker: true,  reflUseBvh: true,  reflSteps: 22, reflRoughCut: 0.45 },
-  very_high: { label: 'Very High',          rays: 3, maxSamples: 160, denoisePasses: 3, giSteps: 16, giMaxDist: 9.2,  shadowSteps: 56, multiBounce: true,  reflEnabled: true,  reflChecker: false, reflUseBvh: true,  reflSteps: 26, reflRoughCut: 0.55 },
+  low:       { label: 'Low (Performance)',  rays: 1, maxSamples: 48,  denoisePasses: 1, giSteps: 10, giMaxDist: 6.8,  shadowSteps: 28, multiBounce: false, reflEnabled: true,  reflChecker: true,  reflUseBvh: false, reflSteps: 14, reflRoughCut: 0.28 },
+  medium:    { label: 'Medium (Balanced)',  rays: 1, maxSamples: 64,  denoisePasses: 2, giSteps: 12, giMaxDist: 7.5,  shadowSteps: 36, multiBounce: true,  reflEnabled: true,  reflChecker: true,  reflUseBvh: true,  reflSteps: 18, reflRoughCut: 0.38 },
+  high:      { label: 'High (Default)',     rays: 2, maxSamples: 128, denoisePasses: 3, giSteps: 14, giMaxDist: 8.5,  shadowSteps: 44, multiBounce: true,  reflEnabled: true,  reflChecker: true,  reflUseBvh: true,  reflSteps: 22, reflRoughCut: 0.45 },
+  very_high: { label: 'Very High',          rays: 3, maxSamples: 160, denoisePasses: 3, giSteps: 16, giMaxDist: 9.2,  shadowSteps: 52, multiBounce: true,  reflEnabled: true,  reflChecker: false, reflUseBvh: true,  reflSteps: 26, reflRoughCut: 0.55 },
   ultra:     { label: 'Ultra (Reference)',  rays: 4, maxSamples: 224, denoisePasses: 3, giSteps: 20, giMaxDist: 10.0, shadowSteps: 64, multiBounce: true,  reflEnabled: true,  reflChecker: false, reflUseBvh: true,  reflSteps: 32, reflRoughCut: 0.65 },
 };
 
@@ -29,6 +29,8 @@ const GBUFFER_WGSL = /* wgsl */`
 struct CamU {
   viewProj: mat4x4<f32>,
   view: mat4x4<f32>,
+  dynPosRad: array<vec4<f32>, 4>,
+  dynColRough: array<vec4<f32>, 4>,
 };
 @group(0) @binding(0) var<uniform> cam: CamU;
 
@@ -36,6 +38,9 @@ struct VIn {
   @location(0) pos: vec3<f32>,
   @location(1) nor: vec3<f32>,
   @location(2) colRough: vec4<f32>,
+};
+struct DynVIn {
+  @location(0) pos: vec3<f32>,
 };
 struct VOut {
   @builtin(position) clip: vec4<f32>,
@@ -51,6 +56,19 @@ struct VOut {
   o.wPos = v.pos;
   o.wNor = v.nor;
   o.colRough = v.colRough;
+  o.viewZ = -(cam.view * wp).z;
+  return o;
+}
+@vertex fn vsDyn(v: DynVIn, @builtin(instance_index) inst: u32) -> VOut {
+  var o: VOut;
+  let pr = cam.dynPosRad[inst];
+  let cr = cam.dynColRough[inst];
+  let wpos = pr.xyz + v.pos * pr.w;
+  let wp = vec4<f32>(wpos, 1.0);
+  o.clip = cam.viewProj * wp;
+  o.wPos = wpos;
+  o.wNor = normalize(v.pos);
+  o.colRough = cr;
   o.viewZ = -(cam.view * wp).z;
   return o;
 }
@@ -328,6 +346,8 @@ struct TraceU {
   extra: vec4<u32>,         // x=shadowSteps, y=tableMask, z=flags(bit0=reuse,bit1=traceSh,bit2=multiBounce,bits8..15=giSteps), w=bvhNodeCount
   rootMin: vec4<f32>,
   rootSpan: vec4<f32>,
+  dynPosRad: array<vec4<f32>, 4>,
+  dynColRough: array<vec4<f32>, 4>,
 };
 
 struct HashEntry {
@@ -408,8 +428,40 @@ fn hashCell(cx: i32, cy: i32, cz: i32, nCode: u32, lod: u32) -> vec2<u32> {
 
 fn sampleSDF(p: vec3<f32>) -> f32 {
   let uv = (p - u.sdfMin.xyz) * u.sdfInvSpan.xyz;
-  if (any(uv < vec3<f32>(0.0)) || any(uv > vec3<f32>(1.0))) { return 1e4; }
-  return textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
+  var d = 1e4;
+  if (all(uv >= vec3<f32>(0.0)) && all(uv <= vec3<f32>(1.0))) {
+    d = textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
+  }
+  if ((u.extra.z & 8u) != 0u) {
+    for (var i = 0u; i < 4u; i++) {
+      let pr = u.dynPosRad[i];
+      if (pr.w > 0.0) {
+        d = min(d, length(p - pr.xyz) - pr.w);
+      }
+    }
+  }
+  return d;
+}
+
+fn evalDynSphereRad(p: vec3<f32>) -> vec4<f32> {
+  if ((u.extra.z & 8u) == 0u) { return vec4<f32>(0.0); }
+  for (var i = 0u; i < 4u; i++) {
+    let pr = u.dynPosRad[i];
+    if (pr.w > 0.0) {
+      let rel = p - pr.xyz;
+      let dist = length(rel);
+      if (abs(dist - pr.w) < 0.07) {
+        let hn = rel / max(dist, 1e-4);
+        let alb = u.dynColRough[i].rgb;
+        let sDir = normalize(u.sunDirScale.xyz);
+        let ndl = max(0.0, dot(hn, sDir));
+        let skyF = 0.42 + 0.32 * max(0.0, hn.z);
+        var rad = alb * (vec3<f32>(3.10, 2.90, 2.55) * ndl + vec3<f32>(0.56, 0.64, 0.76) * skyF);
+        return vec4<f32>(rad, 1.0);
+      }
+    }
+  }
+  return vec4<f32>(0.0);
 }
 
 fn sampleRad(p: vec3<f32>) -> vec3<f32> {
@@ -423,6 +475,8 @@ fn sampleRad(p: vec3<f32>) -> vec3<f32> {
 // sun shadow & emissive orb radiance (zero 11cm voxel light leak!), falling back seamlessly to
 // 360-deg world-space radVol for off-screen, back-facing, or occluded hits!
 fn evalGIHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
+  let dynR = evalDynSphereRad(hitP);
+  if (dynR.a > 0.5) { return dynR.rgb; }
   let clip = u.viewProj * vec4<f32>(hitP, 1.0);
   if (clip.w > 0.1 && u.params.z > 0.5) {
     let ndc = clip.xy / clip.w;
@@ -581,8 +635,8 @@ fn sdfSunShadow(pos: vec3<f32>, nor: vec3<f32>, sDir: vec3<f32>, px: vec2<f32>, 
     let dc = d - tol;
     if (dc <= 0.0) { return 0.0; }
     res = min(res, 10.0 * dc / t);
-    if (res < 0.005) { return 0.0; }
-    t += max(d * 0.72, 0.018);
+    if (res < 0.015) { return 0.0; }
+    t += select(max(d * 0.72, 0.018), d * 1.18, d > 0.28);
     if (t > 10.5) { break; }
   }
   res = clamp(res, 0.0, 1.0);
@@ -611,8 +665,8 @@ fn sdfPointShadow(pos: vec3<f32>, nor: vec3<f32>, lp: vec3<f32>, rLim: f32, px: 
     let d = sampleSDF(ro + lDir * t);
     if (d < 0.008) { return 0.0; }
     res = min(res, 7.0 * d / t);
-    if (res < 0.005) { return 0.0; }
-    t += max(d * 0.72, 0.016);
+    if (res < 0.015) { return 0.0; }
+    t += select(max(d * 0.72, 0.016), d * 1.18, d > 0.25);
     if (t > tMax) { break; }
   }
   res = clamp(res, 0.0, 1.0);
@@ -898,9 +952,12 @@ fn main(
           let cosIn = dot(n, wH);
           let cosOut = dot(hr.norValid.xyz, -wH);
           if (cosIn > 0.06 && cosOut > 0.04) {
-            // Midpoint SDF visibility validation (prevents thin-wall / pedestal light leaking!)
-            let dMid = sampleSDF(p + wH * min(dH * 0.5, 0.45));
-            if (dMid > -0.02) {
+            // Midpoint SDF visibility validation on immediate peers (prevents thin-wall light leaking at low cost)
+            var visOk = true;
+            if (pi < 2u) {
+              visOk = sampleSDF(p + wH * min(dH * 0.5, 0.45)) > -0.02;
+            }
+            if (visOk) {
               // Exact ReSTIR-GI spatial Jacobian (clamped to suppress fireflies)
               let jac = clamp((hr.posDist.w * hr.posDist.w) / max(dH * dH, 0.05), 0.25, 1.8);
               let wt = clamp(cosIn * jac * 0.22, 0.0, 0.22);
@@ -1190,6 +1247,8 @@ struct CompU {
   screen: vec4<f32>,      // x=W, y=H, z=aoW, w=aoH
   sdfMin: vec4<f32>,      // xyz=sdfMin, w=radScale
   sdfInvSpan: vec4<f32>,  // xyz=sdfInvSpan, w=useReflections(0/1)
+  dynPosRad: array<vec4<f32>, 4>,
+  dynColRough: array<vec4<f32>, 4>,
 };
 @group(0) @binding(0) var<uniform> u: CompU;
 @group(0) @binding(1) var aoGITex: texture_2d<f32>;
@@ -1207,6 +1266,9 @@ struct VIn {
   @location(1) nor: vec3<f32>,
   @location(2) colRough: vec4<f32>,
 };
+struct DynVIn {
+  @location(0) pos: vec3<f32>,
+};
 struct VOut {
   @builtin(position) clip: vec4<f32>,
   @location(0) wPos: vec3<f32>,
@@ -1219,6 +1281,17 @@ struct VOut {
   o.wPos = v.pos;
   o.wNor = v.nor;
   o.colRough = v.colRough;
+  return o;
+}
+@vertex fn vsDyn(v: DynVIn, @builtin(instance_index) inst: u32) -> VOut {
+  var o: VOut;
+  let pr = u.dynPosRad[inst];
+  let cr = u.dynColRough[inst];
+  let wpos = pr.xyz + v.pos * pr.w;
+  o.clip = u.viewProj * vec4<f32>(wpos, 1.0);
+  o.wPos = wpos;
+  o.wNor = normalize(v.pos);
+  o.colRough = cr;
   return o;
 }
 
@@ -1245,8 +1318,19 @@ fn ignComp(q: vec2<f32>) -> f32 {
 
 fn compSampleSDF(p: vec3<f32>) -> f32 {
   let uv = (p - u.sdfMin.xyz) * u.sdfInvSpan.xyz;
-  if (any(uv < vec3<f32>(0.0)) || any(uv > vec3<f32>(1.0))) { return 1e4; }
-  return textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
+  var d = 1e4;
+  if (all(uv >= vec3<f32>(0.0)) && all(uv <= vec3<f32>(1.0))) {
+    d = textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
+  }
+  if (u.dynPosRad[0].w > 0.0) {
+    for (var i = 0u; i < 4u; i++) {
+      let pr = u.dynPosRad[i];
+      if (pr.w > 0.0) {
+        d = min(d, length(p - pr.xyz) - pr.w);
+      }
+    }
+  }
+  return d;
 }
 
 fn compSampleRad(p: vec3<f32>) -> vec3<f32> {
@@ -1259,7 +1343,7 @@ fn compSampleRad(p: vec3<f32>) -> vec3<f32> {
 // Zero half-res stair-stepping, zero temporal smear, pixel-sharp G-buffer + 360-deg radVol fallback.
 fn traceMirrorFullRes(p: vec3<f32>, n: vec3<f32>, V: vec3<f32>) -> vec3<f32> {
   let R = reflect(-V, n);
-  let ro = p + n * 0.015;
+  let ro = p + n * 0.032 + R * 0.02;
   var hitDist = 10.5;
   var hitAny = false;
   var orbT = 1e9;
@@ -1273,25 +1357,43 @@ fn traceMirrorFullRes(p: vec3<f32>, n: vec3<f32>, V: vec3<f32>) -> vec3<f32> {
       if (t0 > 0.02 && t0 < hitDist) { orbT = t0; }
     }
   }
-  var s = 0.03;
+  var s = 0.04;
   for (var k = 0u; k < 44u; k++) {
     if (s >= orbT) { break; }
     let d = compSampleSDF(ro + R * s);
     if (d > 100.0) { break; }
-    if (d < 0.015) {
+    let hitEps = select(0.015, 0.004, k < 2u);
+    if (d < hitEps) {
       hitAny = true;
-      hitDist = max(0.03, s + d * 0.5);
+      hitDist = max(0.04, s + d * 0.5);
       break;
     }
-    s += max(d * 0.85, 0.02);
+    s += max(d * 0.85, 0.025);
     if (s > 10.5) { break; }
   }
   if (orbT < hitDist) { return u.emissiveCol.rgb * 1.9; }
   if (!hitAny) {
     let skyT = clamp(R.z * 0.5 + 0.5, 0.0, 1.0);
-    return mix(vec3<f32>(0.18, 0.20, 0.24), vec3<f32>(0.55, 0.66, 0.82), skyT);
+    let sDir = normalize(u.sunDir.xyz);
+    let sunDisc = pow(max(dot(R, sDir), 0.0), 36.0) * vec3<f32>(3.2, 2.9, 2.4);
+    let keyBox = pow(max(dot(R, normalize(vec3<f32>(0.55, -0.62, 0.56))), 0.0), 10.0) * vec3<f32>(1.35, 1.28, 1.18);
+    let rimBox = pow(max(dot(R, normalize(vec3<f32>(-0.72, -0.35, 0.58))), 0.0), 8.0) * vec3<f32>(0.75, 0.92, 1.15);
+    let softBox = smoothstep(0.35, 0.92, R.z) * vec3<f32>(0.55, 0.62, 0.72);
+    return mix(vec3<f32>(0.22, 0.24, 0.28), vec3<f32>(0.62, 0.72, 0.88), skyT) + sunDisc + keyBox + rimBox + softBox;
   }
   let hitP = ro + R * hitDist;
+  if (u.dynPosRad[0].w > 0.0) {
+    for (var i = 0u; i < 4u; i++) {
+      let pr = u.dynPosRad[i];
+      if (pr.w > 0.0 && abs(length(hitP - pr.xyz) - pr.w) < 0.05) {
+        let hn = normalize(hitP - pr.xyz);
+        let sDir = normalize(u.sunDir.xyz);
+        let sun = max(0.0, dot(hn, sDir));
+        let skyT = clamp(hn.z * 0.5 + 0.5, 0.0, 1.0);
+        return u.dynColRough[i].rgb * (vec3<f32>(2.25, 2.10, 1.85) * sun + mix(vec3<f32>(0.25, 0.23, 0.21), vec3<f32>(0.68, 0.79, 0.96), skyT) * 0.45);
+      }
+    }
+  }
   let clip = u.viewProj * vec4<f32>(hitP, 1.0);
   if (clip.w > 0.1) {
     let ndc = clip.xy / clip.w;
@@ -1667,6 +1769,8 @@ export class WebGPUFastSDFAO {
     this.emissivePos = [1.2, 1.0, 1.8];
     this.emissiveCol = [0, 0, 0];
     this.emissiveRadius = 0.20;
+    this.dynObjects = []; // Up to 4 dynamic spheres: [{ pos:[x,y,z], radius, color:[r,g,b], roughness }]
+    this._relightTick = 0;
     this.lastGpuMs = 0;
     this.lastSkipPct = 0;
     this.sceneRes = null;
@@ -1707,9 +1811,21 @@ export class WebGPUFastSDFAO {
     };
 
     const gMod = d.createShaderModule({ code: GBUFFER_WGSL });
+    const dynVLayout = { arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] };
     this.gPipe = d.createRenderPipeline({
       layout: 'auto',
       vertex: { module: gMod, entryPoint: 'vs', buffers: [vLayout] },
+      fragment: {
+        module: gMod,
+        entryPoint: 'fs',
+        targets: [{ format: 'rgba32float' }, { format: 'rgba16float' }, { format: 'rgba8unorm' }],
+      },
+      primitive: { topology: 'triangle-list', cullMode: 'back' },
+      depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+    });
+    this.dynGPipe = d.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module: gMod, entryPoint: 'vsDyn', buffers: [dynVLayout] },
       fragment: {
         module: gMod,
         entryPoint: 'fs',
@@ -1745,6 +1861,13 @@ export class WebGPUFastSDFAO {
     this.compPipe = d.createRenderPipeline({
       layout: 'auto',
       vertex: { module: cpMod, entryPoint: 'vs', buffers: [vLayout] },
+      fragment: { module: cpMod, entryPoint: 'fs', targets: [{ format: this.format }] },
+      primitive: { topology: 'triangle-list', cullMode: 'back' },
+      depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+    });
+    this.dynCompPipe = d.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module: cpMod, entryPoint: 'vsDyn', buffers: [dynVLayout] },
       fragment: { module: cpMod, entryPoint: 'fs', targets: [{ format: this.format }] },
       primitive: { topology: 'triangle-list', cullMode: 'back' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
@@ -1799,17 +1922,17 @@ export class WebGPUFastSDFAO {
     this.statsBuf = d.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
     this.statsRead = d.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
-    this.camUBuf = d.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.camUBuf = d.createBuffer({ size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.relightUBuf = d.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.decayUBuf = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    this.traceUBuf = d.createBuffer({ size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    this.reflUBuf = d.createBuffer({ size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.traceUBuf = d.createBuffer({ size: 384, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.reflUBuf = d.createBuffer({ size: 384, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.reflFiltUBuf = d.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.tempUBuf = d.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.denoiseUBuf1 = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.denoiseUBuf2 = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.denoiseUBuf3 = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    this.compUBuf = d.createBuffer({ size: 176, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.compUBuf = d.createBuffer({ size: 304, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
     this.radVolA = d.createTexture({ size: RAD_DIMS, dimension: '3d', format: 'rgba8unorm', usage: rw });
     this.radVolB = d.createTexture({ size: RAD_DIMS, dimension: '3d', format: 'rgba8unorm', usage: rw });
@@ -1931,6 +2054,7 @@ export class WebGPUFastSDFAO {
   _rebuildBindGroups() {
     const d = this.device, s = this.sceneRes;
     this.gBG = d.createBindGroup({ layout: this.gPipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: this.camUBuf } }] });
+    this.dynGBG = d.createBindGroup({ layout: this.dynGPipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: this.camUBuf } }] });
     this.relightDirectBG = d.createBindGroup({
       layout: this.relightDirectPipe.getBindGroupLayout(0),
       entries: [
@@ -2060,8 +2184,8 @@ export class WebGPUFastSDFAO {
     };
     this.reflFiltBG = [makeReflFiltBG(0), makeReflFiltBG(1)];
 
-    const makeCompBG = (tex, pIdx) => d.createBindGroup({
-      layout: this.compPipe.getBindGroupLayout(0),
+    const makeCompBG = (pipe, tex, pIdx) => d.createBindGroup({
+      layout: pipe.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.compUBuf } },
         { binding: 1, resource: tex.createView() },
@@ -2075,9 +2199,12 @@ export class WebGPUFastSDFAO {
         { binding: 9, resource: this.linSamp },
       ],
     });
-    this.compBGHist = [makeCompBG(this.histAOGI[0], 0), makeCompBG(this.histAOGI[1], 1)];
-    this.compBGD1   = [makeCompBG(this.denoiseA, 0), makeCompBG(this.denoiseA, 1)];
-    this.compBGD2   = [makeCompBG(this.denoiseB, 0), makeCompBG(this.denoiseB, 1)];
+    this.compBGHist = [makeCompBG(this.compPipe, this.histAOGI[0], 0), makeCompBG(this.compPipe, this.histAOGI[1], 1)];
+    this.compBGD1   = [makeCompBG(this.compPipe, this.denoiseA, 0), makeCompBG(this.compPipe, this.denoiseA, 1)];
+    this.compBGD2   = [makeCompBG(this.compPipe, this.denoiseB, 0), makeCompBG(this.compPipe, this.denoiseB, 1)];
+    this.dynCompBGHist = [makeCompBG(this.dynCompPipe, this.histAOGI[0], 0), makeCompBG(this.dynCompPipe, this.histAOGI[1], 1)];
+    this.dynCompBGD1   = [makeCompBG(this.dynCompPipe, this.denoiseA, 0), makeCompBG(this.dynCompPipe, this.denoiseA, 1)];
+    this.dynCompBGD2   = [makeCompBG(this.dynCompPipe, this.denoiseB, 0), makeCompBG(this.dynCompPipe, this.denoiseB, 1)];
   }
 
   clearHash() {
@@ -2115,7 +2242,8 @@ export class WebGPUFastSDFAO {
     p1.setPipeline(this.relightDirectPipe);
     p1.setBindGroup(0, this.relightDirectBG);
     p1.dispatchWorkgroups(RAD_DIMS[0] / 4, RAD_DIMS[1] / 4, RAD_DIMS[2] / 4);
-    if (q.multiBounce) {
+    const runBounce = q.multiBounce && (!softDecayHash || ((this._relightTick++ & 1) === 0));
+    if (runBounce) {
       p1.setPipeline(this.relightBouncePipe);
       p1.setBindGroup(0, this.relightBounceBG);
       p1.dispatchWorkgroups(RAD_DIMS[0] / 4, RAD_DIMS[1] / 4, RAD_DIMS[2] / 4);
@@ -2151,16 +2279,31 @@ export class WebGPUFastSDFAO {
         if (Math.abs(vp[i] - this.prevVP[i]) > 1e-5) { camSame = false; break; }
       }
     }
-    this.stillFrames = camSame ? (this.stillFrames + 1) : 0;
-    const traceShadows = !camSame || this.stillFrames < 28;
-    const traceRefl = this.useGI && this.useReflections && (!camSame || this.stillFrames < 46);
+    const hasDyn = this.dynObjects && this.dynObjects.length > 0;
+    const dynCount = hasDyn ? Math.min(this.dynObjects.length, 4) : 0;
+    const dynPR = new Float32Array(16);
+    const dynCR = new Float32Array(16);
+    for (let i = 0; i < dynCount; i++) {
+      const o = this.dynObjects[i];
+      dynPR.set([o.pos[0], o.pos[1], o.pos[2], o.radius], i * 4);
+      dynCR.set([o.color[0], o.color[1], o.color[2], o.roughness], i * 4);
+    }
 
-    const camData = new Float32Array(32);
+    this.stillFrames = (camSame && !hasDyn) ? (this.stillFrames + 1) : 0;
+    const traceShadows = !camSame || hasDyn || this.stillFrames < 28;
+    const traceRefl = this.useGI && this.useReflections && (!camSame || hasDyn || this.stillFrames < 46);
+    const effShadowSteps = (!camSame || hasDyn) ? Math.min(q.shadowSteps, 20) : q.shadowSteps;
+    const effGiSteps = (!camSame) ? Math.min(q.giSteps, 10) : q.giSteps;
+    const effDenoisePasses = (!camSame || hasDyn) ? Math.min(q.denoisePasses, 2) : q.denoisePasses;
+
+    const camData = new Float32Array(64);
     camData.set(vp, 0);
     camData.set(view, 16);
+    camData.set(dynPR, 32);
+    camData.set(dynCR, 48);
     d.queue.writeBuffer(this.camUBuf, 0, camData);
 
-    const tBuf = new ArrayBuffer(256);
+    const tBuf = new ArrayBuffer(384);
     const tf = new Float32Array(tBuf), tu = new Uint32Array(tBuf);
     tf.set(vp, 0);
     tf.set([s.sdfMin[0], s.sdfMin[1], s.sdfMin[2], 0], 16);
@@ -2171,14 +2314,16 @@ export class WebGPUFastSDFAO {
     tf.set([this.emissivePos[0], this.emissivePos[1], this.emissivePos[2], this.emissiveRadius], 36);
     tf.set([this.emissiveCol[0], this.emissiveCol[1], this.emissiveCol[2], q.giMaxDist], 40);
     tf.set([this.aoW, this.aoH, this.frame, 0.0005], 44);
-    tu.set([q.rays, q.maxSamples, this.useGI ? 1 : 0, this.useHash ? 1 : 0], 48);
-    const extraFlags = (this.reuseEnabled ? 1 : 0) | (traceShadows ? 2 : 0) | (q.multiBounce ? 4 : 0) | ((q.giSteps & 0xFF) << 8);
-    tu.set([q.shadowSteps, HASH_MASK, extraFlags, s.nodeCount], 52);
+    tu.set([q.rays, q.maxSamples, this.useGI ? 1 : 0, (this.useHash && !hasDyn) ? 1 : 0], 48);
+    const extraFlags = (this.reuseEnabled ? 1 : 0) | (traceShadows ? 2 : 0) | (q.multiBounce ? 4 : 0) | (hasDyn ? 8 : 0) | ((effGiSteps & 0xFF) << 8);
+    tu.set([effShadowSteps, HASH_MASK, extraFlags, s.nodeCount], 52);
     tf.set([s.rootMin[0], s.rootMin[1], s.rootMin[2], 0], 56);
     tf.set([s.rootSpan[0], s.rootSpan[1], s.rootSpan[2], 0], 60);
+    tf.set(dynPR, 64);
+    tf.set(dynCR, 80);
     d.queue.writeBuffer(this.traceUBuf, 0, tBuf);
 
-    const rBuf = new ArrayBuffer(256);
+    const rBuf = new ArrayBuffer(384);
     const rf = new Float32Array(rBuf), ru = new Uint32Array(rBuf);
     rf.set(vp, 0);
     rf.set([s.sdfMin[0], s.sdfMin[1], s.sdfMin[2], 0], 16);
@@ -2192,8 +2337,10 @@ export class WebGPUFastSDFAO {
     rf.set([this.aoW, this.aoH, q.reflRoughCut, 10.0], 48);
     rf.set([s.rootMin[0], s.rootMin[1], s.rootMin[2], 0], 52);
     rf.set([s.rootSpan[0], s.rootSpan[1], s.rootSpan[2], 0], 56);
-    const reflFlags = (q.reflChecker ? 1 : 0) | (q.reflUseBvh ? 2 : 0);
+    const reflFlags = (q.reflChecker ? 1 : 0) | (q.reflUseBvh ? 2 : 0) | (hasDyn ? 4 : 0);
     ru.set([s.nodeCount, (this.useGI && this.useReflections) ? 1 : 0, reflFlags, q.reflSteps], 60);
+    rf.set(dynPR, 64);
+    rf.set(dynCR, 80);
     d.queue.writeBuffer(this.reflUBuf, 0, rBuf);
 
     const rfData = new Float32Array(24);
@@ -2215,7 +2362,7 @@ export class WebGPUFastSDFAO {
     d.queue.writeBuffer(this.denoiseUBuf2, 0, new Uint32Array([this.aoW, this.aoH, 3, 0]));
     d.queue.writeBuffer(this.denoiseUBuf3, 0, new Uint32Array([this.aoW, this.aoH, 6, 0]));
 
-    const cBuf = new Float32Array(44);
+    const cBuf = new Float32Array(76);
     cBuf.set(vp, 0);
     cBuf.set([eye[0], eye[1], eye[2], 1], 16);
     cBuf.set([this.sunDir[0], this.sunDir[1], this.sunDir[2], this.useGI ? 1 : 0], 20);
@@ -2224,11 +2371,13 @@ export class WebGPUFastSDFAO {
     cBuf.set([this.width, this.height, this.aoW, this.aoH], 32);
     cBuf.set([s.sdfMin[0], s.sdfMin[1], s.sdfMin[2], RAD_SCALE], 36);
     cBuf.set([1 / s.sdfSpan[0], 1 / s.sdfSpan[1], 1 / s.sdfSpan[2], (this.useGI && this.useReflections) ? 1 : 0], 40);
+    cBuf.set(dynPR, 44);
+    cBuf.set(dynCR, 60);
     d.queue.writeBuffer(this.compUBuf, 0, cBuf);
 
     // Fully-settled static fast-path: skip G-buffer + trace + temporal + denoise completely when
-    // camera, sun, and orb are still and SHaRC cache + shadows + reflections have converged!
-    const fullySettled = camSame && this.stillFrames >= 72 && this.lastSkipPct >= 90 && this._lastCompBG;
+    // camera, sun, orb & dynamic objects are still and SHaRC cache + shadows + reflections have converged!
+    const fullySettled = camSame && !hasDyn && this.stillFrames >= 72 && this.lastSkipPct >= 90 && this._lastCompBG;
     if (fullySettled) {
       const enc = d.createCommandEncoder();
       const fp = enc.beginRenderPass({
@@ -2297,6 +2446,13 @@ export class WebGPUFastSDFAO {
     gp.setVertexBuffer(0, s.vb);
     gp.setIndexBuffer(s.ib, 'uint32');
     gp.drawIndexed(s.indexCount);
+    if (dynCount > 0) {
+      gp.setPipeline(this.dynGPipe);
+      gp.setBindGroup(0, this.dynGBG);
+      gp.setVertexBuffer(0, this.orbVB);
+      gp.setIndexBuffer(this.orbIB, 'uint32');
+      gp.drawIndexed(this.orbIdxCount, dynCount);
+    }
     gp.end();
 
     // Pass 2 & 3: Trace (BVH2 + 2x2 Occlusion-Point Reuse + SHaRC Hash) + Temporal EMA + A-Trous Denoise
@@ -2319,20 +2475,24 @@ export class WebGPUFastSDFAO {
     }
 
     let compBG = this.compBGHist[curIdx];
+    let dynCompBG = this.dynCompBGHist[curIdx];
     if (this.useGI) {
       cp.setPipeline(this.denoisePipe);
       cp.setBindGroup(0, this.denoiseBG1[curIdx]);
       cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
       compBG = this.compBGD1[curIdx];
-      if (q.denoisePasses >= 2) {
+      dynCompBG = this.dynCompBGD1[curIdx];
+      if (effDenoisePasses >= 2) {
         cp.setBindGroup(0, this.denoiseBG2[curIdx]);
         cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
         compBG = this.compBGD2[curIdx];
+        dynCompBG = this.dynCompBGD2[curIdx];
       }
-      if (q.denoisePasses >= 3) {
+      if (effDenoisePasses >= 3) {
         cp.setBindGroup(0, this.denoiseBG3[curIdx]);
         cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
         compBG = this.compBGD1[curIdx];
+        dynCompBG = this.dynCompBGD1[curIdx];
       }
     } else {
       // Single stride-1 plane-aware AO polish dissolves SHaRC cell jitter while preserving sharp contacts
@@ -2340,6 +2500,7 @@ export class WebGPUFastSDFAO {
       cp.setBindGroup(0, this.denoiseBG1[curIdx]);
       cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
       compBG = this.compBGD1[curIdx];
+      dynCompBG = this.dynCompBGD1[curIdx];
     }
     cp.end();
 
@@ -2360,6 +2521,13 @@ export class WebGPUFastSDFAO {
     fp.setVertexBuffer(0, s.vb);
     fp.setIndexBuffer(s.ib, 'uint32');
     fp.drawIndexed(s.indexCount);
+    if (dynCount > 0) {
+      fp.setPipeline(this.dynCompPipe);
+      fp.setBindGroup(0, dynCompBG);
+      fp.setVertexBuffer(0, this.orbVB);
+      fp.setIndexBuffer(this.orbIB, 'uint32');
+      fp.drawIndexed(this.orbIdxCount, dynCount);
+    }
     if (this.viewMode === 0 && (this.emissiveCol[0] + this.emissiveCol[1] + this.emissiveCol[2]) > 1e-3) {
       const oBuf = new Float32Array(24);
       oBuf.set(vp, 0);

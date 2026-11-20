@@ -10,7 +10,7 @@ struct BakeU {
   rootMin: vec4<f32>,  // xyz=bvhRootMin, w=0
   rootSpan: vec4<f32>, // xyz=bvhRootSpan, w=0
   dims: vec4<u32>,     // x=nx, y=ny, z=nz, w=nodeCount
-  layout: vec4<u32>,   // x=rowU32Stride (padded to 256B / 4), y=0, z=0, w=0
+  stride: vec4<u32>,   // x=rowU32Stride (padded to 256B / 4), y=0, z=0, w=0
 };
 
 @group(0) @binding(0) var<uniform> u: BakeU;
@@ -230,7 +230,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let d0 = evalSignedDistance(vec3<f32>(px0, py, pz));
   let d1 = select(u.sdfMin.w, evalSignedDistance(vec3<f32>(px1, py, pz)), xPair * 2u + 1u < nx);
 
-  let outIdx = (z * ny + y) * u.layout.x + xPair;
+  let outIdx = (z * ny + y) * u.stride.x + xPair;
   outHalfPairs[outIdx] = pack2x16float(vec2<f32>(d0, d1));
 }
 `;
