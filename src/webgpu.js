@@ -625,9 +625,9 @@ fn sdfSunShadow(pos: vec3<f32>, nor: vec3<f32>, sDir: vec3<f32>, px: vec2<f32>, 
   let ang = 6.2831853 * u2;
   let dir = normalize(sDir + st * (rad * cos(ang)) + sb * (rad * sin(ang)));
   let ro = pos + nor * 0.028 + dir * 0.015;
-  var t = 0.012 + 0.035 * fract(ign(px + vec2<f32>(7.0, 41.0)) + vdc2(frame + 17u));
+  var t = 0.012 + 0.055 * fract(ign(px + vec2<f32>(7.0, 41.0)) + vdc2(frame + 17u));
   var res = 1.0;
-  let steps = max(u.extra.x, 24u);
+  let steps = max(u.extra.x, 28u);
   for (var s = 0u; s < steps; s++) {
     let d = sampleSDF(ro + dir * t);
     if (d > 100.0) { break; }
@@ -635,8 +635,8 @@ fn sdfSunShadow(pos: vec3<f32>, nor: vec3<f32>, sDir: vec3<f32>, px: vec2<f32>, 
     let dc = d - tol;
     if (dc <= 0.0) { return 0.0; }
     res = min(res, 10.0 * dc / t);
-    if (res < 0.015) { return 0.0; }
-    t += select(max(d * 0.72, 0.018), d * 1.18, d > 0.28);
+    if (res < 0.01) { return 0.0; }
+    t += max(d * 0.72, 0.018);
     if (t > 10.5) { break; }
   }
   res = clamp(res, 0.0, 1.0);
@@ -658,15 +658,15 @@ fn sdfPointShadow(pos: vec3<f32>, nor: vec3<f32>, lp: vec3<f32>, rLim: f32, px: 
   let lDir = toL / dist;
   if (dot(nor, lDir) <= 0.001) { return 0.0; }
   let ro = pos + nor * 0.025 + lDir * 0.012;
-  var t = 0.012 + 0.025 * fract(ign(px + vec2<f32>(13.0, 47.0)) + vdc2(frame + 23u));
+  var t = 0.012 + 0.045 * fract(ign(px + vec2<f32>(13.0, 47.0)) + vdc2(frame + 23u));
   let tMax = dist - rLim * 0.35 - 0.02;
   var res = 1.0;
-  for (var s = 0u; s < 32u; s++) {
+  for (var s = 0u; s < 36u; s++) {
     let d = sampleSDF(ro + lDir * t);
     if (d < 0.008) { return 0.0; }
     res = min(res, 7.0 * d / t);
-    if (res < 0.015) { return 0.0; }
-    t += select(max(d * 0.72, 0.016), d * 1.18, d > 0.25);
+    if (res < 0.01) { return 0.0; }
+    t += max(d * 0.72, 0.016);
     if (t > tMax) { break; }
   }
   res = clamp(res, 0.0, 1.0);
@@ -722,8 +722,8 @@ fn main(
     let ax = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.x) < 0.9);
     let tang = normalize(cross(n, ax));
     let bitang = cross(n, tang);
-    let jx = (ign(px + vec2<f32>(11.0, 23.0)) - 0.5) * cellSize;
-    let jy = (ign(px + vec2<f32>(41.0, 7.0)) - 0.5) * cellSize;
+    let jx = (fract(ign(px + vec2<f32>(11.0, 23.0)) + vdc2(frame)) - 0.5) * cellSize;
+    let jy = (fract(ign(px + vec2<f32>(41.0, 7.0)) + vdc3(frame)) - 0.5) * cellSize;
     let pj = p + tang * jx + bitang * jy;
     let cx = i32(floor(pj.x / cellSize));
     let cy = i32(floor(pj.y / cellSize));
@@ -1096,13 +1096,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (doShadow) {
         let nm = textureLoad(curMeta, nq, 0);
         if (nm.x >= -0.5) {
-          let isEdge = inPenumbra || abs(nm.x - curM.x) > 0.08 || abs(nm.y - curM.y) > 0.08;
+          let isEdge = inPenumbra || abs(nm.x - curM.x) > 0.06 || abs(nm.y - curM.y) > 0.06;
           if (isEdge) {
-            let wk = select(0.5, 0.85, dx == 0 || dy == 0);
+            let wk = select(0.55, 0.90, dx == 0 || dy == 0);
             shSum += nm.xy * wk;
             shW += wk;
           }
         }
+      }
+    }
+  }
+  // Extra 4-tap stride-2 SIGMA penumbra ring when inside a soft shadow transition (eliminates penumbra banding!)
+  if (inPenumbra) {
+    let offs = array<vec2<i32>, 4>(vec2<i32>(2, 0), vec2<i32>(-2, 0), vec2<i32>(0, 2), vec2<i32>(0, -2));
+    for (var oi = 0u; oi < 4u; oi++) {
+      let nq = q + offs[oi];
+      if (nq.x < 0 || nq.y < 0 || nq.x >= W || nq.y >= H) { continue; }
+      let npd = textureLoad(curPosDepth, nq, 0);
+      let ngn = textureLoad(curNormal, nq, 0);
+      if (npd.w <= 0.0 || ngn.w < 0.5) { continue; }
+      if (dot(normalize(ngn.xyz), n) < 0.92) { continue; }
+      if (abs(dot(n, npd.xyz - p)) > planeTol * 2.0) { continue; }
+      let nm = textureLoad(curMeta, nq, 0);
+      if (nm.x >= -0.5) {
+        shSum += nm.xy * 0.45;
+        shW += 0.45;
       }
     }
   }
@@ -1155,10 +1173,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let prevSh = mAcc / wSum;
     // REBLUR-lite soft neighborhood variance clamping: instant anti-lag for moving orb/sun
     // while keeping 1-SPP static frames rock-solid (generous 2.4-sigma box + soft pull)
-    let boxMin = mu - sigma * vec4<f32>(2.4, 2.4, 2.4, 2.6) - vec4<f32>(0.03, 0.03, 0.03, 0.03);
-    let boxMax = mu + sigma * vec4<f32>(2.4, 2.4, 2.4, 2.6) + vec4<f32>(0.03, 0.03, 0.03, 0.03);
+    let boxMin = mu - sigma * vec4<f32>(3.0, 3.0, 3.0, 3.2) - vec4<f32>(0.06, 0.06, 0.06, 0.04);
+    let boxMax = mu + sigma * vec4<f32>(3.0, 3.0, 3.0, 3.2) + vec4<f32>(0.06, 0.06, 0.06, 0.04);
     let clampedPrev = clamp(prev, boxMin, boxMax);
-    prev = mix(prev, clampedPrev, 0.55);
+    prev = mix(prev, clampedPrev, 0.22);
     textureStore(outAOGI, q, mix(prev, cur, u.params.z));
     // Reuse converged static shadow directly when curM.x < 0 (shadow trace skipped!)
     let shAlpha = max(u.params.z, 0.16);
@@ -1201,12 +1219,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let pC = pdC.xyz;
   let nC = normalize(gnC.xyz);
   let metaC = textureLoad(metaTex, q, 0);
-  // REBLUR-lite hit-distance-guided kernel: tight contact hits stay razor sharp, far bounces filter smoothly
-  let hitScale = clamp(sqrt(metaC.z) * 1.45, 0.35, 1.15);
+  // REBLUR-lite hit-distance-guided kernel: tight contact hits stay sharp, far bounces filter smoothly
+  // without luma edge-rejection (which would preserve noisy 1-SPP fireflies as moving splotches!)
+  let hitScale = clamp(sqrt(metaC.z) * 1.35, 0.5, 1.0);
   let stepS = max(1, i32(round(f32(u.params.z) * hitScale)));
   let planeTol = (0.0025 * pdC.w + 0.01) * f32(stepS);
-  let lumaC = dot(cC.rgb, vec3<f32>(0.299, 0.587, 0.114));
-  let lumaSigma = mix(0.55, 1.85, clamp(metaC.z * 1.6, 0.0, 1.0));
 
   var giSum = cC.rgb;
   var aoSum = cC.a;
@@ -1224,9 +1241,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (dot(nP, nC) < 0.9) { continue; }
       if (abs(dot(nC, pdP.xyz - pC)) > planeTol) { continue; }
       let cP = textureLoad(srcAOGI, p, 0);
-      let lumaP = dot(cP.rgb, vec3<f32>(0.299, 0.587, 0.114));
-      let wL = exp(-abs(lumaP - lumaC) / lumaSigma);
-      let wK = select(0.25, 0.5, dx == 0 || dy == 0) * wL;
+      let wK = select(0.25, 0.5, dx == 0 || dy == 0);
       giSum += cP.rgb * wK;
       aoSum += cP.a * wK;
       wSum += wK;
@@ -1549,8 +1564,9 @@ fn traceMirrorFullRes(p: vec3<f32>, n: vec3<f32>, V: vec3<f32>) -> vec3<f32> {
       color += alb * diffWeight * u.emissiveCol.rgb * (2.6 * att * ndlO * orbSh);
     }
   }
-  // Triangular-PDF IGN dithering eliminates 8-bit swapchain banding on smooth walls
-  let triDither = (ignComp(i.clip.xy) + ignComp(i.clip.xy + vec2<f32>(17.0, 31.0)) - 1.0) / 255.0;
+  // Spatio-temporal triangular-PDF IGN dithering eliminates 8-bit swapchain banding on smooth walls
+  let fOff = vec2<f32>(f32(u32(u.eye.w) & 63u)) * vec2<f32>(5.588238, 11.17647);
+  let triDither = (ignComp(i.clip.xy + fOff) + ignComp(i.clip.xy + fOff + vec2<f32>(17.0, 31.0)) - 1.0) * (1.25 / 255.0);
   let srgb = linearToSrgb(acesToneMap(color * 0.88)) + triDither;
   return vec4<f32>(clamp(srgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
@@ -2289,10 +2305,11 @@ export class WebGPUFastSDFAO {
       dynCR.set([o.color[0], o.color[1], o.color[2], o.roughness], i * 4);
     }
 
-    this.stillFrames = (camSame && !hasDyn) ? (this.stillFrames + 1) : 0;
-    const traceShadows = !camSame || hasDyn || this.stillFrames < 28;
-    const traceRefl = this.useGI && this.useReflections && (!camSame || hasDyn || this.stillFrames < 46);
-    const effShadowSteps = (!camSame || hasDyn) ? Math.min(q.shadowSteps, 20) : q.shadowSteps;
+    const hasOrb = (this.emissiveCol[0] + this.emissiveCol[1] + this.emissiveCol[2]) > 1e-3;
+    this.stillFrames = (camSame && !hasDyn && !hasOrb) ? (this.stillFrames + 1) : 0;
+    const traceShadows = !camSame || hasDyn || hasOrb || this.stillFrames < 28;
+    const traceRefl = this.useGI && this.useReflections && (!camSame || hasDyn || hasOrb || this.stillFrames < 46);
+    const effShadowSteps = (!camSame || hasDyn) ? Math.min(q.shadowSteps, 32) : q.shadowSteps;
     const effGiSteps = (!camSame) ? Math.min(q.giSteps, 10) : q.giSteps;
     const effDenoisePasses = (!camSame || hasDyn) ? Math.min(q.denoisePasses, 2) : q.denoisePasses;
 
@@ -2314,7 +2331,7 @@ export class WebGPUFastSDFAO {
     tf.set([this.emissivePos[0], this.emissivePos[1], this.emissivePos[2], this.emissiveRadius], 36);
     tf.set([this.emissiveCol[0], this.emissiveCol[1], this.emissiveCol[2], q.giMaxDist], 40);
     tf.set([this.aoW, this.aoH, this.frame, 0.0005], 44);
-    tu.set([q.rays, q.maxSamples, this.useGI ? 1 : 0, (this.useHash && !hasDyn) ? 1 : 0], 48);
+    tu.set([q.rays, q.maxSamples, this.useGI ? 1 : 0, (this.useHash && !hasDyn && !hasOrb) ? 1 : 0], 48);
     const extraFlags = (this.reuseEnabled ? 1 : 0) | (traceShadows ? 2 : 0) | (q.multiBounce ? 4 : 0) | (hasDyn ? 8 : 0) | ((effGiSteps & 0xFF) << 8);
     tu.set([effShadowSteps, HASH_MASK, extraFlags, s.nodeCount], 52);
     tf.set([s.rootMin[0], s.rootMin[1], s.rootMin[2], 0], 56);
@@ -2359,12 +2376,12 @@ export class WebGPUFastSDFAO {
     d.queue.writeBuffer(this.tempUBuf, 0, tempData);
 
     d.queue.writeBuffer(this.denoiseUBuf1, 0, new Uint32Array([this.aoW, this.aoH, 1, 1]));
-    d.queue.writeBuffer(this.denoiseUBuf2, 0, new Uint32Array([this.aoW, this.aoH, 3, 0]));
-    d.queue.writeBuffer(this.denoiseUBuf3, 0, new Uint32Array([this.aoW, this.aoH, 6, 0]));
+    d.queue.writeBuffer(this.denoiseUBuf2, 0, new Uint32Array([this.aoW, this.aoH, 2, 0]));
+    d.queue.writeBuffer(this.denoiseUBuf3, 0, new Uint32Array([this.aoW, this.aoH, 4, 0]));
 
     const cBuf = new Float32Array(76);
     cBuf.set(vp, 0);
-    cBuf.set([eye[0], eye[1], eye[2], 1], 16);
+    cBuf.set([eye[0], eye[1], eye[2], this.frame], 16);
     cBuf.set([this.sunDir[0], this.sunDir[1], this.sunDir[2], this.useGI ? 1 : 0], 20);
     cBuf.set([this.emissivePos[0], this.emissivePos[1], this.emissivePos[2], this.emissiveRadius], 24);
     cBuf.set([this.emissiveCol[0], this.emissiveCol[1], this.emissiveCol[2], this.viewMode], 28);
