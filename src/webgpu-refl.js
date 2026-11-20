@@ -356,6 +356,7 @@ export const REFL_FILTER_WGSL = /* wgsl */`
 struct ReflFiltU {
   prevViewProj: mat4x4<f32>,
   params: vec4<f32>, // x=W, y=H, z=alpha, w=validPrev(0/1)
+  eyePos: vec4<f32>, // xyz=eye
 };
 
 @group(0) @binding(0) var<uniform> u: ReflFiltU;
@@ -390,14 +391,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = normalize(gn.xyz);
   let planeTol = 0.0025 * pd.w + 0.012;
 
-  // Roughness-guided spatial pre-filter with strict roughness edge-stopping
-  // (keeps mirror/brushed meridian seam razor sharp, makes brushed chrome velvety smooth!)
+  // REBLUR Specular-lite: hit-distance-guided & roughness-guided spatial filter + local moments
+  // Close contact reflections (small c0.w) stay razor sharp; distant rough reflections filter smoothly!
   let isSkipped = c0.w < -0.5;
   var spSum = select(c0, vec4<f32>(0.0), isSkipped);
   var spW = select(1.0, 0.0, isSkipped);
-  let spGain = smoothstep(0.08, 0.30, rough);
+  var m1 = select(c0.rgb, vec3<f32>(0.0), isSkipped);
+  var m2 = select(c0.rgb * c0.rgb, vec3<f32>(0.0), isSkipped);
+  var mCnt = select(1.0, 0.0, isSkipped);
+  let normHit = select(clamp(c0.w, 0.05, 1.0), 0.35, isSkipped);
+  let spGain = smoothstep(0.06, 0.30, rough) * clamp(sqrt(normHit) * 1.35, 0.45, 1.0);
   if (spGain > 0.02 || isSkipped) {
-    let stepS = select(1, 2, rough > 0.24 && !isSkipped);
+    let stepS = select(1, 2, rough > 0.24 && normHit > 0.18 && !isSkipped);
     for (var dy = -1; dy <= 1; dy++) {
       for (var dx = -1; dx <= 1; dx++) {
         if (dx == 0 && dy == 0) { continue; }
@@ -415,10 +420,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let w = select(0.45, 0.75, dx == 0 || dy == 0) * max(spGain, select(0.0, 1.0, isSkipped));
         spSum += nr * w;
         spW += w;
+        m1 += nr.rgb;
+        m2 += nr.rgb * nr.rgb;
+        mCnt += 1.0;
       }
     }
   }
   let filtered = select(c0, spSum / spW, spW > 1e-4);
+  let rMu = select(filtered.rgb, m1 / mCnt, mCnt > 0.5);
+  let rSigma = select(vec3<f32>(0.15), sqrt(max(m2 / max(mCnt, 1.0) - rMu * rMu, vec3<f32>(0.0))), mCnt > 1.5);
 
   // Mirror chrome uses faster temporal alpha (0.35); rough chrome uses tighter EMA (0.07);
   // checkerboard-skipped pixels keep 95% temporal history for rock-solid zero-flicker stability!
@@ -429,8 +439,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     return;
   }
 
-  // Temporal reprojection EMA
-  let clip = u.prevViewProj * vec4<f32>(p, 1.0);
+  // REBLUR Virtual-Motion (Parallax) Reprojection for glossy reflections:
+  // Reproject virtual reflected point p_virt = p - V * hitDist on smooth/glossy planar surfaces,
+  // falling back to surface reprojection p when virtual reprojection misses geometry!
+  let V = normalize(u.eyePos.xyz - p);
+  let hitDist = clamp(filtered.w, 0.05, 1.0) * 6.0;
+  let virtWeight = (1.0 - smoothstep(0.08, 0.34, rough)) * smoothstep(0.25, 1.2, hitDist);
+  let reprojP = mix(p, p - V * hitDist, virtWeight * 0.65);
+
+  let clip = u.prevViewProj * vec4<f32>(reprojP, 1.0);
   if (clip.w <= 0.0) {
     textureStore(outRefl, q, filtered);
     return;
@@ -453,15 +470,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pgn = textureLoad(prevNormal, pq, 0);
     if (ppd.w <= 0.0 || pgn.w < 0.5) { continue; }
     if (dot(normalize(pgn.xyz), n) < 0.90) { continue; }
-    if (abs(dot(n, ppd.xyz - p)) > planeTol) { continue; }
-    // Also reject across smooth/rough meridian seam
+    if (abs(dot(n, ppd.xyz - p)) > planeTol * (1.0 + virtWeight * 4.0)) { continue; }
     let par = textureLoad(gAlbedoRough, pq, 0);
     if (abs(par.a - rough) > 0.14) { continue; }
     acc += textureLoad(prevRefl, pq, 0) * bw;
     wSum += bw;
   }
+  // Fallback to surface-motion reprojection if virtual point fell outside matching plane
+  if (wSum <= 0.01 && virtWeight > 0.05) {
+    let clipS = u.prevViewProj * vec4<f32>(p, 1.0);
+    if (clipS.w > 0.0) {
+      let ndcS = clipS.xy / clipS.w;
+      let uvS = vec2<f32>(ndcS.x * 0.5 + 0.5, 0.5 - ndcS.y * 0.5);
+      var fS = uvS * vec2<f32>(u.params.xy) - 0.5;
+      fS = select(fS, round(fS), abs(fS - round(fS)) < vec2<f32>(0.02));
+      let iS = vec2<i32>(floor(fS));
+      let fwS = fS - floor(fS);
+      for (var k = 0; k < 4; k++) {
+        let o = vec2<i32>(k & 1, k >> 1);
+        let pq = iS + o;
+        let bw = select(1.0 - fwS.x, fwS.x, o.x == 1) * select(1.0 - fwS.y, fwS.y, o.y == 1);
+        if (bw < 1e-4 || pq.x < 0 || pq.y < 0 || pq.x >= W || pq.y >= H) { continue; }
+        let ppd = textureLoad(prevPosDepth, pq, 0);
+        let pgn = textureLoad(prevNormal, pq, 0);
+        if (ppd.w <= 0.0 || pgn.w < 0.5) { continue; }
+        if (dot(normalize(pgn.xyz), n) < 0.90) { continue; }
+        if (abs(dot(n, ppd.xyz - p)) > planeTol) { continue; }
+        let par = textureLoad(gAlbedoRough, pq, 0);
+        if (abs(par.a - rough) > 0.14) { continue; }
+        acc += textureLoad(prevRefl, pq, 0) * bw;
+        wSum += bw;
+      }
+    }
+  }
   if (wSum > 0.01) {
-    textureStore(outRefl, q, mix(acc / wSum, filtered, effAlpha));
+    var prevR = acc / wSum;
+    // REBLUR variance-clamped reflection anti-lag (prevents moving orb / orbit ghosting)
+    let rMin = rMu - rSigma * 2.2 - vec3<f32>(0.04);
+    let rMax = rMu + rSigma * 2.2 + vec3<f32>(0.04);
+    prevR = vec4<f32>(mix(prevR.rgb, clamp(prevR.rgb, rMin, rMax), select(0.55, 0.25, isSkipped)), prevR.w);
+    textureStore(outRefl, q, mix(prevR, filtered, effAlpha));
   } else {
     textureStore(outRefl, q, filtered);
   }

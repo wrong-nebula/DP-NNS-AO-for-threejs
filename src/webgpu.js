@@ -942,7 +942,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let curM = textureLoad(curMeta, q, 0);
   let pd = textureLoad(curPosDepth, q, 0);
   let gn = textureLoad(curNormal, q, 0);
-  if (u.params.w < 0.5 || pd.w <= 0.0 || gn.w < 0.5) {
+  if (pd.w <= 0.0 || gn.w < 0.5) {
     textureStore(outAOGI, q, cur);
     textureStore(outMeta, q, curM);
     return;
@@ -950,10 +950,61 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let p = pd.xyz;
   let n = normalize(gn.xyz);
+  let planeTol = 0.0025 * pd.w + 0.012;
+
+  // SIGMA-lite 1-SPP Penumbra-Guided Shadow Pre-Filter + REBLUR-lite 3x3 Bilateral Moments
+  // Computes local 3x3 bilateral mean & std-dev for fast variance-clamped anti-lag AND
+  // filters 1-SPP stochastic penumbras on frame 1 while keeping contact shadows razor sharp!
+  var m1 = cur;
+  var m2 = cur * cur;
+  var nCnt = 1.0;
+  let doShadow = curM.x >= -0.5;
+  var shSum = select(vec2<f32>(0.0), curM.xy, doShadow);
+  var shW = select(0.0, 1.0, doShadow);
+  // Only run SIGMA penumbra filter when pixel or neighbor is near a shadow transition (skip deep shadow / full lit!)
+  let inPenumbra = doShadow && ((curM.x > 0.01 && curM.x < 0.99) || (curM.y > 0.01 && curM.y < 0.99));
+  for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+      if (dx == 0 && dy == 0) { continue; }
+      let nq = q + vec2<i32>(dx, dy);
+      if (nq.x < 0 || nq.y < 0 || nq.x >= W || nq.y >= H) { continue; }
+      let npd = textureLoad(curPosDepth, nq, 0);
+      let ngn = textureLoad(curNormal, nq, 0);
+      if (npd.w <= 0.0 || ngn.w < 0.5) { continue; }
+      if (dot(normalize(ngn.xyz), n) < 0.92) { continue; }
+      if (abs(dot(n, npd.xyz - p)) > planeTol) { continue; }
+      let nc = textureLoad(curAOGI, nq, 0);
+      m1 += nc;
+      m2 += nc * nc;
+      nCnt += 1.0;
+      if (doShadow) {
+        let nm = textureLoad(curMeta, nq, 0);
+        if (nm.x >= -0.5) {
+          let isEdge = inPenumbra || abs(nm.x - curM.x) > 0.08 || abs(nm.y - curM.y) > 0.08;
+          if (isEdge) {
+            let wk = select(0.5, 0.85, dx == 0 || dy == 0);
+            shSum += nm.xy * wk;
+            shW += wk;
+          }
+        }
+      }
+    }
+  }
+  let mu = m1 / nCnt;
+  let sigma = sqrt(max(m2 / nCnt - mu * mu, vec4<f32>(0.0)));
+  let sigmaSh = select(curM.xy, shSum / max(shW, 1e-4), doShadow && shW > 1.0);
+
+  if (u.params.w < 0.5) {
+    let fireflyClamped = clamp(cur, mu - sigma * 1.5, mu + sigma * 1.5);
+    textureStore(outAOGI, q, mix(fireflyClamped, mu, 0.65));
+    textureStore(outMeta, q, vec4<f32>(max(sigmaSh, vec2<f32>(0.0)), curM.zw));
+    return;
+  }
+
   let clip = u.prevViewProj * vec4<f32>(p, 1.0);
   if (clip.w <= 0.0) {
-    textureStore(outAOGI, q, cur);
-    textureStore(outMeta, q, curM);
+    textureStore(outAOGI, q, mix(cur, mu, 0.45));
+    textureStore(outMeta, q, vec4<f32>(max(sigmaSh, vec2<f32>(0.0)), curM.zw));
     return;
   }
   let ndc = clip.xy / clip.w;
@@ -965,7 +1016,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i0 = vec2<i32>(floor(f));
   let fw = f - floor(f);
 
-  let planeTol = 0.0025 * pd.w + 0.012;
   var acc = vec4<f32>(0.0);
   var mAcc = vec2<f32>(0.0);
   var wSum = 0.0;
@@ -985,16 +1035,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 
   if (wSum > 0.01) {
-    let prev = acc / wSum;
+    var prev = acc / wSum;
     let prevSh = mAcc / wSum;
+    // REBLUR-lite soft neighborhood variance clamping: instant anti-lag for moving orb/sun
+    // while keeping 1-SPP static frames rock-solid (generous 2.4-sigma box + soft pull)
+    let boxMin = mu - sigma * vec4<f32>(2.4, 2.4, 2.4, 2.6) - vec4<f32>(0.03, 0.03, 0.03, 0.03);
+    let boxMax = mu + sigma * vec4<f32>(2.4, 2.4, 2.4, 2.6) + vec4<f32>(0.03, 0.03, 0.03, 0.03);
+    let clampedPrev = clamp(prev, boxMin, boxMax);
+    prev = mix(prev, clampedPrev, 0.55);
     textureStore(outAOGI, q, mix(prev, cur, u.params.z));
     // Reuse converged static shadow directly when curM.x < 0 (shadow trace skipped!)
-    let shAlpha = max(u.params.z, 0.14);
-    let smoothSh = select(mix(prevSh, curM.xy, shAlpha), prevSh, curM.x < -0.5);
+    let shAlpha = max(u.params.z, 0.16);
+    let smoothSh = select(mix(prevSh, sigmaSh, shAlpha), prevSh, !doShadow);
     textureStore(outMeta, q, vec4<f32>(smoothSh, curM.zw));
   } else {
-    textureStore(outAOGI, q, cur);
-    textureStore(outMeta, q, vec4<f32>(max(curM.xy, vec2<f32>(0.0)), curM.zw));
+    // Disoccluded pixel: initialize with bilateral 3x3 mean for instant 1-SPP noise suppression!
+    textureStore(outAOGI, q, mix(cur, mu, 0.55));
+    textureStore(outMeta, q, vec4<f32>(max(sigmaSh, vec2<f32>(0.0)), curM.zw));
   }
 }
 `;
@@ -1028,9 +1085,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let pC = pdC.xyz;
   let nC = normalize(gnC.xyz);
   let metaC = textureLoad(metaTex, q, 0);
-  let hitScale = clamp(sqrt(metaC.z) * 1.35, 0.45, 1.0);
+  // REBLUR-lite hit-distance-guided kernel: tight contact hits stay razor sharp, far bounces filter smoothly
+  let hitScale = clamp(sqrt(metaC.z) * 1.45, 0.35, 1.15);
   let stepS = max(1, i32(round(f32(u.params.z) * hitScale)));
   let planeTol = (0.0025 * pdC.w + 0.01) * f32(stepS);
+  let lumaC = dot(cC.rgb, vec3<f32>(0.299, 0.587, 0.114));
+  let lumaSigma = mix(0.55, 1.85, clamp(metaC.z * 1.6, 0.0, 1.0));
 
   var giSum = cC.rgb;
   var aoSum = cC.a;
@@ -1048,7 +1108,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (dot(nP, nC) < 0.9) { continue; }
       if (abs(dot(nC, pdP.xyz - pC)) > planeTol) { continue; }
       let cP = textureLoad(srcAOGI, p, 0);
-      let wK = select(0.25, 0.5, dx == 0 || dy == 0);
+      let lumaP = dot(cP.rgb, vec3<f32>(0.299, 0.587, 0.114));
+      let wL = exp(-abs(lumaP - lumaC) / lumaSigma);
+      let wK = select(0.25, 0.5, dx == 0 || dy == 0) * wL;
       giSum += cP.rgb * wK;
       aoSum += cP.a * wK;
       wSum += wK;
@@ -1683,7 +1745,7 @@ export class WebGPUFastSDFAO {
     this.decayUBuf = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.traceUBuf = d.createBuffer({ size: 192, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.reflUBuf = d.createBuffer({ size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    this.reflFiltUBuf = d.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.reflFiltUBuf = d.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.tempUBuf = d.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.denoiseUBuf1 = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.denoiseUBuf2 = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -2072,9 +2134,10 @@ export class WebGPUFastSDFAO {
     ru.set([s.nodeCount, (this.useGI && this.useReflections) ? 1 : 0, reflFlags, q.reflSteps], 60);
     d.queue.writeBuffer(this.reflUBuf, 0, rBuf);
 
-    const rfData = new Float32Array(20);
+    const rfData = new Float32Array(24);
     rfData.set(this.prevVP, 0);
     rfData.set([this.aoW, this.aoH, this.frame < 4 ? (1 / (this.frame + 1)) : 0.12, this.hasPrev ? 1 : 0], 16);
+    rfData.set([eye[0], eye[1], eye[2], 1], 20);
     d.queue.writeBuffer(this.reflFiltUBuf, 0, rfData);
 
     const curIdx = this.pingIdx;
