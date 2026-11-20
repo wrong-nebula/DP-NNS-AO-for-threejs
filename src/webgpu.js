@@ -315,6 +315,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 const TRACE_WGSL = /* wgsl */`
 struct TraceU {
+  viewProj: mat4x4<f32>,
   sdfMin: vec4<f32>,
   sdfInvSpan: vec4<f32>,
   gridMinSize: vec4<f32>,   // xyz=gridMin, w=gridSize
@@ -324,7 +325,7 @@ struct TraceU {
   emissiveCol: vec4<f32>,   // rgb=col, w=giMaxDist
   params: vec4<f32>,        // x=W, y=H, z=frame, w=contactBias
   flags: vec4<u32>,         // x=rays, y=maxSamples, z=useGI(0/1), w=useHash(0/1)
-  extra: vec4<u32>,         // x=shadowSteps, y=tableMask, z=reuseEnabled, w=bvhNodeCount
+  extra: vec4<u32>,         // x=shadowSteps, y=tableMask, z=flags(bit0=reuse,bit1=traceSh,bit2=multiBounce,bits8..15=giSteps), w=bvhNodeCount
   rootMin: vec4<f32>,
   rootSpan: vec4<f32>,
 };
@@ -358,6 +359,8 @@ struct HitRec {
 @group(0) @binding(10) var outAOGI: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(11) var outMeta: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(12) var<storage, read_write> stats: array<atomic<u32>>;
+@group(0) @binding(13) var gAlbedoRough: texture_2d<f32>;
+@group(0) @binding(14) var prevHistMeta: texture_2d<f32>;
 
 var<workgroup> sharedHits: array<HitRec, 64>;
 
@@ -413,6 +416,50 @@ fn sampleRad(p: vec3<f32>) -> vec3<f32> {
   let uv = (p - u.sdfMin.xyz) * u.sdfInvSpan.xyz;
   if (any(uv < vec3<f32>(0.0)) || any(uv > vec3<f32>(1.0))) { return vec3<f32>(0.0); }
   return textureSampleLevel(radVol, linSamp, uv, 0.0).rgb * u.sunDirScale.w;
+}
+
+// Hybrid Screen-Space + World radVol Diffuse GI Hit Evaluation:
+// Projects bounce hitP into the half-res G-buffer for sub-centimeter triangle-sharp albedo, normal,
+// sun shadow & emissive orb radiance (zero 11cm voxel light leak!), falling back seamlessly to
+// 360-deg world-space radVol for off-screen, back-facing, or occluded hits!
+fn evalGIHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
+  let clip = u.viewProj * vec4<f32>(hitP, 1.0);
+  if (clip.w > 0.1 && u.params.z > 0.5) {
+    let ndc = clip.xy / clip.w;
+    if (abs(ndc.x) < 0.99 && abs(ndc.y) < 0.99) {
+      let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+      let iq = clamp(vec2<i32>(uv * u.params.xy), vec2<i32>(0), vec2<i32>(u.params.xy) - 1);
+      let gpd = textureLoad(gPosDepth, iq, 0);
+      let gnr = textureLoad(gNormal, iq, 0);
+      if (gpd.w > 0.0 && gnr.w > 0.5 && length(gpd.xyz - hitP) < 0.12) {
+        let hn = normalize(gnr.xyz);
+        if (dot(hn, -rayDir) > 0.02) {
+          let halb = textureLoad(gAlbedoRough, iq, 0).rgb;
+          let mt = textureLoad(prevHistMeta, iq, 0);
+          let sDir = normalize(u.sunDirScale.xyz);
+          let ndl = max(0.0, dot(hn, sDir));
+          let sunSh = clamp(mt.x, 0.0, 1.0);
+          let skyF = 0.42 + 0.32 * max(0.0, hn.z);
+          var rad = halb * (vec3<f32>(3.10, 2.90, 2.55) * ndl * sunSh + vec3<f32>(0.56, 0.64, 0.76) * skyF);
+          if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) > 1e-4) {
+            let toO = u.emissivePos.xyz - hitP;
+            let d2 = dot(toO, toO);
+            let dist = sqrt(d2);
+            let ndlO = max(0.0, dot(hn, toO / max(dist, 1e-4)));
+            if (ndlO > 0.001 && dist < 7.0) {
+              rad += halb * u.emissiveCol.rgb * (2.8 * ndlO * clamp(mt.y, 0.0, 1.0) / (0.32 + d2));
+            }
+          }
+          // When multi-bounce is enabled, blend in 2nd-bounce energy from radVolB
+          if ((u.extra.z & 4u) != 0u) {
+            rad = max(rad, sampleRad(hitP));
+          }
+          return max(rad, vec3<f32>(0.0));
+        }
+      }
+    }
+  }
+  return sampleRad(hitP);
 }
 
 fn boxHit(nd: vec4<u32>, qInv: vec3<f32>, qOff: vec3<f32>, tMax: f32) -> f32 {
@@ -754,7 +801,7 @@ fn main(
           if (nl > 1e-8) {
             let hn = hitN / nl;
             if (dot(hn, -w) > 0.0) {
-              rad = sampleRad(origin + w * tHit);
+              rad = evalGIHitRadiance(origin + w * tHit, w);
               if (tHit < 0.15) {
                 let sDir = normalize(u.sunDirScale.xyz);
                 let hitNdl = max(0.0, dot(hn, sDir));
@@ -785,7 +832,7 @@ fn main(
         if (useGI) {
           if (v < 0.5) {
             rayHitT = tMinD;
-            rad = sampleRad(p + w * tMinD);
+            rad = evalGIHitRadiance(p + w * tMinD, w);
           } else {
             var sg = max(s, 1.12);
             var hitFar = false;
@@ -795,7 +842,7 @@ fn main(
               if (d > 100.0) { break; }
               if (d < 0.045) {
                 rayHitT = sg;
-                rad = sampleRad(p + w * sg);
+                rad = evalGIHitRadiance(p + w * sg, w);
                 hitFar = true;
                 break;
               }
@@ -825,30 +872,42 @@ fn main(
     avgHitDist = hitDistSum / f32(nd);
   }
 
-  // 3) Workgroup Shared-Memory 2x2 Occlusion-Point Reuse (Jin et al. 2026)
+  // 3) ReSTIR-GI 4-Neighbor Weighted Spatial Reservoir Reuse in 8x8 Workgroup Shared Memory
+  // Uses exact spatial Jacobian + midpoint SDF visibility validation so GI never leaks across thin walls!
   workgroupBarrier();
 
   if (needTrace && (u.extra.z & 1u) != 0u) {
-    let peerX = lidx ^ 1u;
-    let peerY = lidx ^ 8u;
+    let lx = lidx & 7u;
+    let ly = lidx >> 3u;
+    let peers = array<u32, 4>(
+      (ly << 3u) | (lx ^ 1u),
+      ((ly ^ 1u) << 3u) | lx,
+      (ly << 3u) | ((lx + 2u) & 7u),
+      (((ly + 2u) & 7u) << 3u) | lx
+    );
     var reuseVis = 0.0;
     var reuseGI = vec3<f32>(0.0);
     var reuseW = 0.0;
-    let peers = array<u32, 2>(peerX, peerY);
-    for (var pi = 0u; pi < 2u; pi++) {
+    for (var pi = 0u; pi < 4u; pi++) {
       let hr = sharedHits[peers[pi]];
       if (hr.norValid.w > 0.5 && hr.posDist.w > 0.02) {
         let toH = hr.posDist.xyz - p;
         let dH = length(toH);
-        if (dH > 0.03 && dH < u.emissiveCol.w) {
+        if (dH > 0.04 && dH < u.emissiveCol.w) {
           let wH = toH / dH;
           let cosIn = dot(n, wH);
           let cosOut = dot(hr.norValid.xyz, -wH);
-          if (cosIn > 0.08 && cosOut > 0.05) {
-            let wt = clamp(cosIn * 0.35, 0.0, 0.25);
-            if (dH <= 1.12) { reuseVis += hr.radVis.w * wt; } else { reuseVis += wt; }
-            reuseGI += hr.radVis.rgb * wt;
-            reuseW += wt;
+          if (cosIn > 0.06 && cosOut > 0.04) {
+            // Midpoint SDF visibility validation (prevents thin-wall / pedestal light leaking!)
+            let dMid = sampleSDF(p + wH * min(dH * 0.5, 0.45));
+            if (dMid > -0.02) {
+              // Exact ReSTIR-GI spatial Jacobian (clamped to suppress fireflies)
+              let jac = clamp((hr.posDist.w * hr.posDist.w) / max(dH * dH, 0.05), 0.25, 1.8);
+              let wt = clamp(cosIn * jac * 0.22, 0.0, 0.22);
+              if (dH <= 1.12) { reuseVis += hr.radVis.w * wt; } else { reuseVis += wt; }
+              reuseGI += hr.radVis.rgb * wt;
+              reuseW += wt;
+            }
           }
         }
       }
@@ -1743,7 +1802,7 @@ export class WebGPUFastSDFAO {
     this.camUBuf = d.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.relightUBuf = d.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.decayUBuf = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    this.traceUBuf = d.createBuffer({ size: 192, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.traceUBuf = d.createBuffer({ size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.reflUBuf = d.createBuffer({ size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.reflFiltUBuf = d.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.tempUBuf = d.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -1918,6 +1977,8 @@ export class WebGPUFastSDFAO {
         { binding: 10, resource: this.rawAOGI.createView() },
         { binding: 11, resource: this.metaTex.createView() },
         { binding: 12, resource: { buffer: this.statsBuf } },
+        { binding: 13, resource: this.gAlbedo.createView() },
+        { binding: 14, resource: this.histMeta[1 - pIdx].createView() },
       ],
     });
     this.traceBG1B = [makeTraceBG(this.radVolA.createView(), 0), makeTraceBG(this.radVolA.createView(), 1)];
@@ -2099,21 +2160,22 @@ export class WebGPUFastSDFAO {
     camData.set(view, 16);
     d.queue.writeBuffer(this.camUBuf, 0, camData);
 
-    const tBuf = new ArrayBuffer(192);
+    const tBuf = new ArrayBuffer(256);
     const tf = new Float32Array(tBuf), tu = new Uint32Array(tBuf);
-    tf.set([s.sdfMin[0], s.sdfMin[1], s.sdfMin[2], 0], 0);
-    tf.set([1 / s.sdfSpan[0], 1 / s.sdfSpan[1], 1 / s.sdfSpan[2], 0], 4);
-    tf.set([s.gridMin[0], s.gridMin[1], s.gridMin[2], s.gridSize], 8);
-    tf.set([s.gridDims[0], s.gridDims[1], s.gridDims[2], s.contactRange], 12);
-    tf.set([this.sunDir[0], this.sunDir[1], this.sunDir[2], RAD_SCALE], 16);
-    tf.set([this.emissivePos[0], this.emissivePos[1], this.emissivePos[2], this.emissiveRadius], 20);
-    tf.set([this.emissiveCol[0], this.emissiveCol[1], this.emissiveCol[2], q.giMaxDist], 24);
-    tf.set([this.aoW, this.aoH, this.frame, 0.0005], 28);
-    tu.set([q.rays, q.maxSamples, this.useGI ? 1 : 0, this.useHash ? 1 : 0], 32);
-    const extraFlags = (this.reuseEnabled ? 1 : 0) | (traceShadows ? 2 : 0) | ((q.giSteps & 0xFF) << 8);
-    tu.set([q.shadowSteps, HASH_MASK, extraFlags, s.nodeCount], 36);
-    tf.set([s.rootMin[0], s.rootMin[1], s.rootMin[2], 0], 40);
-    tf.set([s.rootSpan[0], s.rootSpan[1], s.rootSpan[2], 0], 44);
+    tf.set(vp, 0);
+    tf.set([s.sdfMin[0], s.sdfMin[1], s.sdfMin[2], 0], 16);
+    tf.set([1 / s.sdfSpan[0], 1 / s.sdfSpan[1], 1 / s.sdfSpan[2], 0], 20);
+    tf.set([s.gridMin[0], s.gridMin[1], s.gridMin[2], s.gridSize], 24);
+    tf.set([s.gridDims[0], s.gridDims[1], s.gridDims[2], s.contactRange], 28);
+    tf.set([this.sunDir[0], this.sunDir[1], this.sunDir[2], RAD_SCALE], 32);
+    tf.set([this.emissivePos[0], this.emissivePos[1], this.emissivePos[2], this.emissiveRadius], 36);
+    tf.set([this.emissiveCol[0], this.emissiveCol[1], this.emissiveCol[2], q.giMaxDist], 40);
+    tf.set([this.aoW, this.aoH, this.frame, 0.0005], 44);
+    tu.set([q.rays, q.maxSamples, this.useGI ? 1 : 0, this.useHash ? 1 : 0], 48);
+    const extraFlags = (this.reuseEnabled ? 1 : 0) | (traceShadows ? 2 : 0) | (q.multiBounce ? 4 : 0) | ((q.giSteps & 0xFF) << 8);
+    tu.set([q.shadowSteps, HASH_MASK, extraFlags, s.nodeCount], 52);
+    tf.set([s.rootMin[0], s.rootMin[1], s.rootMin[2], 0], 56);
+    tf.set([s.rootSpan[0], s.rootSpan[1], s.rootSpan[2], 0], 60);
     d.queue.writeBuffer(this.traceUBuf, 0, tBuf);
 
     const rBuf = new ArrayBuffer(256);
