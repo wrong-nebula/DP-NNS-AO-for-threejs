@@ -1,15 +1,37 @@
-# Fast SDF AO
+# Fast SDF AO & GI
 
-**[Live WebGL2 Demo](https://wrong-nebula.github.io/Fast-SDF-AO/)** · **[Live WebGPU Compute Demo](https://wrong-nebula.github.io/Fast-SDF-AO/webgpu.html)** · Switch between **Archive (Boxes + 11 Movers)**, **Atrium (Curved Meshes)**, and **Gallery (GI)**, choose a **Quality** preset (**Performance (Low)**, **Balanced (Medium)**, **High (Default)**, **Ultra**), compare 7 AO modes, toggle **Diffuse GI**, **Multi-bounce GI**, **Emissive orb**, **GI bounce only**, **PBR + Multi-Bounce + Bent Normals**, **Hi-Z contact**, **Smooth falloff**, or **AO mask**, and drag the **Sun** angle slider in real time.
+Real-time **multi-bounce Global Illumination (GI)**, **Ambient Occlusion (AO)**, **soft area shadows**, **dynamic moving objects**, and **full-resolution mirror & rough glossy SDF reflections** for Three.js — running natively in **WebGPU Compute** and **WebGL2** with **zero hardware ray tracing, zero lightmaps, and zero probe grids**.
+
+**[Live WebGPU Compute Demo](https://wrong-nebula.github.io/Fast-SDF-AO/webgpu.html)** · **[Live WebGL2 Demo](https://wrong-nebula.github.io/Fast-SDF-AO/)** · Switch between **Gallery (GI + Chrome Reflections)**, **Atrium (Curved Meshes)**, and **Archive (Boxes)**, choose from **6 WebGPU Quality Tiers** (`Very Low` → `Ultra`), toggle **Reflections**, **Emissive Orb**, **Moving Objects**, **SHaRC Hash**, **GI Bounce Only**, or **AO Mask**, drag the **Sun** slider in real time, or **drag & drop any `.glb` / `.obj`** to bake an exact FP16 SDF on the GPU.
 
 ### Unified WebGPU Compute Backend (`src/webgpu.js`, `src/webgpu-refl.js`, `src/webgpu-bake.js`, `webgpu.html`)
 
 Exported as `fast-sdf-ao/webgpu` and live at **[webgpu.html](https://wrong-nebula.github.io/Fast-SDF-AO/webgpu.html)**: native WGSL compute pipeline combining:
-- Direct storage-buffer **Dual-Child Quantized SAH Contact BVH2** + 1-Lipschitz empty-sphere skip
-- `8×8` workgroup shared-memory **2×2 Occlusion-Point Reuse** (Jin et al. 2026)
-- `262,144`-slot atomic **SHaRC World-Space Spatial Hash Cache** (AO + multi-bounce RGB GI, **100% converged-cell skip** on camera cuts) + hybrid screen-space temporal EMA & 3-pass hit-distance-guided à-trous denoiser
-- **Real-Time Glossy / Rough SDF Reflections** (`src/webgpu-refl.js`): GGX importance-sampled reflection ray tracing against storage-buffer BVH2 → FP16 SDF → 2-bounce `radVol` + direct Emissive Orb hits, Fresnel + GTSO specular occlusion, and roughness-guided spatiotemporal filtering (`Reflections` toggle + `Glossy Reflections` debug view)
-- **Live Drag-and-Drop `.glb` / `.obj` + In-Browser GPU SDF Baker** (`src/webgpu-bake.js`): drop any `.glb`, `.gltf`, or `.obj` onto `webgpu.html` to bake an exact `96 × 96 × 56` FP16 SDF directly on the WebGPU GPU (`~2–20 ms`, zero CPU readback) with instant Contact BVH, Multi-Bounce GI, and Glossy Reflections (`benchmark/bench_webgpu_unified.py`, Apple M1 Metal-3, 1280×720):
+- **Hybrid SAH Contact BVH2 + FP16 SDF Tracing:** Direct storage-buffer **Dual-Child Quantized SAH Contact BVH2** for millimeter-sharp contacts + 1-Lipschitz empty-sphere skip + isotropic FP16 3D SDF for far visibility and GI rays
+- **Hybrid Screen-Space + 360° World `radVol` Diffuse GI:** Projects visible GI bounce hits into the G-buffer for sub-centimeter albedo/normal/shadow sharpness while falling back seamlessly to a `64 × 64 × 40` GPU-relit 2-bounce radiance volume for 360° off-screen color bleed
+- **SHaRC World-Space Hash Cache + 4-Neighbor ReSTIR-GI:** `262,144`-slot atomic world-space hash cache (AO + multi-bounce GI, **100% converged-cell skip** on camera cuts) + `8×8` workgroup shared-memory **4-neighbor ReSTIR-GI** spatial reservoir reuse with midpoint SDF visibility validation
+- **REBLUR-lite + SIGMA-lite 1-SPP Denoising:** Penumbra-guided bilateral shadow filtering (noise-free soft shadows on frame 1), hit-distance-guided `1→2→4` à-trous GI filtering, firefly suppression, and spatio-temporal triangular-PDF dithering
+- **Full-Resolution Mirror Chrome + GGX Glossy SDF Reflections** (`src/webgpu-refl.js`): Exact `1280 × 720` mirror chrome ray tracing on conductors (`rough ≤ 0.08`) + checkerboard GGX rough reflections with virtual-motion parallax reprojection and roughness edge-stopping
+- **Real-Time Dynamic Moving Objects:** Analytic dynamic spheres rendered directly into the G-buffer & Composite passes and evaluated in the SDF — casting real-time soft shadows, contact AO, colored GI bounce, and live reflections with **zero SDF re-baking**
+- **Live Drag-and-Drop `.glb` / `.obj` + In-Browser GPU SDF Baker** (`src/webgpu-bake.js`): Drop any `.glb`, `.gltf`, or `.obj` onto `webgpu.html` to import full **PBR `metalness` & `roughness`** materials and bake an exact `96 × 96 × 56` FP16 SDF directly on the WebGPU GPU (zero CPU readback)
+
+#### 1-Bounce Diffuse GI Head-to-Head (`benchmark/bench_gi_compare.py`, Apple M1, `1280 × 720`, 512-Ray Reference)
+
+Scored on pure linear bounce irradiance (`giIrr`) and perceptual sRGB bounce PSNR across **Front** (all walls visible) and **Panned Off-Screen** (terracotta crimson left wall outside the camera frustum):
+
+| GI Technique | Front Linear MAE ↓ | Front PSNR ↑ | Panned (Off-Screen) MAE ↓ | Panned PSNR ↑ | Off-Screen Red Bleed ↑ | Early / Settled ms/f (GPU) |
+|---|---:|---:|---:|---:|---:|---:|
+| **AO-only** (no GI baseline) | `0.3428` | `2.71 dB` | `0.3515` | `2.58 dB` | `0.0%` | — |
+| **Ideal 512-ray SSGI** *(noiseless theoretical upper bound)* | `0.2140` | `9.88 dB` | `0.2567` | `7.92 dB` | `10.7%` | — *(bound)* |
+| **Voxel Cone GI (VXGI)** *(5-cone, `64³` mipmapped vol)* | `0.1556` | `15.83 dB` | `0.1796` | `14.22 dB` | `-15.5%` | `4.21` / `2.25 ms` |
+| **DDGI `8×8×5` Probe Grid** *(1 m spacing, 512-ray probes)* | `0.1078` | `18.76 dB` | `0.1066` | `19.33 dB` | `-9.8%` | — *(exact probes)* |
+| **Fast-SDF-GI · WebGL2 (`high`)** | `0.0684` | `24.05 dB` | `0.0763` | `23.91 dB` | `40.7%` | `9.79` / `3.19 ms` |
+| **Fast-SDF-GI · WebGL2 (`ultra`)** | `0.0565` | **`26.81 dB`** | `0.0602` | **`26.93 dB`** | `45.3%` | `16.29` / `4.31 ms` |
+| **Fast-SDF-GI · WebGPU + SHaRC (`medium`, 1 SPP)** | **`0.0536`** | `25.65 dB` | `0.0515` | `26.47 dB` | `49.2%` | `8.67` / **`1.73 ms`** |
+| **Fast-SDF-GI · WebGPU + SHaRC (`high`, 2 SPP)** | **`0.0536`** | `26.02 dB` | **`0.0513`** | `26.62 dB` | `58.3%` | `11.71` / `2.11 ms` (`1.72 ms` GPU) |
+| **Fast-SDF-GI · WebGPU + SHaRC (`ultra`, 4 SPP)** | `0.0608` | `25.28 dB` | `0.0558` | `26.15 dB` | **`71.1%`** | `18.79` / `1.74 ms` (`1.23 ms` GPU) |
+
+#### Scene Scaling (`benchmark/bench_webgpu_unified.py`, Apple M1 Metal-3, `1280 × 720`)
 
 | Apple M1 Metal-3 WebGPU (`high` preset) | Cold ms/f | Orbit 3°/f | Settled GPU ms | Camera-Cut Revisit Cache Skip |
 |---|---:|---:|---:|---:|
