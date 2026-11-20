@@ -180,7 +180,8 @@ fn relightDirect(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ndl = max(0.0, dot(sNor, sDir));
   var sunSh = 0.0;
   if (ndl > 0.001) { sunSh = sdfSunSh(sp, sNor, sDir); }
-  var rad = sAlb * (vec3<f32>(2.35, 2.20, 1.95) * ndl * sunSh + vec3<f32>(0.055, 0.065, 0.08));
+  let skyF = 0.42 + 0.32 * max(0.0, sNor.z);
+  var rad = sAlb * (vec3<f32>(3.10, 2.90, 2.55) * ndl * sunSh + vec3<f32>(0.56, 0.64, 0.76) * skyF);
 
   if (hasOrb) {
     let toO = u.emissivePos.xyz - sp;
